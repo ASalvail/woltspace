@@ -13,12 +13,15 @@ release is required.
 - **They are marked experimental**, and so is opencode, until they see real
   use. The pickers say so next to their names.
 - **Each engine has its own icon.** Simple line icons replace the coloured
-  emoji wherever you pick an engine, and they follow light and dark mode. The
-  harness choice in Create a wolt is now a menu that shows them.
+  emoji wherever you pick an engine. They are drawn in the text colour, so
+  they match the theme. The harness choice in Create a wolt is now a menu
+  that shows them.
 - **Install them yourself, once.** Woltspace needs nothing new, but each engine
   is its own program:
-  - Hermes: `uv tool install hermes-agent`
-  - Pi: `npm install -g @earendil-works/pi-coding-agent` (Node 22.19 or newer)
+  - Hermes: `uv tool install hermes-agent==0.19.0`. This is the version we
+    tested; a later Hermes may change its CLI or session store.
+  - Pi: `npm install -g @earendil-works/pi-coding-agent@1.1.0` (Node 22.19 or
+    newer). Tested with Pi 1.1.0.
   - Both default to Claude through OpenRouter, so put `OPENROUTER_API_KEY` in
     the lodge `.env`.
 
@@ -70,3 +73,19 @@ release is required.
 
 0.5.15 includes everything that shipped in 0.5.14: fresh lodges install the
 newest Onboardie, and 0.5 fixes can ship from `release/0.5`.
+
+## Upgrade notes
+
+```sh
+woltspace update
+```
+
+No colony-data migration is required. Native upgrades stop and restart the
+control plane while preserving tmux sessions. Container lodges update from the
+host as before.
+
+After upgrading, verify the lodge is healthy:
+
+```sh
+woltspace status
+```
