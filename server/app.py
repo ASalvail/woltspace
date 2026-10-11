@@ -74,7 +74,7 @@ from sessions import (
     resume_session, start_session, stop_session,
     deliver_message, resolve_active_session, format_attributed_message,
     format_spawned_prompt,
-    wolt_harness, ResumeUnavailable, ResumeFailed,
+    wolt_harness, ResumeUnavailable, ResumeFailed, HarnessNotInstalled,
     stored_resume_id, recover_resume_id, taken_resume_ids, claim_resume_id,
 )
 from session_expiry import get_idle_timeout, get_pane_activity, set_idle_timeout
@@ -90,6 +90,7 @@ from harnesses import (
     set_default_harness,
     set_tier_defaults,
     resolve_harness,
+    harness_install_problem,
     platform_skill_invoke,
     is_valid_model,
     model_catalog,
@@ -1150,6 +1151,13 @@ async def session_new_create(request: Request):
             {"detail": f"unknown model for {selected_harness}: {requested_model}"},
             status_code=400,
         )
+    # Refuse before scaffolding: a wolt whose engine is missing would only get
+    # a session that exits 127, with the reason buried in the boot log.
+    problem = harness_install_problem(
+        selected_harness, isolation=RuntimeContext.from_env().isolation,
+    )
+    if problem:
+        return JSONResponse({"detail": problem}, status_code=400)
 
     try:
         # Step 1: Scaffold the wolt with environment-appropriate harness config.
@@ -1223,6 +1231,8 @@ async def session_new_lodge(request: Request):
         return result
     except PermissionError as e:
         return JSONResponse({"error": str(e)}, status_code=403)
+    except HarnessNotInstalled as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=404)
     except Exception as e:
