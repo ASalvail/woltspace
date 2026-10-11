@@ -24,6 +24,7 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -571,6 +572,8 @@ HARNESSES = {
         "label": "Claude Code",
         "emoji": "🟠",
         "icon": "/static/engines/claude.svg",
+        # the program the wrapper execs; a spawn refuses when it is not on PATH
+        "binary": "claude",
         # comm names that count as "the agent is running" in a session's process tree
         "process_names": {"claude"},
         # creature tier → default model flag value (the seed; woltspace.json may override)
@@ -609,6 +612,7 @@ HARNESSES = {
         "label": "Codex",
         "emoji": "⬛",
         "icon": "/static/engines/codex.svg",
+        "binary": "codex",
         "process_names": {"codex"},
         # From the live /model picker (codex-cli 0.144.4, 2026-07):
         # gpt-5.5 "frontier, complex work", gpt-5.6-terra "balanced, everyday"
@@ -655,6 +659,7 @@ HARNESSES = {
         "experimental": True,
         "emoji": "🟦",
         "icon": "/static/engines/opencode.svg",
+        "binary": "opencode",
         "process_names": {"opencode"},
         # opencode is a multi-provider engine with hundreds of models across
         # providers — a curated whitelist can't keep up, so model pins are
@@ -737,6 +742,7 @@ HARNESSES = {
         "experimental": True,
         "emoji": "🥧",
         "icon": "/static/engines/pi.svg",
+        "binary": "pi",
         "process_names": {"pi"},
         # OpenRouter only for now: one key, every vendor. Pins are freeform
         # "openrouter/<vendor>/<model>" strings; the catalog is suggestions.
@@ -767,6 +773,7 @@ HARNESSES = {
         "experimental": True,
         "emoji": "☤",
         "icon": "/static/engines/hermes.svg",
+        "binary": "hermes",
         # `hermes` is a Python entry-point script: ps reports the interpreter as
         # comm and the runtime matches the script name from argv.
         "process_names": {"hermes"},
@@ -816,6 +823,28 @@ def resolve_harness(name: str | None) -> str:
 def get_harness(name: str | None) -> dict:
     """Get a harness table entry, falling back to the default harness."""
     return HARNESSES[resolve_harness(name)]
+
+
+def _engine_on_path(binary: str) -> bool:
+    return shutil.which(binary) is not None
+
+
+def harness_install_problem(name: str | None, *, isolation: str) -> str:
+    """Why `name` cannot start here, or "" when it can.
+
+    Only native lodges are checked: there the wrapper execs the engine from the
+    owner's PATH, and a missing one used to surface only as exit 127 in the
+    boot log. In a container the program lives in the image, not on this
+    process's PATH.
+    """
+    if isolation != "host":
+        return ""
+    entry = get_harness(name)
+    binary = entry.get("binary") or resolve_harness(name)
+    if _engine_on_path(binary):
+        return ""
+    label = entry.get("label", binary)
+    return f"{label} is not installed (no `{binary}` on PATH)."
 
 
 # The namespace a platform skill answers to once it is delivered as the

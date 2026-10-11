@@ -868,7 +868,9 @@ document.addEventListener('click', event => {
 
 document.addEventListener('keydown', event => {
   const list = document.getElementById('create-harness-list');
-  if (!list || list.hidden || !list.contains(document.activeElement)) return;
+  // An open menu owns these keys wherever focus sits (a click on the list's
+  // padding blurs the option), so Escape never falls through to the modal.
+  if (!list || list.hidden) return;
   const options = [...list.querySelectorAll('.engine-menu-option')];
   const index = options.indexOf(document.activeElement);
   if (event.key === 'Escape') {

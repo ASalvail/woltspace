@@ -1573,3 +1573,21 @@ class TestResolveModel:
     def test_pi_honors_explicit_openrouter_pin(self):
         model = "openrouter/deepseek/deepseek-v4.1-flash"
         assert resolve_model("pi", "raccoon", model) == model
+
+
+def test_a_missing_engine_is_named_on_a_native_lodge(monkeypatch):
+    import harnesses
+    from harnesses import HARNESSES, harness_install_problem
+
+    seen = []
+    monkeypatch.setattr(
+        harnesses, "_engine_on_path", lambda binary: seen.append(binary) or False)
+    assert harness_install_problem("hermes", isolation="host") == (
+        "Hermes is not installed (no `hermes` on PATH).")
+    # A container carries its engines in the image; this PATH says nothing.
+    assert harness_install_problem("hermes", isolation="external") == ""
+    assert seen == ["hermes"]
+    for name, entry in HARNESSES.items():
+        assert entry["binary"] == name
+    monkeypatch.setattr(harnesses, "_engine_on_path", lambda binary: True)
+    assert harness_install_problem("pi", isolation="host") == ""

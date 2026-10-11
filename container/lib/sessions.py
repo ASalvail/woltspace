@@ -43,6 +43,7 @@ from harnesses import (
     resolve_model,
     get_harness,
     get_default_harness,
+    harness_install_problem,
     build_command,
     session_has_agent_process,
     sessions_with_agent_process,
@@ -140,6 +141,14 @@ class ResumeUnavailable(Exception):
 
 class ResumeFailed(Exception):
     """Resume was attempted and the agent did not come up. Surfaces as 502."""
+
+
+class HarnessNotInstalled(ValueError):
+    """The chosen engine's program is not on this lodge's PATH.
+
+    Raised before anything is recorded or spawned, so the caller can show the
+    reason instead of a session that dies with exit 127.
+    """
 
 
 # How long resume waits for a relaunched agent to show up in the process tree
@@ -1633,6 +1642,9 @@ def start_session(
         wolt, workdir, wolts_dir=WOLTS_DIR
     )
     isolation = RuntimeContext.from_env().isolation
+    problem = harness_install_problem(harness, isolation=isolation)
+    if problem:
+        raise HarnessNotInstalled(problem)
     policy, grant = resolve_execution_policy(
         execution_policy,
         isolation=isolation,

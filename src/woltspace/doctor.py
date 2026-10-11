@@ -391,9 +391,22 @@ def ensure_data_root_available(
         raise DataRootConflict(check)
 
 
+def _graft_runtime_lib(layout: RuntimeLayout) -> None:
+    """Make the install's `container/lib` importable, as `serve` does.
+
+    The harness registry lives there. Without the graft an installed CLI
+    (uvx, uv tool) cannot import it, and every harness check falls back to
+    names alone: no default-harness validation, no `auth_env` keys.
+    """
+    lib_dir = str(layout.runtime_lib)
+    if lib_dir not in sys.path:
+        sys.path.insert(0, lib_dir)
+
+
 def run_doctor(
     layout: RuntimeLayout, *, check_port: bool = True, as_entrypoint: bool = False
 ) -> list[DoctorCheck]:
+    _graft_runtime_lib(layout)
     checks = []
     version = sys.version_info
     checks.append(DoctorCheck(

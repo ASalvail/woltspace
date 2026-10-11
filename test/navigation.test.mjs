@@ -141,6 +141,8 @@ test('backend harness labels and wolf status remain data', () => {
   assert.match(lodgeSource, /name\.append\(engineIcon\(h\), lodgeElement\('span', '', h\.label \|\| h\.id\)\)/);
   assert.match(lodgeSource, /lodgeElement\('span', 'engine-menu-label', harness\.label \|\| harness\.id\)/);
   assert.doesNotMatch(lodgeSource, /engine-menu[^\n]*innerHTML/);
+  // Escape closes only the open menu even when focus left the option list.
+  assert.match(lodgeSource, /if \(!list \|\| list\.hidden\) return;/);
   assert.doesNotMatch(lodgeSource, /button\.innerHTML\s*=.*\$\{name\}/);
   assert.match(wolvesSource, /\$\{esc\(e\.status\)\}/);
   assert.match(wolvesSource, /st\.textContent = e\.status \|\| ''/);
