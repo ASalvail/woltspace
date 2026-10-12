@@ -541,10 +541,27 @@ def _access_set(args) -> int:
     """
     layout = RuntimeLayout.from_env()
     access = _access_module(layout)
+    apps_aud = args.apps_aud
+    if apps_aud is None:
+        # Omitted keeps the app domain's audience; `--apps-aud ""` clears it.
+        try:
+            current = access.load_access_settings(layout.wolts_dir)
+        except RuntimeError:
+            current = None
+        apps_aud = current.apps_aud if current else ""
+        team = args.team_domain.strip().lower().rstrip(".")
+        if current and current.apps_aud and team != current.team_domain:
+            print(
+                "woltspace access: the team domain changes, so the saved apps audience "
+                "may no longer apply. Pass --apps-aud <tag> to keep apps reachable, "
+                'or --apps-aud "" to turn remote apps off.',
+                file=sys.stderr,
+            )
+            return 1
     raw = {
         "team_domain": args.team_domain,
         "lodge_aud": args.lodge_aud,
-        "apps_aud": args.apps_aud,
+        "apps_aud": apps_aud,
         "owner_email": args.owner_email,
     }
     try:
@@ -1181,8 +1198,9 @@ def build_parser() -> argparse.ArgumentParser:
                             help="e.g. yourteam.cloudflareaccess.com")
     access_set.add_argument("--lodge-aud", required=True,
                             help="Application Audience (AUD) tag of the lodge's Access app")
-    access_set.add_argument("--apps-aud", default="",
-                            help="AUD tag of the apps' Access app (empty: no app domain yet)")
+    access_set.add_argument("--apps-aud", default=None,
+                            help="AUD tag of the apps' Access app; omit to keep the saved one, "
+                                 '"" to turn remote apps off')
     access_set.add_argument("--owner-email", required=True)
     access_set.set_defaults(func=_access_set)
     access_clear = access_sub.add_parser(

@@ -385,11 +385,15 @@ def _owner_allowed_hosts() -> set[str]:
     Host check exists against DNS rebinding, so only the owner adds to it.
     """
     raw = os.environ.get("WOLTSPACE_ALLOWED_HOSTS", "")
-    return {name.strip().lower().rstrip(".") for name in raw.split(",") if name.strip()}
+    names = {name.strip().lower().rstrip(".") for name in raw.split(",")}
+    names.discard("")
+    return names
 
 
 def _allowed_http_hostname(hostname: str) -> bool:
     """Allow only the lodge's loopback/tunnel names and valid app subdomains."""
+    if not hostname:  # an unparseable Host
+        return False
     if hostname in {"localhost", "127.0.0.1", "::1"}:
         return True
     if hostname in _owner_allowed_hosts():
@@ -459,6 +463,10 @@ def _extract_app_subdomain(host_header: str) -> str | None:
     host, _port = _split_host(host_header)
     if host.endswith(".localhost") and host != "localhost":
         return host.removesuffix(".localhost")
+    if host in _owner_allowed_hosts():
+        # A name the owner listed is always the lodge itself, even when it
+        # sits under the tunnel domain; it never takes the apps audience.
+        return None
     td = tunnel_mgr.get_tunnel_domain()
     th = tunnel_mgr.get_tunnel_hostname()
     if td and host.endswith(f".{td}") and host != th:

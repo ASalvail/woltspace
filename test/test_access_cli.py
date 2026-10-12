@@ -83,3 +83,38 @@ def test_doctor_is_quiet_about_access_when_nothing_is_published(colony, monkeypa
     monkeypatch.setenv("WOLTSPACE_PUBLIC_TUNNEL", "false")
     checks = {c.name for c in run_doctor(_layout(colony), check_port=False)}
     assert "remote-access" not in checks
+
+
+def _saved(colony):
+    return json.loads((colony / "woltspace.json").read_text())["access"]
+
+
+def test_omitting_apps_aud_keeps_the_saved_one_and_empty_clears_it(colony):
+    assert cli_main(["access", "set", *VALUES, "--apps-aud", "apps-aud"]) == 0
+    assert cli_main(["access", "set", *VALUES[:4], "--owner-email", "new@example.com"]) == 0
+    assert _saved(colony)["apps_aud"] == "apps-aud"
+    assert _saved(colony)["owner_email"] == "new@example.com"
+    assert cli_main(["access", "set", *VALUES, "--apps-aud", ""]) == 0
+    assert _saved(colony)["apps_aud"] == ""
+
+
+def test_changing_team_needs_a_deliberate_apps_choice(colony, capsys):
+    assert cli_main(["access", "set", *VALUES, "--apps-aud", "apps-aud"]) == 0
+    moved = ["--team-domain", "other.cloudflareaccess.com", *VALUES[2:]]
+    assert cli_main(["access", "set", *moved]) == 1
+    assert "--apps-aud" in capsys.readouterr().err
+    assert _saved(colony)["team_domain"] == "team.cloudflareaccess.com"
+    assert cli_main(["access", "set", *moved, "--apps-aud", "new-apps"]) == 0
+    assert _saved(colony)["apps_aud"] == "new-apps"
+
+
+@pytest.mark.parametrize("block", [{"broken": True}, []])
+def test_doctor_reads_broken_settings_the_way_the_lodge_does(block, colony, monkeypatch):
+    monkeypatch.setenv("CLOUDFLARE_TUNNEL_TOKEN", "token")
+    monkeypatch.setenv("CLOUDFLARE_TUNNEL_URL", "https://lodge.example.com")
+    monkeypatch.setenv("WOLTSPACE_PUBLIC_TUNNEL", "true")
+    (colony / "woltspace.json").write_text(json.dumps({"access": block}))
+    check = {c.name: c for c in run_doctor(_layout(colony), check_port=False)}["remote-access"]
+    assert check.status == "warn"
+    assert "refuses every remote request" in check.detail
+    assert "restore" in check.remedy and "remove" not in check.remedy

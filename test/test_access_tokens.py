@@ -554,3 +554,57 @@ def test_an_interrupted_settings_write_leaves_the_old_settings(tmp_path):
     # A write that died before its rename leaves only a hidden temp file.
     (tmp_path / ".woltspace.json.999.tmp").write_text('{"access": {"broken"')
     assert access_module.load_access_settings(tmp_path) == SETTINGS
+
+
+def test_an_owner_listed_name_under_the_tunnel_domain_is_the_lodge(monkeypatch):
+    """alt.woltspace.test sits under the tunnel domain but the owner listed it:
+    it is the lodge, so only a lodge-audience owner token opens it."""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    _configured(monkeypatch, key.public_key())
+    monkeypatch.setenv("WOLTSPACE_ALLOWED_HOSTS", "alt.woltspace.test")
+    assert server_app._extract_app_subdomain("alt.woltspace.test") is None
+    host = "alt.woltspace.test"
+    assert asyncio.run(_request(host=host, token=_token(key, SETTINGS.apps_aud))).status_code == 403
+    assert asyncio.run(_request(host=host, token=_token(key, SETTINGS.lodge_aud))).status_code == 200
+
+
+@pytest.mark.parametrize("listed,host", [
+    (".", "bad:invalid"),
+    (" , ,", "bad:invalid"),
+    (".", ""),
+])
+def test_empty_or_unparseable_names_never_pass_the_host_check(listed, host, monkeypatch):
+    monkeypatch.setattr(server_app, "load_access_settings", lambda _root: None)
+    monkeypatch.setenv("WOLTSPACE_ALLOWED_HOSTS", listed)
+    assert "" not in server_app._owner_allowed_hosts()
+    assert not server_app._allowed_http_hostname("")
+    response = asyncio.run(_request(host=host))
+    assert response.status_code == 403
+
+
+def test_listed_hosts_keep_the_write_and_websocket_guards(monkeypatch):
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    _configured(monkeypatch, key.public_key())
+    host = "lodge.tail1234.ts.net"
+    monkeypatch.setenv("WOLTSPACE_ALLOWED_HOSTS", host)
+    owner = _token(key, SETTINGS.lodge_aud)
+
+    async def post(headers):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=server_app.app, client=("127.0.0.1", 1)),
+            base_url=f"https://{host}",
+        ) as client:
+            return await client.post("/settings/session-expiry", json={"idle_timeout_seconds": 60},
+                                     headers={"host": host, **headers})
+
+    assert asyncio.run(post({})).status_code == 403  # no token
+    assert asyncio.run(post({"cf-access-jwt-assertion": owner,
+                             "origin": "https://attacker.example"})).status_code == 403
+    assert asyncio.run(post({"cf-access-jwt-assertion": owner, "origin": "null"})).status_code == 403
+
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with TestClient(server_app.app).websocket_connect(
+            "/livereload", headers={"host": host, "origin": f"https://{host}"},
+        ):
+            pass
+    assert exc.value.code == 1008

@@ -444,24 +444,35 @@ def _graft_runtime_lib(layout: RuntimeLayout) -> None:
 
 
 def _remote_access_check(layout: RuntimeLayout, tunnel: dict) -> DoctorCheck | None:
-    """Say plainly what a published lodge without lodge-side Access means.
+    """Say plainly what a published lodge's Access settings mean for it.
 
     A warning, not a failure: the way in is the owner's choice. The lodge
-    still starts, and our own Cloudflare setup turns the check on.
+    still starts, and our own Cloudflare setup turns the check on. Reads the
+    settings with the lodge's own loader, so doctor and server always agree.
     """
     if not tunnel.get("enabled"):
         return None
+    root = str(layout.install_root)
+    if root not in sys.path:
+        sys.path.insert(0, root)
     try:
-        config = json.loads((layout.wolts_dir / "woltspace.json").read_text())
-    except FileNotFoundError:
-        config = {}
-    except (OSError, ValueError):
+        from server.access import load_access_settings
+    except ImportError:
+        return None
+    try:
+        settings = load_access_settings(layout.wolts_dir)
+    except RuntimeError as exc:
         return DoctorCheck(
-            "remote-access", "warn", "woltspace.json is unreadable, so remote requests are refused",
-            "Fix or remove woltspace.json; this machine still reaches the lodge.",
+            "remote-access", "warn",
+            f"the lodge's Access settings are unusable ({exc}), so it refuses every "
+            "remote request",
+            "Repair them with `woltspace access set`, or restore woltspace.json from a "
+            "backup. This machine still reaches the lodge.",
         )
-    if isinstance(config, dict) and config.get("access"):
-        return DoctorCheck("remote-access", "pass", "remote requests are checked with Cloudflare Access")
+    if settings is not None:
+        return DoctorCheck(
+            "remote-access", "pass", "remote requests are checked with Cloudflare Access",
+        )
     return DoctorCheck(
         "remote-access", "warn",
         "the lodge is published without its own Access check: anyone who reaches "
