@@ -70,7 +70,10 @@ Opus, say), it arrives as a plain file. Any other name is a document.
   anything in an `.ssh` folder except public keys (`*.pub`), `known_hosts`,
   `authorized_keys` and `config`, SSH private keys by name (`id_rsa`,
   `id_ed25519` and the like) wherever they are, files ending in `.pem`, `.key`,
-  `.p12` or `.pfx`, and `.netrc`, `.git-credentials` and `.pgpass`. A link to
+  `.p12` or `.pfx`, `.netrc`, `.git-credentials` and `.pgpass`, AWS
+  `credentials` and `config`, password vaults (`.kdbx` and the like), and
+  anything in the lodge's `.space` folder (chat history, sessions, tunnel
+  state). A link to
   one of them under another name is refused too. A Keynote deck also ends in
   `.key`: export it to PDF and send that.
 - The message may be empty when a file is attached.
@@ -119,7 +122,8 @@ technical as text.
   `OPENAI_API_KEY` in the lodge's `.env`, the speech service refused, or the
   user has voice messages blocked. If it says the text was delivered, the user
   already has your words; do not send them twice.
-- Each `--speak` is a paid request to OpenAI, and the text of the message goes
+- Each `--speak` is one OpenAI API request, billed to the lodge's key, and the
+  text of the message goes
   there. `OPENAI_TTS_VOICE` and `OPENAI_TTS_MODEL` in the lodge's `.env` change
   the voice and the model.
 

@@ -193,7 +193,8 @@ to litellm and the image generator.
 human sends and speaks a message a wolt sends with `notify --speak`.
 `OPENAI_TTS_MODEL` (default `gpt-4o-mini-tts`) and `OPENAI_TTS_VOICE` (default
 `alloy`) pick the model and the voice of the spoken message. Read by
-`server/notify.py`; each spoken message is one paid request.
+`server/notify.py`; each spoken message is one OpenAI API request,
+billed to that key.
 
 **Harnesses** — `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_OAUTH_TOKEN`,
 `CLAUDE_CODE_DISABLE_AUTO_MEMORY`, `CODEX_HOME`, `OPENCODE_CONFIG_DIR` and the

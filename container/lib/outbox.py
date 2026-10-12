@@ -31,6 +31,7 @@ _SSH_KEY_NAMES = frozenset({
 })
 _KEY_SUFFIXES = (".pem", ".key", ".p12", ".pfx")
 _PASSWORD_FILE_NAMES = frozenset({".netrc", ".git-credentials", ".pgpass"})
+_VAULT_SUFFIXES = (".kdbx", ".kdb", ".1pif", ".agilekeychain", ".opvault")
 _MAX_NAME_CHARS = 200
 _MAX_SUFFIX_CHARS = 16
 # Unicode direction controls. Left in a name they can make it read backwards in
@@ -76,6 +77,13 @@ def credential_rule(path: Path) -> str | None:
         return "key-file"
     if lowered in _PASSWORD_FILE_NAMES:
         return "password-file"
+    if parent.lower() == ".aws" and lowered in ("credentials", "config"):
+        return "aws-credentials"
+    if lowered.endswith(_VAULT_SUFFIXES):
+        return "password-vault"
+    # The lodge's own state: chat history, sessions, tunnel and platform files.
+    if any(part == ".space" for part in path.parts[:-1]):
+        return "lodge-state"
     return None
 
 

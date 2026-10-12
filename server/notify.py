@@ -221,18 +221,23 @@ async def _spoken(speech: _Speech, sender: Plugin, adapter: str) -> Attachment:
     if not api_key:
         raise SpeechError(
             "speech_not_configured",
-            f"speaking needs OPENAI_API_KEY in {WOLTS_DIR}/.env; send the message as text",
+            "speaking needs OPENAI_API_KEY in the lodge's .env; send the message as text",
         )
     try:
         OUTBOX_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     except OSError as exc:
         # Before the words are spoken: there would be nowhere to keep the audio.
         raise write_failure(exc) from None
+    try:
+        OUTBOX_DIR.chmod(0o700)  # as outbox.stage: mkdir leaves an existing dir alone
+    except OSError:
+        pass  # not ours to change; the audio is 0600 either way
     path = OUTBOX_DIR / speech.entry_id
     size = await synthesize(
         speech.text, sender.speech_format, path, api_key=api_key,
         model=dotenv_env("OPENAI_TTS_MODEL") or DEFAULT_SPEECH_MODEL,
         voice=dotenv_env("OPENAI_TTS_VOICE") or DEFAULT_SPEECH_VOICE,
+        max_bytes=sender.max_attachment_bytes,
     )
     filename, content_type = SPEECH_FILES[sender.speech_format]
     return Attachment(path, filename, size, content_type, "voice")
@@ -302,7 +307,7 @@ async def _send(
 
     if speech is not None:
         # Only now that there is somewhere to send it: every spoken message is
-        # a paid request, and its words leave the lodge.
+        # an OpenAI request billed to the lodge's key, and its words leave the lodge.
         attachments = (await _spoken(speech, sender, adapter),)
 
     for attachment in attachments:
