@@ -1,78 +1,77 @@
-# Woltspace 0.5.15
+# Woltspace 0.5.16
 
-Python **0.5.15** is a 0.5 release with two new experimental engines and a few
-fixes. The separately distributed **@woltspace/tui remains at 0.5.2**; no npm
-release is required.
+Python **0.5.16** lets wolts send you files and voice notes, and keeps the
+lodge's secrets off process command lines and out of the apps it runs. The
+separately distributed **@woltspace/tui remains at 0.5.2**; no npm release is
+required.
 
-## Two new engines to try: Hermes and Pi (experimental)
+## Files and voice notes from your wolts
 
-- **Hermes** ([Nous Research](https://github.com/NousResearch/hermes-agent)) and
-  **Pi** ([pi-coding-agent](https://www.npmjs.com/package/@earendil-works/pi-coding-agent))
-  can now run a wolt, next to Claude Code, Codex and opencode. Pick one when
-  you create a wolt, in Settings, or on a wolt's page.
-- **They are marked experimental**, and so is opencode, until they see real
-  use. The pickers say so next to their names.
-- **Each engine has its own icon.** Simple line icons replace the coloured
-  emoji wherever you pick an engine. They are drawn in the text colour, so
-  they match the theme. The harness choice in Create a wolt is now a menu
-  that shows them.
-- **Install them yourself, once.** Woltspace needs nothing new, but each engine
-  is its own program:
-  - Hermes: `uv tool install hermes-agent==0.19.0`. This is the version we
-    tested; a later Hermes may change its CLI or session store.
-  - Pi: `npm install -g @earendil-works/pi-coding-agent@1.1.0` (Node 22.19 or
-    newer). Tested with Pi 1.1.0.
-  - Both default to Claude through OpenRouter, so put `OPENROUTER_API_KEY` in
-    the lodge `.env`.
+A community contribution: thanks to [@asharakeh](https://github.com/asharakeh)
+for building this, from the first idea to spoken replies (#519).
 
-  `woltspace start` lists the engines it finds and says whether Hermes has its
-  key.
-- **Each Hermes wolt keeps its own Hermes home** (`<wolt>/.hermes`), with the
-  wolt's skills, its own persona file and no Hermes memory of its own (a wolt's
-  memory stays in `wolt/memory/`). No credentials are copied into it.
-- **Pi runs without project trust**, so a repository's own Pi extensions never
-  run. A Pi wolt gets its skills through `--skill`.
-- **Pi keeps its sessions in your Pi home.** On a native lodge, a Pi wolt's
-  session files go to your own `~/.pi/agent/sessions/`, not inside the wolt.
-- **A missing engine is named up front.** If the chosen engine's program is
-  not on PATH, creating the wolt or starting the session says so ("Hermes is
-  not installed (no `hermes` on PATH)") instead of a session that just exits.
-- Known limits are listed in
-  [adding a harness](adding-a-harness.md#experimental-harnesses-known-limits):
-  neither engine is in the container image, and both are untested from
-  Telegram and Slack.
+- **`notify --file PATH`** sends one file with the message, to the same chat
+  or thread the message goes to, on Telegram or Slack (up to 50 MB). On
+  Telegram, `.ogg`/`.oga`/`.opus` audio arrives as a voice note, `.mp3`/`.m4a`
+  in Telegram's player, and anything else as a document.
+- **`notify --speak`** has the lodge read the message aloud and send it as a
+  voice note. It uses the `OPENAI_API_KEY` that already transcribes the voice
+  notes you send (`gpt-4o-mini-tts`, voice `alloy`; change them with
+  `OPENAI_TTS_MODEL` and `OPENAI_TTS_VOICE`). Each spoken message is one OpenAI
+  API request, billed to that key, of at most 4096 characters.
+- **`notify --voice PATH`** sends audio you already have as a voice note.
+- **Replying works.** A reply to a file or a voice note the wolt sent reaches the
+  session that sent it.
+- **Files go only to the lodge's own chats:** the allowed Telegram users, the
+  Slack notify channel, or the chat the session started from. Text is not
+  limited this way.
+- **Credentials are refused:** `.env` files, Claude and Codex logins, SSH keys,
+  `.pem`/`.key`/`.p12`/`.pfx` files, `.netrc`, `.git-credentials`, `.pgpass`,
+  AWS credentials, password vaults, and anything in the lodge's own `.space`
+  folder. Spoken audio is capped at what the chat can carry while it downloads.
+- **Slack** needs the `files:write` scope for files. The setup-slack skill's
+  manifest includes it; an existing Slack app needs it added and reinstalled.
 
-## Fixes
+## Secrets stay off command lines and out of apps
 
-- **A voice note is never lost silently.** When Telegram was slow to hand over
-  the audio, the download timed out and the message vanished with no reply.
-  Downloads now retry with longer timeouts. If they still fail, the bot answers
-  "I couldn't get that voice message from Telegram (it kept timing out). Please
-  send it again." Photos, videos and files get the same retries.
-- **Every wolt shows its own creature again.** On some page loads, the
-  sessions list was drawn before the lodge knew which creature each wolt is,
-  so every group showed the beaver, and the folder name instead of the wolt's
-  display name, until a full reload. The sidebar now corrects itself as soon
-  as the wolts load, and on every refresh after that. It happened most on
-  fresh lodges, slower machines and lodges opened remotely. Thanks to the
-  community member who traced it to the exact lines.
-- **Wolts know about Onboardie.** A wolt's instructions now say that Onboardie,
-  the starter lodge's beaver, gives newcomers the tour and helps with their
-  first wolt, and that a wolt should check the local `wolts/*/wolt/wolt.json`
-  files before asking who another wolt is.
-- **`woltspace doctor` reads the engine list in an installed copy.** It
-  checks the default engine again and shows Hermes' `OPENROUTER_API_KEY` as
-  sign-in, and it no longer fails on an engine it does not know.
+On a machine with more than one user, every user can read every process's
+command line with `ps`. A report from a Mac with two users, each running a
+lodge, showed one lodge's Cloudflare tunnel token that way, and a Slack app
+token in an app's process.
 
-## Docs
+- **The tunnel token is no longer on cloudflared's command line.** The lodge
+  hands it over in the `TUNNEL_TOKEN` environment variable. Same tunnel, same
+  behaviour.
+- **Apps no longer receive the lodge's service credentials.** Apps, their
+  install step, and processes started through the tools route stop inheriting
+  `TELEGRAM_*`, `SLACK_*`, `GITHUB_APP_*`, `CLOUDFLARE_*` and the owner's
+  `CLAUDE_CODE_OAUTH_TOKEN`. Everything else still reaches them, model API keys
+  included.
+- **The cloudflare skill keeps tokens out of the session.** It writes a new
+  tunnel token straight to `.env` instead of printing it, and its `curl` calls
+  pass the API token as a config file instead of a command-line header. So do
+  the wildcard-subdomain docs.
+- **Wolts learn the rules.** The apps and new-app skills have a Secrets section,
+  and new wolts get one rule: never print, log or commit a secret, never put one
+  on a command line, and ask the human for a key instead of looking for one.
 
-- **The README has two parts: one for humans, one for agents.** An agent can
-  follow the install steps on its own.
+## Before you update
 
-## Also in this release
+- **An app that used the lodge's Slack, Telegram, GitHub-app or Cloudflare
+  token stops seeing it.** Give that app its own token in its own `.env`
+  (`wolts/apps/<name>/.env`).
+- **If other people can log in to your machine,** rotate your Cloudflare tunnel
+  token after updating and restarting.
+- **To send files to Slack,** add the `files:write` scope to your Slack app and
+  reinstall it.
 
-0.5.15 includes everything that shipped in 0.5.14: fresh lodges install the
-newest Onboardie, and 0.5 fixes can ship from `release/0.5`.
+## Known limits
+
+- Wolt sessions still inherit the whole lodge environment, so a wolt can read
+  the lodge's secrets. The secrets service planned for 0.6 is the full fix.
+- A wolt session's opening message is still passed on the engine's command
+  line. A fix is planned.
+- There is no spending limit on `--speak` yet beyond one request per call.
 
 ## Upgrade notes
 
