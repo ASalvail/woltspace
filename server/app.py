@@ -50,7 +50,8 @@ from .config import (
     load_dotenv,
 )
 from . import tunnel as tunnel_mgr
-from .notify import NoNotificationTarget, send_notification
+from .notify import AttachmentError, NoNotificationTarget, send_notification
+from .speech import SpeechError
 from .sparks import get_spark_with_chain, list_sparks
 from .pty_bridge import (
     PtyBridgeError,
@@ -771,8 +772,16 @@ async def post_notify(request: Request):
             explicit["thread_ts"] = body.get("thread_ts")
         elif body["adapter"] == "telegram":
             explicit["chat_id"] = body.get("chat_id", "")
+    # Outbox entries `notify --file` staged: [{"id", "name"}]. Never a path.
+    attachments = body.get("attachments") or []
+    # `notify --speak`: {"text"}, the words the lodge is to say. Passed on only
+    # when the request has it, so every other call is the one it always was.
+    speak = body.get("speak")
     try:
-        result = await send_notification(session, message, explicit=explicit or None)
+        result = await send_notification(
+            session, message, explicit=explicit or None, attachments=attachments,
+            **({} if speak is None else {"speak": speak}),
+        )
         print(f"[notify] → {result.get('adapter')} | {message[:80]}")
         bot_log("notify_sent", {"session": session, **result, "message": message})
         return {"ok": True, **result}
@@ -787,9 +796,25 @@ async def post_notify(request: Request):
             "remedy": "Set TELEGRAM_BOT_TOKEN + TELEGRAM_ALLOWED_USERS in the data "
                       "root's .env, or run the /telegram skill to connect a chat.",
         }, status_code=409)
+    except AttachmentError as e:
+        # The file cannot go, and `reason` tells the caller which rule it met.
+        print(f"[notify] attachment refused: {e}")
+        return JSONResponse(
+            {"ok": False, "error": str(e), "reason": e.reason},
+            status_code=413 if e.reason == "attachment_too_large" else 400,
+        )
+    except SpeechError as e:
+        # The words could not be made into audio; nothing was sent.
+        print(f"[notify] speech failed: {e}")
+        return JSONResponse(
+            {"ok": False, "error": str(e), "reason": e.reason},
+            status_code=502 if e.reason == "speech_failed" else 400,
+        )
     except Exception as e:
-        print(f"[notify] error: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
+        # Some errors carry no text (an httpx timeout, say); name them instead.
+        error = str(e) or type(e).__name__
+        print(f"[notify] error: {error}")
+        return JSONResponse({"error": error}, status_code=500)
 
 
 # --- Memory ---
