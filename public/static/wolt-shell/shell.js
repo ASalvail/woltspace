@@ -41,7 +41,7 @@
   }
 
   function mount(m) {
-    var w = m.wolt || {}, site = m.site || {}, t = site.tokens || {};
+    var w = m.wolt || {}, site = m.site || {}, t = site.tokens || {}, slots = site.slots || {};
     var title = site.title || w.display_name || w.name;
     var emoji = t.emoji || EMOJI[w.type] || '🌲';
 
@@ -93,10 +93,14 @@
       });
       return ul;
     }
-    function slot(file) {
-      if (!file) return null;
+    // Slot HTML is only ever what the server inlined into the manifest, and
+    // it only does that for the wolt's own (sandboxed) site pages. Never a
+    // fetch: a sandboxed page has no same-origin fetch, and on the lodge-origin
+    // built-in pages the wolt's markup must not be written into the document.
+    function slot(html) {
+      if (typeof html !== 'string' || !html) return null;
       var box = el('div', { class: 'slot' });
-      fetch(m.base + enc(file)).then(function (r) { return r.ok ? r.text() : ''; }).then(function (h) { box.innerHTML = h; }).catch(function () {});
+      box.innerHTML = html;
       return box;
     }
 
@@ -109,12 +113,12 @@
         el('div', { class: 'avatar', text: emoji }),
         el('div', {}, [el('div', { class: 'title', text: title }), el('div', { class: 'role', text: w.role || '' })])
       ]),
-      slot(site.header_html),
+      slot(slots.header),
       el('div', { class: 'section', text: 'Wolt' }),
       el('div', { class: 'builtins' }, builtins),
       el('div', { class: 'section', text: 'Pages' }),
       (m.tree && m.tree.length) ? branch(m.tree, 0) : el('div', { class: 'empty', text: 'No pages yet.' }),
-      slot(site.footer_html)
+      slot(slots.footer)
     ]);
     var scrim = el('div', { class: 'scrim', onclick: toggle });
     var pill = el('button', { class: 'pill', type: 'button', 'aria-label': 'Open ' + title + ' menu', onclick: toggle },

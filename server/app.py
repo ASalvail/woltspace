@@ -408,6 +408,11 @@ def _allowed_http_hostname(hostname: str) -> bool:
 
 def _same_http_authority(origin: str, host_header: str) -> bool:
     """Require a browser write's Origin to name the exact request authority."""
+    # `Origin: null` is a value, not an absent header: it is what a sandboxed
+    # document (every wolt site and spark, see _UNTRUSTED_CONTENT_HEADERS)
+    # sends. It never names this lodge, even after Access let the request in.
+    if origin.strip().lower() == "null":
+        return False
     try:
         parsed = urlsplit(origin)
         origin_host = (parsed.hostname or "").lower().rstrip(".")
@@ -546,6 +551,48 @@ async def request_origin_guard(request: Request, call_next):
             return JSONResponse({"error": "cross-origin request rejected"}, status_code=403)
 
     return await call_next(request)
+
+
+# Wolt-authored documents - every file under a wolt's site, and spark/history
+# previews - are served on the lodge origin, and a prompt-injected wolt can
+# put script on its page. An enforced CSP sandbox (no allow-same-origin) gives
+# that document an opaque origin: its script still runs, but every request it
+# makes to the lodge carries `Origin: null`, which the write guard above and
+# every websocket handler reject, and it cannot read lodge responses. nosniff
+# keeps the browser from upgrading a text file into a document on its own.
+# The headers go on every response from these routes - errors and redirects
+# included - never Report-Only and never as a <meta> the page could precede.
+_UNTRUSTED_CONTENT_HEADERS = {
+    "Content-Security-Policy": "sandbox allow-scripts",
+    "X-Content-Type-Options": "nosniff",
+}
+_UNTRUSTED_PATH_RE = re.compile(r"/wolt/[^/]+/site(?:/.*)?|/history/[^/]+")
+# Lodge-owned pages may only be framed by the lodge itself: the split view and
+# the wolt page frame sites, sparks and apps, and a sandboxed site (opaque
+# origin) must not be able to frame settings or the shell in return.
+_OWNER_FRAME_POLICY = "frame-ancestors 'self'"
+
+
+def _untrusted_content_path(path: str) -> bool:
+    return _UNTRUSTED_PATH_RE.fullmatch(path) is not None
+
+
+def _mark_untrusted(response: Response) -> Response:
+    """Sandbox a response whose body a wolt wrote (the catch-all site files)."""
+    response.headers.update(_UNTRUSTED_CONTENT_HEADERS)
+    return response
+
+
+@app.middleware("http")
+async def content_isolation_headers(request: Request, call_next):
+    response = await call_next(request)
+    if _untrusted_content_path(request.url.path):
+        response.headers.update(_UNTRUSTED_CONTENT_HEADERS)
+    elif "content-security-policy" not in response.headers:
+        content_type = response.headers.get("content-type", "")
+        if content_type.startswith("text/html"):
+            response.headers["Content-Security-Policy"] = _OWNER_FRAME_POLICY
+    return response
 
 
 class AccessTokenMiddleware:
@@ -730,11 +777,14 @@ async def _serve_static(url_path: str, request: Request | None = None) -> Respon
     content = full_path.read_bytes()
     ext = full_path.suffix
     is_iframe = request and request.headers.get("sec-fetch-dest") == "iframe"
+    # Wolt-authored, served at the lodge root: sandboxed like /wolt/*/site.
     if ext == ".html" and not is_iframe:
         html = _inject_livereload(content.decode())
-        return HTMLResponse(html, headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
+        return _mark_untrusted(
+            HTMLResponse(html, headers={"Cache-Control": "no-cache, no-store, must-revalidate"}))
     mime = MIME_TYPES.get(ext, "application/octet-stream")
-    return Response(content, media_type=mime, headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
+    return _mark_untrusted(Response(
+        content, media_type=mime, headers={"Cache-Control": "no-cache, no-store, must-revalidate"}))
 
 
 # jerpint: will have to look into how this works and security around it
@@ -2559,9 +2609,11 @@ async def serve_wolt_site(wolt_name: str, request: Request, path: str = ""):
             text += reload_script
         # The site shell: nav drawer + built-in pages, owned by the lodge and
         # skinned by the wolt's site.json. See container/lib/site_shell.py.
+        # The header/footer slots ride along inline: under the CSP sandbox the
+        # page has no same-origin fetch to pull them with.
         site_cfg = load_site_config(sdir)
         if shell_wanted(site_cfg, text):
-            text = inject_shell(text, shell_manifest(wolt_name, wolt_dir, sdir, site_cfg))
+            text = inject_shell(text, shell_manifest(wolt_name, wolt_dir, sdir, site_cfg, slots=True))
         return HTMLResponse(
             text, headers={"Cache-Control": "no-cache, no-store, must-revalidate"}
         )
@@ -2611,7 +2663,13 @@ async def wolt_builtin_page(wolt_name: str, tab: str = "about"):
         return PlainTextResponse("Not found", status_code=404)
     sdir = site_dir(wolt_name)
     site_cfg = load_site_config(sdir)
+    # Lodge-owned, so it stays outside the content sandbox - but it is also
+    # what the wolt page's sandboxed site frame navigates to, where a fetch
+    # of memory.json would come from an opaque origin and fail. The boot files
+    # ride inline instead, and the wolt's header/footer HTML never does: the
+    # shell must not write wolt-authored markup into a lodge-origin document.
     manifest = shell_manifest(wolt_name, wolt_dir, sdir, site_cfg)
+    manifest["memory"] = memory_payload(wolt_dir)
     page = (STATIC_DIR / "wolt-shell" / "wolt.html").read_text(encoding="utf-8")
     # The built-in page always needs the manifest; the drawer only when the
     # wolt has not switched the shell off.
@@ -2927,6 +2985,18 @@ async def placeholder_page():
     """
     resp = await _serve_platform_file("placeholder.html")
     return resp or PlainTextResponse("placeholder.html not found", status_code=500)
+
+
+@app.get("/sw.js")
+async def service_worker():
+    """The lodge's service worker, registered by every owner page.
+
+    Dedicated route for the same reason as placeholder.html, and a sharper
+    one: the catch-all tries the wolt site dir first, and a worker a wolt
+    wrote would sit between the owner's browser and every lodge request.
+    """
+    resp = await _serve_platform_file("sw.js")
+    return resp or PlainTextResponse("sw.js not found", status_code=404)
 
 
 # --- Catch-all: static files ---

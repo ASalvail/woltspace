@@ -99,7 +99,11 @@
   }
 
   render('<p class="meta">loading...</p>');
-  fetch(m.builtin + 'memory.json').then(function (r) { return r.json(); }).then(function (mem) {
+  // The server inlines the boot files: inside the wolt page's sandboxed site
+  // frame this document has an opaque origin and could not fetch them.
+  var memory = m.memory ? Promise.resolve(m.memory)
+    : fetch(m.builtin + 'memory.json').then(function (r) { return r.json(); });
+  memory.then(function (mem) {
     if (tab === 'about') {
       render((w.description ? '<p>' + esc(w.description) + '</p>' : '') +
         '<div class="md">' + (mem.identity ? md(mem.identity) : '<p class="meta">No identity.md yet.</p>') + '</div>');

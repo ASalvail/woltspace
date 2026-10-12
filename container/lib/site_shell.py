@@ -181,13 +181,45 @@ def wolt_fields(wolt_dir: Path, wolt_name: str) -> dict:
     return fields
 
 
-def shell_manifest(wolt_name: str, wolt_dir: Path, sdir: Path, site_cfg: dict | None = None) -> dict:
-    """Everything the drawer needs, inlined into the page so it draws with no fetch."""
+# A slot is a fragment of the drawer, not a page; this is plenty for one.
+MAX_SLOT_BYTES = 64 * 1024
+
+
+def slot_html(sdir: Path, name: object) -> str | None:
+    """The header/footer slot file, read from inside the site dir or nothing."""
+    if not isinstance(name, str) or not name:
+        return None
+    path = sdir / name.strip("/")
+    try:
+        path.resolve().relative_to(sdir.resolve())
+        if not path.is_file() or path.stat().st_size > MAX_SLOT_BYTES:
+            return None
+        return path.read_text(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        return None
+
+
+def shell_manifest(wolt_name: str, wolt_dir: Path, sdir: Path, site_cfg: dict | None = None,
+                   slots: bool = False) -> dict:
+    """Everything the drawer needs, inlined into the page so it draws with no fetch.
+
+    `slots` inlines the header/footer HTML too. Only a wolt's own site page
+    asks for that: it is served sandboxed (opaque origin), so it could not
+    fetch the slots itself, and the wolt's markup inside the wolt's own page
+    adds nothing. The built-in pages are lodge-origin documents and never get
+    it - shell.js draws no slot it was not handed.
+    """
     cfg = load_site_config(sdir) if site_cfg is None else site_cfg
+    site = {k: cfg[k] for k in ("title", "tokens", "fonts_href", "custom_css", "header_html", "footer_html") if k in cfg}
+    if slots:
+        found = {k: slot_html(sdir, cfg.get(f"{k}_html")) for k in ("header", "footer")}
+        found = {k: v for k, v in found.items() if v is not None}
+        if found:
+            site["slots"] = found
     return {
         "v": 1,
         "wolt": wolt_fields(wolt_dir, wolt_name),
-        "site": {k: cfg[k] for k in ("title", "tokens", "fonts_href", "custom_css", "header_html", "footer_html") if k in cfg},
+        "site": site,
         "tree": page_tree(sdir, cfg),
         "base": f"/wolt/{wolt_name}/site/",
         "builtin": f"/wolt/{wolt_name}/_/",
