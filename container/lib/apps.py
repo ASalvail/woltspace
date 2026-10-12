@@ -35,6 +35,27 @@ MANIFEST = "woltspace.json"
 # Running app state — now at .space/apps/
 _RUNNING_STATE_DIR = space_apps_dir(WOLTS_DIR)
 
+# Credentials of the lodge's own services: the chat adapters, the GitHub bot,
+# the Cloudflare tunnel and API. They are loaded into the lodge's environment
+# for those services, and an app would otherwise inherit them all. An app that
+# really needs one keeps its own copy in its own .env.
+LODGE_ONLY_ENV_PREFIXES = ("TELEGRAM_", "SLACK_", "GITHUB_APP_", "CLOUDFLARE_")
+# The owner's own Claude Code login, for wolt sessions only.
+LODGE_ONLY_ENV_KEYS = frozenset({"CLAUDE_CODE_OAUTH_TOKEN"})
+
+
+def app_environment(**extra: str) -> dict[str, str]:
+    """The environment an app process starts with: the lodge's, minus its
+    service credentials, plus `extra`."""
+    env = {
+        key: value for key, value in os.environ.items()
+        if not key.upper().startswith(LODGE_ONLY_ENV_PREFIXES)
+        and key.upper() not in LODGE_ONLY_ENV_KEYS
+    }
+    env.update(extra)
+    return env
+
+
 # Wolt type emojis — reserved, never used as random defaults
 WOLT_EMOJIS = {"🦫", "🦝", "🦦", "🐺", "🐶", "🕷️", "🐻", "🐼"}
 
@@ -238,10 +259,13 @@ def start_app(name: str) -> dict:
     if app.install and app.stack in ("node", "vite"):
         nm = work_dir / "node_modules"
         if not nm.exists():
-            subprocess.run(app.install, shell=True, cwd=str(work_dir), check=True)
+            subprocess.run(
+                app.install, shell=True, cwd=str(work_dir), check=True,
+                env=app_environment(),
+            )
 
     # Start the process with PORT env var
-    env = {**os.environ, "PORT": str(port)}
+    env = app_environment(PORT=str(port))
     _RUNNING_STATE_DIR.mkdir(parents=True, exist_ok=True)
     log_handle = app_log_file(name).open("ab", buffering=0)
     try:
