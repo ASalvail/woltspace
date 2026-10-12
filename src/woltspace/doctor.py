@@ -443,6 +443,36 @@ def _graft_runtime_lib(layout: RuntimeLayout) -> None:
         sys.path.insert(0, lib_dir)
 
 
+def _remote_access_check(layout: RuntimeLayout, tunnel: dict) -> DoctorCheck | None:
+    """Say plainly what a published lodge without lodge-side Access means.
+
+    A warning, not a failure: the way in is the owner's choice. The lodge
+    still starts, and our own Cloudflare setup turns the check on.
+    """
+    if not tunnel.get("enabled"):
+        return None
+    try:
+        config = json.loads((layout.wolts_dir / "woltspace.json").read_text())
+    except FileNotFoundError:
+        config = {}
+    except (OSError, ValueError):
+        return DoctorCheck(
+            "remote-access", "warn", "woltspace.json is unreadable, so remote requests are refused",
+            "Fix or remove woltspace.json; this machine still reaches the lodge.",
+        )
+    if isinstance(config, dict) and config.get("access"):
+        return DoctorCheck("remote-access", "pass", "remote requests are checked with Cloudflare Access")
+    return DoctorCheck(
+        "remote-access", "warn",
+        "the lodge is published without its own Access check: anyone who reaches "
+        f"{tunnel.get('url') or 'its public address'} is treated as you, unless "
+        "Cloudflare Access in front of it stops them first",
+        "Run `woltspace access set` on this machine (or open Settings > Access) so the "
+        "lodge verifies every remote request itself. The cloudflare skill explains "
+        "where each value comes from.",
+    )
+
+
 def run_doctor(
     layout: RuntimeLayout, *, check_port: bool = True, as_entrypoint: bool = False
 ) -> list[DoctorCheck]:
@@ -479,6 +509,9 @@ def run_doctor(
                 "CLOUDFLARE_TUNNEL_TOKEN is configured but the tunnel is disabled",
                 "Set WOLTSPACE_PUBLIC_TUNNEL=true and restart the lodge.",
             ))
+    remote = _remote_access_check(layout, tunnel_settings(layout))
+    if remote is not None:
+        checks.append(remote)
     default_harness = _default_harness_check()
     if default_harness is not None:
         checks.append(default_harness)

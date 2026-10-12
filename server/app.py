@@ -378,9 +378,21 @@ def _split_host(host_header: str) -> tuple[str, int | None]:
         return "", None
 
 
+def _owner_allowed_hosts() -> set[str]:
+    """Extra names the owner reaches the lodge by (a tailnet name, a LAN name).
+
+    WOLTSPACE_ALLOWED_HOSTS is a comma-separated list of exact host names. The
+    Host check exists against DNS rebinding, so only the owner adds to it.
+    """
+    raw = os.environ.get("WOLTSPACE_ALLOWED_HOSTS", "")
+    return {name.strip().lower().rstrip(".") for name in raw.split(",") if name.strip()}
+
+
 def _allowed_http_hostname(hostname: str) -> bool:
     """Allow only the lodge's loopback/tunnel names and valid app subdomains."""
     if hostname in {"localhost", "127.0.0.1", "::1"}:
+        return True
+    if hostname in _owner_allowed_hosts():
         return True
     if hostname.endswith(".localhost"):
         return bool(_APP_HOST_RE.fullmatch(hostname.removesuffix(".localhost")))
@@ -585,12 +597,20 @@ class AccessTokenMiddleware:
                 )
             return await self._reject(scope, receive, send, message)
         if settings is None:
+            # The owner chose the way in (a tunnel with Cloudflare Access, a
+            # tailnet, ...) and it does the checking. Doctor and Settings say
+            # plainly that without lodge-side Access anyone it lets through
+            # is treated as the owner.
             return await self.inner(scope, receive, send)
         token = headers.get("cf-access-jwt-assertion", "").strip()
         if not token:
             return await self._reject(scope, receive, send, "Access token required")
         app_name = _extract_app_subdomain(host_header)
         audience = settings.apps_aud if app_name else settings.lodge_aud
+        if not audience:
+            return await self._reject(
+                scope, receive, send, "apps have no Cloudflare Access audience configured",
+            )
         try:
             claims = await access_token_verifier.verify(token, settings, audience)
         except Exception:
