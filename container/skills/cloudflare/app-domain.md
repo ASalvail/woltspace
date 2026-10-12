@@ -38,7 +38,7 @@ Load the Cloudflare credentials (only the `CLOUDFLARE_*` lines - the file can ho
 ```bash
 eval "$(grep -E '^CLOUDFLARE_[A-Z_]+=' "${WOLTSPACE_WOLTS_DIR:-$HOME/.woltspace/wolts}/.env" | sed 's/^/export /')"
 curl -fsS "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/cfd_tunnel?is_deleted=false" \
-  -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN"
+  -K <(printf 'header = "Authorization: Bearer %s"\n' "$CLOUDFLARE_API_TOKEN")
 ```
 
 Set `TUNNEL_ID` and `APPS_ZONE_ID` to the confirmed values. Do not print or copy the tunnel token.
@@ -49,7 +49,7 @@ First list matching records so the operation is idempotent:
 
 ```bash
 curl -fsS "https://api.cloudflare.com/client/v4/zones/$APPS_ZONE_ID/dns_records?type=CNAME&name=*.$APP_DOMAIN" \
-  -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN"
+  -K <(printf 'header = "Authorization: Bearer %s"\n' "$CLOUDFLARE_API_TOKEN")
 ```
 
 If the exact proxied CNAME does not exist, create it:
@@ -57,7 +57,7 @@ If the exact proxied CNAME does not exist, create it:
 ```bash
 curl -fsS -X POST \
   "https://api.cloudflare.com/client/v4/zones/$APPS_ZONE_ID/dns_records" \
-  -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+  -K <(printf 'header = "Authorization: Bearer %s"\n' "$CLOUDFLARE_API_TOKEN") \
   -H "Content-Type: application/json" \
   --data "{\"type\":\"CNAME\",\"name\":\"*.$APP_DOMAIN\",\"content\":\"$TUNNEL_ID.cfargotunnel.com\",\"proxied\":true}"
 ```
@@ -69,7 +69,7 @@ Tunnel configuration updates replace the full configuration. GET the current obj
 ```bash
 curl -fsS \
   "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/cfd_tunnel/$TUNNEL_ID/configurations" \
-  -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" > /tmp/woltspace-tunnel-config.json
+  -K <(printf 'header = "Authorization: Bearer %s"\n' "$CLOUDFLARE_API_TOKEN") > /tmp/woltspace-tunnel-config.json
 
 APP_DOMAIN="$APP_DOMAIN" GATEWAY_PORT="$GATEWAY_PORT" python3 - <<'PY'
 import json, os
@@ -91,7 +91,7 @@ PY
 
 curl -fsS -X PUT \
   "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/cfd_tunnel/$TUNNEL_ID/configurations" \
-  -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+  -K <(printf 'header = "Authorization: Bearer %s"\n' "$CLOUDFLARE_API_TOKEN") \
   -H "Content-Type: application/json" \
   --data-binary @/tmp/woltspace-tunnel-put.json
 ```
@@ -106,7 +106,7 @@ List Access applications and reuse the exact wildcard application if it exists:
 
 ```bash
 curl -fsS "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/access/apps" \
-  -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN"
+  -K <(printf 'header = "Authorization: Bearer %s"\n' "$CLOUDFLARE_API_TOKEN")
 ```
 
 For a new application, POST the complete object:
@@ -114,7 +114,7 @@ For a new application, POST the complete object:
 ```bash
 curl -fsS -X POST \
   "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/access/apps" \
-  -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+  -K <(printf 'header = "Authorization: Bearer %s"\n' "$CLOUDFLARE_API_TOKEN") \
   -H "Content-Type: application/json" \
   --data "{\"name\":\"woltspace-apps\",\"domain\":\"*.$APP_DOMAIN\",\"type\":\"self_hosted\",\"session_duration\":\"24h\"}"
 ```
@@ -124,13 +124,13 @@ For an existing application, GET it by ID, preserve its complete writable config
 ```bash
 curl -fsS \
   "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/access/apps/$APP_ID" \
-  -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN"
+  -K <(printf 'header = "Authorization: Bearer %s"\n' "$CLOUDFLARE_API_TOKEN")
 
 # Build and inspect the complete writable application object as access-app-put.json.
 # Preserve every existing setting that the owner did not ask to change.
 curl -fsS -X PUT \
   "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/access/apps/$APP_ID" \
-  -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+  -K <(printf 'header = "Authorization: Bearer %s"\n' "$CLOUDFLARE_API_TOKEN") \
   -H "Content-Type: application/json" \
   --data-binary @access-app-put.json
 ```

@@ -177,4 +177,7 @@ agreement, configure `LLM_MODEL` and its matching key in the lodge's private
 `openrouter/…` uses `OPENROUTER_API_KEY`, and `gemini/…` uses `GEMINI_API_KEY`.
 Preserve an existing provider configuration. Never request a key merely to enable
 ordinary wolt text messages. Voice transcription separately requires
-`OPENAI_API_KEY`, even when the dog uses another provider.
+`OPENAI_API_KEY`, even when the dog uses another provider. The same key is what
+lets a wolt answer with a voice note (`notify --speak`); each spoken answer is
+one OpenAI API request, billed to that key, and nothing is spoken unless a wolt
+asks for it.

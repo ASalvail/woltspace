@@ -98,6 +98,8 @@ Your port is declared in `woltspace.json` and is permanent — it never changes.
 - **Static HTML still needs a server.** There is no lodge or gateway static fallback. Use, for example, `"start": "python3 -m http.server $PORT --bind 127.0.0.1"`.
 - **No base path needed.** The gateway gives the app its own origin (the first lodge defaults to `blog.localhost:7117`), so internal links, WebSockets, and HMR work naturally.
 
+- **Secrets:** if the app needs API keys, put them in its own `.env` (gitignored) and load them in the app. Never in `woltspace.json`, the start command, or the code. Apps don't get the lodge's chat, GitHub-bot or Cloudflare tokens; ask the human for a token just for this app. The woltspace apps skill has the full rules.
+
 ## 6. Start it
 
 Run the dev server or build step. Verify it works:

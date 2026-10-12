@@ -30,7 +30,7 @@ If either is missing, the named tunnel hasn't been set up yet — point the user
 ```bash
 eval "$(grep -E '^CLOUDFLARE_[A-Z_]+=' "${WOLTSPACE_WOLTS_DIR:-$HOME/.woltspace/wolts}/.env" | sed 's/^/export /')"
 curl -s "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/access/apps" \
-  -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | python3 -c "
+  -K <(printf 'header = "Authorization: Bearer %s"\n' "$CLOUDFLARE_API_TOKEN") | python3 -c "
 import json, sys
 r = json.load(sys.stdin)
 for app in r['result']:
@@ -56,7 +56,7 @@ A more specific Access app (e.g. `blog.example.com`) takes precedence over the w
 eval "$(grep -E '^CLOUDFLARE_[A-Z_]+=' "${WOLTSPACE_WOLTS_DIR:-$HOME/.woltspace/wolts}/.env" | sed 's/^/export /')"
 APP_RESULT=$(curl -s -X POST \
   "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/access/apps" \
-  -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+  -K <(printf 'header = "Authorization: Bearer %s"\n' "$CLOUDFLARE_API_TOKEN") \
   -H "Content-Type: application/json" \
   --data "{
     \"name\": \"<app-name>\",
@@ -79,7 +79,7 @@ Replace `<APP_ID>`, `<EMAIL>`, and `<name>` with real values. `<name>` is just a
 eval "$(grep -E '^CLOUDFLARE_[A-Z_]+=' "${WOLTSPACE_WOLTS_DIR:-$HOME/.woltspace/wolts}/.env" | sed 's/^/export /')"
 curl -s -X POST \
   "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/access/apps/<APP_ID>/policies" \
-  -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+  -K <(printf 'header = "Authorization: Bearer %s"\n' "$CLOUDFLARE_API_TOKEN") \
   -H "Content-Type: application/json" \
   --data "{
     \"name\": \"allow-<name>\",

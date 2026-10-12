@@ -57,6 +57,21 @@ jobs:
           test/test_auto_grants_cli.py
           test/test_backup.py
           test/test_native_doctor.py
+          test/test_outbox.py
+          test/test_notification_types.py
+          test/test_notification_senders.py
+          test/test_notify_file_core.py
+          test/test_notify_file_telegram.py
+          test/test_notify_file_telegram_methods.py
+          test/test_notify_file_route.py
+          test/test_notify_destination.py
+          test/test_voice_notes.py
+          test/test_notify_voice_telegram.py
+          test/test_notify_voice_core.py
+          test/test_notify_speech.py
+          test/test_notify_speak_core.py
+          test/test_notify_speak_route.py
+          test/test_notify_hardening.py
           test/test_closed_loop.py::TestRegressions::test_notify_footer_appended
           test/test_closed_loop.py::TestRegressions::test_notify_script_executable
           test/test_closed_loop.py::TestRegressions::test_den_reply_footer_consistent
@@ -64,7 +79,16 @@ jobs:
           test/test_native_surfaces.py
           test/test_telegram_loop.py
           test/test_telegram_media_download.py
+          test/test_notify_file_slack.py
+          test/test_telegram_reply_caption.py
           test/test_wolts.py::TestCredentials
+          test/test_wolts.py::TestSyncClaudeMdPlatformSection
+      - name: notify command
+        # The script runs under woltspace-python, which needs a Python that
+        # has the test install's dependencies.
+        run: >-
+          PATH="$PWD/container/bin:$PATH" WOLTSPACE_PYTHON="$(command -v python)"
+          python -m pytest -q test/test_notify_cli.py
       - name: Node suite
         run: npm test
 

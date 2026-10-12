@@ -127,6 +127,16 @@ curl -X POST "$WOLTSPACE_API/apps/unshare-all"      # close them all
 
 A quick tunnel is never opened for the lodge or the gateway port, and the manifest's `public` field is ignored: a manifest can never publish an app.
 
+## Secrets
+
+An app keeps its own secrets in its own folder, never the lodge's.
+
+- **Use the app's own `.env`** (`$WOLTSPACE_WOLTS_DIR/apps/<name>/.env`), gitignored, loaded by the app itself (python-dotenv, Vite's `.env`, etc.).
+- **Don't reuse the lodge's tokens.** Apps no longer receive the lodge's chat, GitHub-bot or Cloudflare credentials (`TELEGRAM_*`, `SLACK_*`, `GITHUB_APP_*`, `CLOUDFLARE_*`). If an app needs Slack or Telegram, ask the human for a separate bot or token just for that app, so a leak exposes one app, not the lodge.
+- **Never print a secret, log it, or commit it.** Your transcript, the app log and git history all outlive the session.
+- **Never put a secret on a command line** (`cmd --token abc`, `KEY=abc` inside a start command). Every user on the machine can read command lines with `ps`. Pass secrets in the environment or a file instead.
+- **Ask, don't hunt.** If a key is missing, ask the human for it. Don't read other wolts' or the lodge's `.env` to find one.
+
 ## Key rules
 
 - **Always use the API to start/stop** — never run start commands directly

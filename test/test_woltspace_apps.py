@@ -290,6 +290,48 @@ class TestStartStop:
         assert "tunnel_url" not in state
 
     @patch("apps.subprocess.Popen")
+    def test_start_app_withholds_lodge_service_credentials(
+        self, mock_popen, wolts_dir, monkeypatch,
+    ):
+        """Chat, GitHub-bot and Cloudflare credentials stay with the lodge."""
+        for key in (
+            "TELEGRAM_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_BOT_TOKEN",
+            "GITHUB_APP_PRIVATE_KEY", "GITHUB_APP_INSTALLATION_ID",
+            "CLOUDFLARE_TUNNEL_TOKEN", "CLOUDFLARE_API_TOKEN",
+        ):
+            monkeypatch.setenv(key, "secret-" + key.lower())
+        monkeypatch.setenv("OPENROUTER_API_KEY", "kept")
+        monkeypatch.setenv("APP_SETTING", "kept")
+        mock_popen.return_value.pid = 12346
+        _make_app(wolts_dir, "quiet", start="node server.js", port=4201)
+
+        apps.start_app("quiet")
+
+        env = mock_popen.call_args[1]["env"]
+        leaked = [k for k in env if k.startswith(apps.LODGE_ONLY_ENV_PREFIXES)]
+        assert leaked == []
+        assert not any(v.startswith("secret-") for v in env.values())
+        assert env["OPENROUTER_API_KEY"] == "kept"
+        assert env["APP_SETTING"] == "kept"
+        assert env["PORT"] == "4201"
+
+    @patch("apps.subprocess.run")
+    @patch("apps.subprocess.Popen")
+    def test_app_install_withholds_lodge_service_credentials(
+        self, mock_popen, mock_run, wolts_dir, monkeypatch,
+    ):
+        monkeypatch.setenv("SLACK_APP_TOKEN", "secret")
+        mock_popen.return_value.pid = 12347
+        _make_app(
+            wolts_dir, "fresh", start="npm run dev", port=4202,
+            stack="node", install="npm install",
+        )
+
+        apps.start_app("fresh")
+
+        assert "SLACK_APP_TOKEN" not in mock_run.call_args[1]["env"]
+
+    @patch("apps.subprocess.Popen")
     def test_start_uses_manifest_port(self, mock_popen, wolts_dir):
         """Port comes from woltspace.json, not dynamic allocation."""
         mock_popen.return_value.pid = 11111

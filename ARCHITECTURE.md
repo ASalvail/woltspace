@@ -43,6 +43,7 @@ server/                     FastAPI server, port 7777
   state.py                    Viewport state + views history
   tunnel.py                   Lodge tunnel lifecycle (quick or named)
   notify.py                   Outbound Telegram/Slack notifications
+  speech.py                   Text to audio for notify --speak; the one module that talks to the speech service
   tools.py                    Tool process registry (spawn + proxy)
   sparks.py                   Spark/digest storage
   tui-service.js              Node pty + WebSocket — the only Node piece left
@@ -107,9 +108,19 @@ The agent loop is multi-turn — Haiku can chain tool calls. Tools live in `core
 ```
 Claude in session passes the message through a single-quoted heredoc to: notify
   → bin/notify                                     wolt-facing helper
+      (--file PATH: staged in .space/outbox/; a file travels by outbox entry id, never by path;
+       credential files, private keys and password files are refused before anything is staged)
+      (--voice PATH: staged the same way, and marked to arrive as a voice note)
+      (--speak: no file; the lodge has the message spoken once it knows where it goes,
+       writes the audio into .space/outbox/ and sends it as a voice note)
   → POST /notify on FastAPI
   → server reads session routing from registry
+      (text goes to any chat the caller names; a file, a voice note or a spoken message only to
+       the lodge's own: TELEGRAM_ALLOWED_USERS, SLACK_NOTIFY_CHANNEL, or the session's own chat)
   → adapter sends to Telegram/Slack with footer:
+      (Telegram reads a file's name: .ogg/.oga/.opus → sendVoice, .mp3/.m4a → sendAudio, anything
+       else → sendDocument; a voice or audio upload Telegram refuses goes again as a document.
+       A voice note that was asked for, --voice or --speak, is sendVoice with no second try)
         "↩ reply to this message…"
         "https://tunnel/tui?session=NAME"
 ```
@@ -180,7 +191,7 @@ The proxy streams responses (so SSE / Vite HMR / video Range requests work) and 
 
 ## Tunnels
 
-The lodge is only ever published through a **named tunnel** — `cloudflared tunnel run --token $TOKEN` (`container/lib/tunnel.py`). Permanent URL on a domain you control, gated by Cloudflare Access. Set `CLOUDFLARE_TUNNEL_TOKEN` + `CLOUDFLARE_TUNNEL_URL` in `.env`. Without both, the lodge stays on the machine: it never opens a quick (random, unauthenticated) tunnel. `WOLTSPACE_PUBLIC_TUNNEL=false` disables tunneling entirely.
+The lodge is only ever published through a **named tunnel** — `cloudflared tunnel run` with the token in `TUNNEL_TOKEN` (never on the command line, which every user on the machine can see) (`container/lib/tunnel.py`). Permanent URL on a domain you control, gated by Cloudflare Access. Set `CLOUDFLARE_TUNNEL_TOKEN` + `CLOUDFLARE_TUNNEL_URL` in `.env`. Without both, the lodge stays on the machine: it never opens a quick (random, unauthenticated) tunnel. `WOLTSPACE_PUBLIC_TUNNEL=false` disables tunneling entirely.
 
 Selection is config-driven; `server/tunnel.py` picks the right path at startup. The same module also tracks `tunnel_domain` and `tunnel_hostname` so the subdomain proxy knows which host is the lodge and which are app subdomains.
 
@@ -221,6 +232,8 @@ wolts/                                     mounted into the container
     ├─ apps/                               running app port + pid files
     ├─ wolf/                               wolf scheduler
     ├─ vulture/                            session reaper
+    ├─ outbox/                             files staged by notify --file / --voice and audio the lodge
+    │                                      spoke for --speak, removed after the send
     └─ logs/                               bot.jsonl event log
 ```
 
