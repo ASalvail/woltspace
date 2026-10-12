@@ -1,6 +1,7 @@
 """Lodge secrets stay off command lines and out of the processes it starts
 for apps and tools."""
 
+import re
 import sys
 from pathlib import Path
 
@@ -59,10 +60,11 @@ def test_tools_spawn_and_restore_drop_lodge_secrets(monkeypatch, tmp_path):
         assert not set(LODGE_SECRETS) & set(env)
 
 
-def test_skills_never_put_a_bearer_token_on_curls_command_line():
+def test_skills_and_docs_never_put_a_bearer_token_on_curls_command_line():
+    # `-H "Authorization: Bearer $TOKEN"` or `${TOKEN}`, any quoting.
+    bearer_arg = re.compile(r"""-H\s+["']Authorization:\s*Bearer\s+\$""")
+    paths = [*(ROOT / "container" / "skills").rglob("*.md"), *(ROOT / "docs").rglob("*.md")]
     offenders = [
-        str(path.relative_to(ROOT))
-        for path in (ROOT / "container" / "skills").rglob("*.md")
-        if '-H "Authorization: Bearer $' in path.read_text()
+        str(path.relative_to(ROOT)) for path in paths if bearer_arg.search(path.read_text())
     ]
     assert offenders == []
