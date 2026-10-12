@@ -1056,3 +1056,18 @@ def test_gateway_refuses_every_token_while_the_apps_audience_is_empty(tmp_path, 
     for token in (None, _token(key, "apps-aud"), _token(key, ""), _token(key, "lodge-aud")):
         response = asyncio.run(_get("/", host="notes.owner.woltspace.app", token=token))
         assert response.status_code == 403
+
+
+def test_gateway_websocket_is_refused_while_the_apps_audience_is_empty(tmp_path, monkeypatch):
+    key = _configure(tmp_path, monkeypatch)
+    config = json.loads((tmp_path / "woltspace.json").read_text())
+    config["access"]["apps_aud"] = ""
+    (tmp_path / "woltspace.json").write_text(json.dumps(config))
+    headers = {
+        "host": "notes.owner.woltspace.app", "origin": "https://notes.owner.woltspace.app",
+        "cf-access-jwt-assertion": _token(key, "apps-aud"),
+    }
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with TestClient(gateway.app).websocket_connect("/socket", headers=headers):
+            pass
+    assert exc.value.code == 1008

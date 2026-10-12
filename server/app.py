@@ -386,8 +386,10 @@ def _owner_allowed_hosts() -> set[str]:
     """
     raw = os.environ.get("WOLTSPACE_ALLOWED_HOSTS", "")
     names = {name.strip().lower().rstrip(".") for name in raw.split(",")}
-    names.discard("")
-    return names
+    # `*.localhost` is reserved for this machine's app hosts and `localhost`
+    # is always allowed, so neither can be re-declared as a lodge name.
+    return {name for name in names if name and name != "localhost"
+            and not name.endswith(".localhost")}
 
 
 def _allowed_http_hostname(hostname: str) -> bool:

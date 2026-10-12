@@ -608,3 +608,44 @@ def test_listed_hosts_keep_the_write_and_websocket_guards(monkeypatch):
         ):
             pass
     assert exc.value.code == 1008
+
+
+def test_localhost_names_cannot_be_redeclared_as_lodge_hosts(monkeypatch):
+    monkeypatch.setenv("WOLTSPACE_ALLOWED_HOSTS", "studio.localhost, localhost, real.example")
+    assert server_app._owner_allowed_hosts() == {"real.example"}
+    assert server_app._extract_app_subdomain("studio.localhost") == "studio"
+
+
+@pytest.mark.parametrize("origin", ["null", "https://attacker.example", "https://lodge.tail1234.ts.net:8443"])
+def test_listed_host_websocket_with_a_valid_owner_token_still_checks_origin(origin, monkeypatch):
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    _configured(monkeypatch, key.public_key())
+    host = "lodge.tail1234.ts.net"
+    monkeypatch.setenv("WOLTSPACE_ALLOWED_HOSTS", host)
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with TestClient(server_app.app).websocket_connect("/livereload", headers={
+            "host": host, "origin": origin,
+            "cf-access-jwt-assertion": _token(key, SETTINGS.lodge_aud),
+        }):
+            pass
+    assert exc.value.code == 1008
+
+
+def test_listed_host_websocket_with_owner_token_and_same_origin_connects(monkeypatch):
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    _configured(monkeypatch, key.public_key())
+    host = "lodge.tail1234.ts.net"
+    monkeypatch.setenv("WOLTSPACE_ALLOWED_HOSTS", host)
+    with TestClient(server_app.app).websocket_connect("/livereload", headers={
+        "host": host, "origin": f"https://{host}",
+        "cf-access-jwt-assertion": _token(key, SETTINGS.lodge_aud),
+    }):
+        pass
+
+
+def test_overlapping_alias_refuses_a_non_owner_lodge_token(monkeypatch):
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    _configured(monkeypatch, key.public_key())
+    monkeypatch.setenv("WOLTSPACE_ALLOWED_HOSTS", "alt.woltspace.test")
+    token = _token(key, SETTINGS.lodge_aud, email="intruder@example.com")
+    assert asyncio.run(_request(host="alt.woltspace.test", token=token)).status_code == 403
