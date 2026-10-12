@@ -42,10 +42,11 @@ def lodge(monkeypatch, tmp_path):
         tmp=tmp_path, spoken=[], speech_error=None,
     )
 
-    async def synthesize(text, speech_format, target, *, api_key, model, voice):
+    async def synthesize(text, speech_format, target, *, api_key, model, voice,
+                         max_bytes=None):
         state.spoken.append(SimpleNamespace(
             text=text, speech_format=speech_format, target=target,
-            api_key=api_key, model=model, voice=voice,
+            api_key=api_key, model=model, voice=voice, max_bytes=max_bytes,
         ))
         if state.speech_error is not None:
             raise state.speech_error
@@ -330,7 +331,8 @@ def real_lodge(monkeypatch, tmp_path):
         "OPENAI_API_KEY": "sk-test",
     }
 
-    async def synthesize(text, speech_format, target, *, api_key, model, voice):
+    async def synthesize(text, speech_format, target, *, api_key, model, voice,
+                         max_bytes=None):
         target.write_bytes(OGG)
         return len(OGG)
 

@@ -70,10 +70,13 @@ def _refusal(status: int, body: bytes, api_key: str) -> str:
 
 async def synthesize(
     text: str, speech_format: str, target: Path, *, api_key: str, model: str, voice: str,
+    max_bytes: int | None = None,
 ) -> int:
     """Write `text`, spoken, to the new file `target`; return its size in bytes.
 
     A failure leaves no file behind, and a file already at `target` is left alone.
+    `max_bytes` stops the download as soon as the audio outgrows what the
+    sender can carry, instead of measuring it once it is all on disk.
     """
     if speech_format not in SPEECH_FILES:
         raise SpeechError("speech_failed", f"unknown speech format: {speech_format}")
@@ -98,8 +101,14 @@ async def synthesize(
                 created = True
                 with os.fdopen(descriptor, "wb") as audio:
                     async for chunk in response.aiter_bytes():
-                        audio.write(chunk)
                         size += len(chunk)
+                        if max_bytes is not None and size > max_bytes:
+                            raise SpeechError(
+                                "speech_too_large",
+                                f"the spoken audio is over {max_bytes} bytes; "
+                                "send a shorter message",
+                            )
+                        audio.write(chunk)
                         if len(head) < 4:
                             head = (head + chunk)[:4]
         # A 200 can still be an error page, or audio in another format.

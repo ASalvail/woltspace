@@ -105,11 +105,25 @@ async def test_split_sends_the_text_before_the_document(attachment):
     assert order == ["text", "document"]
 
 
+@pytest.fixture
+def parse_session_from_reply(monkeypatch, tmp_path):
+    # The adapter loads bot.core, which makes its log folder under the data
+    # root as it is imported. A first import here must not reach for the
+    # default /workspace, which CI cannot create.
+    if "bot.core" not in sys.modules:
+        for name in ("WOLTSPACE_WOLTS_DIR", "WOLTS_DIR"):
+            monkeypatch.setenv(name, str(tmp_path / "wolts"))
+    from bot.telegram_adapter import _parse_session_from_reply
+    return _parse_session_from_reply
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("link", [LINK, "session=test-session"])
 @pytest.mark.parametrize("split", [False, True])
-async def test_split_caption_is_still_a_parseable_reply_footer(attachment, link, split):
-    from bot.telegram_adapter import _parse_session_from_reply
+async def test_split_caption_is_still_a_parseable_reply_footer(
+    attachment, link, split, parse_session_from_reply,
+):
+    _parse_session_from_reply = parse_session_from_reply
 
     document_transport = AsyncMock()
     text = "x" * 2000 if split else "hi\n"
