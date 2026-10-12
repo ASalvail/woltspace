@@ -123,3 +123,14 @@ async def test_speech_not_configured_names_no_lodge_path(lodge):
     assert error.value.reason == "speech_not_configured"
     assert str(notify.WOLTS_DIR) not in str(error.value)
     assert "/" not in str(error.value)
+
+
+def test_a_lodge_state_file_is_refused_with_its_own_reason(tmp_path):
+    state = tmp_path / ".space" / "telegram" / "uploads"
+    state.mkdir(parents=True)
+    upload = state / "photo.jpg"
+    upload.write_bytes(b"jpeg")
+    with pytest.raises(outbox.OutboxError) as error:
+        outbox.check_source(upload)
+    assert ".space folder" in str(error.value)
+    assert "copy it into your wolt" in str(error.value)

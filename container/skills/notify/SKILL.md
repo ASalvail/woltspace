@@ -73,7 +73,8 @@ Opus, say), it arrives as a plain file. Any other name is a document.
   `.p12` or `.pfx`, `.netrc`, `.git-credentials` and `.pgpass`, AWS
   `credentials` and `config`, password vaults (`.kdbx` and the like), and
   anything in the lodge's `.space` folder (chat history, sessions, tunnel
-  state). A link to
+  state; to send back a photo the human uploaded, copy it into your wolt's
+  folder first). A link to
   one of them under another name is refused too. A Keynote deck also ends in
   `.key`: export it to PDF and send that.
 - The message may be empty when a file is attached.

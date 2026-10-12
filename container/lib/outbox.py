@@ -102,7 +102,14 @@ def check_source(path: Path) -> int:
         raise OutboxError("not_a_file", f"not a regular file: {path}")
     # The rules read names, so judge the name as typed and the file it leads to.
     for candidate in (os.path.abspath(path), os.path.realpath(path)):
-        if credential_rule(Path(candidate)):
+        rule = credential_rule(Path(candidate))
+        if rule == "lodge-state":
+            raise OutboxError(
+                "credential",
+                f"refusing to send a file from the lodge's .space folder: {path.name}; "
+                "copy it into your wolt's folder first if it is meant to be shared",
+            )
+        if rule:
             raise OutboxError(
                 "credential", f"refusing to send a credential file: {path.name}"
             )
