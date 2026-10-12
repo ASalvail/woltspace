@@ -98,7 +98,10 @@ TUNNEL_ID=$(echo "$TUNNEL_RESULT" | python3 -c "import json,sys; print(json.load
 TUNNEL_TOKEN=$(echo "$TUNNEL_RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin)['result']['token'])")
 
 echo "Tunnel ID: $TUNNEL_ID"
-echo "Token: $TUNNEL_TOKEN"
+# Never print the token: it would land in this session's transcript.
+# Write it straight to .env from the same shell.
+printf 'CLOUDFLARE_TUNNEL_TOKEN=%s\n' "$TUNNEL_TOKEN" >> /workspace/wolts/.env
+echo "Token saved to .env (${#TUNNEL_TOKEN} chars)"
 ```
 
 Configure the tunnel ingress:
@@ -133,10 +136,9 @@ curl -s -X POST \
   }"
 ```
 
-Add the tunnel token and URL to `.env`:
+The token is already in `.env` (written above). Add the tunnel URL next to it:
 
 ```
-CLOUDFLARE_TUNNEL_TOKEN=<token from above>
 CLOUDFLARE_TUNNEL_URL=https://<subdomain>.<domain>
 ```
 
@@ -252,7 +254,9 @@ Start the named tunnel manually to verify:
 
 ```bash
 source /workspace/wolts/.env
-cloudflared tunnel run --token "$CLOUDFLARE_TUNNEL_TOKEN" &
+# TUNNEL_TOKEN in the environment, not --token: a command line is visible
+# to every user on the machine (ps).
+TUNNEL_TOKEN="$CLOUDFLARE_TUNNEL_TOKEN" cloudflared tunnel run &
 sleep 3
 curl -s -o /dev/null -w "%{http_code}" "https://<subdomain>.<domain>"
 ```
