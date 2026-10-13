@@ -55,6 +55,7 @@ from .access import (
     save_access_settings,
 )
 from .notify import AttachmentError, NoNotificationTarget, send_notification
+from .connector_api import router as connector_router
 from .speech import SpeechError
 from .app_sharing import read_app_shares, read_site_shares, write_app_shares, write_site_shares
 from .content_hosts import (
@@ -1099,6 +1100,11 @@ async def views_history():
 
 
 # --- Notify ---
+
+# The connector protocol's routes carry their own admission (a connector
+# token, local-only); nothing else on this app is reachable with one.
+app.include_router(connector_router)
+
 
 @app.post("/notify")
 async def post_notify(request: Request):
