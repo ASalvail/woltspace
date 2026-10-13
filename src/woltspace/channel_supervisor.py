@@ -127,6 +127,11 @@ def timeout_for_stillborn() -> float:
     return 5.0
 
 
+RECOVERY_INTERVAL = 60.0
+# While something is owed or failing: often enough to settle soon, not every tick.
+RECOVERY_RETRY = 5.0
+
+
 def backoff_delay(restarts: int) -> float:
     return min(BACKOFF_BASE * (2 ** max(restarts - 1, 0)), BACKOFF_CAP)
 
@@ -191,8 +196,14 @@ class ChannelSupervisor:
         ps_bin: str | None = None,
         runner=subprocess.run,
         already_reaped: bool = False,
+        recovery=None,
     ):
         self.layout = layout
+        # The lodge-wide debt recovery (handoff.ConnectorRecovery), or None
+        # when it could not be built: then every report says so.
+        self.recovery = recovery
+        self._recovery_status: dict = {"ran": False, "ok": False, "errors": ["recovery unavailable"]}
+        self._recovered_at = 0.0
         self._already_reaped = already_reaped
         self.ps_bin = ps_bin or os.environ.get("WOLTSPACE_PS_BIN", "ps")
         self._run = runner
@@ -265,12 +276,10 @@ class ChannelSupervisor:
             orphans = self.reap_orphans()
             if orphans:
                 print(f"[connectors] reaped {len(orphans)} orphaned connector(s): {orphans}")
+        # Whatever a previous supervisor left owed is settled before anything
+        # new is minted, whatever the plans say about launching.
+        self._recover()
         for name, state in self.states.items():
-            if state.plan.handoff is not None:
-                # Whatever a previous supervisor left (a pending or live
-                # generation it could not revoke) is revoked before anything
-                # new is minted.
-                state.plan.handoff.recover()
             if not state.plan.enabled:
                 state.state = "disabled"
                 continue
@@ -505,6 +514,13 @@ class ChannelSupervisor:
     def poll_once(self) -> None:
         """One supervision tick. Public so tests can drive it deterministically."""
         changed = False
+        # Recovery again: every few seconds while something is owed or failing, else once a minute.
+        interval = RECOVERY_INTERVAL if self._recovery_status.get("ok") else RECOVERY_RETRY
+        if self.recovery is not None and self._clock() - self._recovered_at >= interval:
+            before = {k: v for k, v in self._recovery_status.items() if k != "at"}
+            self._recover()
+            if {k: v for k, v in self._recovery_status.items() if k != "at"} != before:
+                changed = True
         for name, state in self.states.items():
             handoff = state.plan.handoff
             if handoff is not None:
@@ -622,9 +638,19 @@ class ChannelSupervisor:
 
     # -- reporting ---------------------------------------------------------
 
+    def _recover(self) -> None:
+        if self.recovery is None:
+            return
+        try:
+            self._recovery_status = self.recovery.run()
+        except Exception as exc:  # noqa: BLE001 - reported, retried
+            self._recovery_status = {"ran": True, "ok": False, "errors": [str(exc)], "owed": [], "settled": []}
+        self._recovered_at = self._clock()
+
     def report(self) -> dict:
         return {
             "connectors": [state.to_record() for state in self.states.values()],
+            "recovery": dict(self._recovery_status),
             "updated": int(time.time()),
         }
 

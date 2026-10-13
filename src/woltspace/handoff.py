@@ -26,11 +26,19 @@ state, and shown in `status()`. `check()` on every tick: a file still there
 after `CONSUME_TIMEOUT` is removed and its generation revoked; a file gone
 but whose generation was not activated within the window is a failure too,
 never a success. A revocation that fails is also written down as a debt in
-`run/debts.json` (0600, anchored like everything else): exact
-(instance, generation) records, so that `recover()` at the next supervisor
-start revokes precisely those and nothing newer, a connector that
-legitimately survived included. Pending generations never activated within
-the window are revoked at recovery too.
+the ledger, `run/debts.json` (0600, anchored like everything else, every
+read-modify-write under `run/debts.lock`): exact (instance, generation)
+records. `ConnectorRecovery`, a lodge-wide step the supervisor runs at
+every start and again on later ticks whatever the plans say (connector
+disabled, channel off, runtime back on the adapter, another instance
+selected), settles precisely those debts for every instance and revokes
+pending generations never activated within the window; a newer live
+generation is never touched, a connector that legitimately survived
+included. The ledger is never read as empty when it is not: a corrupt,
+unreadable, non-regular or oversized file is preserved as it is, reported
+as a recovery failure (status, `woltspace connector list`, doctor) and
+retried; a debt that could not be written down is marked non-durable in
+the handoff's status rather than called durable.
 """
 
 from __future__ import annotations
@@ -48,6 +56,8 @@ CONSUME_TIMEOUT = 10.0
 STALE_AFTER = 60.0
 RUN_DIR = "run"
 DEBTS_FILE = "debts.json"
+DEBTS_LOCK = "debts.lock"
+DEBTS_MAX_BYTES = 64 * 1024
 
 
 def canonical_root(root: Path) -> str:
@@ -112,6 +122,8 @@ class ConnectorHandoff:
         # failed, each with the last error. Retried on every call.
         self.unrevoked: dict[int, str] = {}
         self.uncleaned: dict[str, str] = {}
+        # Debts that are owed in memory but could not be written to the ledger.
+        self.non_durable: dict[int, str] = {}
         self.activated = False
 
     def _store(self):
@@ -273,73 +285,27 @@ class ConnectorHandoff:
             os.close(root_fd)
         return removed
 
-    def recover(self) -> None:
-        """At a supervisor's start: the debts a previous supervisor wrote down are settled.
+    # ------------------------------------------------------------ the ledger
 
-        Exactly the generations it could not revoke, never a newer one; plus
-        every pending generation that was never activated within the window.
-        """
-        for instance_id, generation in self._read_debts():
-            if instance_id == self.instance_id:
-                self.unrevoked.setdefault(generation, "owed by a previous supervisor")
-        try:
-            self._store().revoke_stale_pending(self._clock() - CONSUME_TIMEOUT)
-        except Exception as exc:  # noqa: BLE001 - retried on the next tick as a debt
-            self.unrevoked[-1] = f"stale sweep: {exc}"
-        self.retry_debts()
-
-    # ------------------------------------------------------------ debt file
-
-    def _read_debts(self) -> list[tuple[str, int]]:
-        try:
-            root_fd, run_fd = open_anchored_run_dir(self.root, create=False)
-        except OSError:
-            return []
-        try:
-            try:
-                descriptor = os.open(DEBTS_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=run_fd)
-            except OSError:
-                return []
-            try:
-                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                    return []
-                raw = os.read(descriptor, 64 * 1024)
-            finally:
-                os.close(descriptor)
-            data = json.loads(raw)
-            return [
-                (str(d["instance_id"]), int(d["generation"])) for d in data
-                if isinstance(d, dict) and "instance_id" in d and "generation" in d
-            ] if isinstance(data, list) else []
-        except (OSError, ValueError, TypeError):
-            return []
-        finally:
-            os.close(run_fd)
-            os.close(root_fd)
-
-    def _write_debts(self, debts: list[tuple[str, int]]) -> None:
-        root_fd, run_fd = open_anchored_run_dir(self.root, create=True)
-        try:
-            tmp = f".{DEBTS_FILE}.{os.getpid()}.tmp"
-            descriptor = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600, dir_fd=run_fd)
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                json.dump([{"instance_id": i, "generation": g} for i, g in debts], handle)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.rename(tmp, DEBTS_FILE, src_dir_fd=run_fd, dst_dir_fd=run_fd)
-        finally:
-            os.close(run_fd)
-            os.close(root_fd)
+    @property
+    def ledger(self) -> "DebtLedger":
+        return DebtLedger(self.root)
 
     def _note_debt(self, generation: int, owed: bool) -> None:
-        """Write the debt down (or strike it) so the next supervisor settles it; best effort."""
+        """Write the debt down (or strike it) so the next supervisor settles it.
+
+        A ledger that cannot be written leaves the debt in memory only, and
+        says so: `status()["unrevoked"][generation]["durable"]` is False.
+        """
         try:
-            debts = [d for d in self._read_debts() if d != (self.instance_id, generation)]
             if owed:
-                debts.append((self.instance_id, generation))
-            self._write_debts(debts)
-        except OSError:
-            pass
+                self.ledger.add(self.instance_id, generation)
+            else:
+                self.ledger.remove(self.instance_id, generation)
+            self.non_durable.pop(generation, None)
+        except (OSError, DebtLedgerUnreadable) as exc:
+            if owed:
+                self.non_durable[generation] = str(exc)
 
     # ------------------------------------------------------------ revocation
 
@@ -352,6 +318,7 @@ class ConnectorHandoff:
             return
         if self.unrevoked.pop(generation, None) is not None:
             self._note_debt(generation, owed=False)
+        self.non_durable.pop(generation, None)
 
     def retry_debts(self) -> None:
         """Every revocation or removal that failed is tried again; nothing is forgotten."""
@@ -380,6 +347,192 @@ class ConnectorHandoff:
         return {
             "generation": self.generation, "activated": self.activated,
             "pending_file": self.pending is not None,
-            "unrevoked": {str(g): e for g, e in self.unrevoked.items()},
+            "unrevoked": {
+                str(g): {"error": e, "durable": g not in self.non_durable}
+                | ({"ledger": self.non_durable[g]} if g in self.non_durable else {})
+                for g, e in self.unrevoked.items()
+            },
             "uncleaned": dict(self.uncleaned),
         }
+
+
+class DebtLedgerUnreadable(RuntimeError):
+    """The ledger exists but cannot be trusted; it is kept as it is, never replaced."""
+
+
+class DebtLedger:
+    """Exact (instance, generation) revocation obligations, in the anchored run dir.
+
+    Absence is an empty ledger. Anything else that is not a small regular
+    JSON list of records is `DebtLedgerUnreadable`, and no write ever
+    replaces such a file. Every read-modify-write holds `debts.lock`
+    (flock, across processes); the temp name is unique per process and
+    attempt and the publish is an fd-relative rename.
+    """
+
+    def __init__(self, root: str):
+        self.root = root
+
+    def _run(self, *, create: bool):
+        return open_anchored_run_dir(self.root, create=create)
+
+    def _read_in(self, run_fd: int) -> list[tuple[str, int]]:
+        try:
+            descriptor = os.open(DEBTS_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=run_fd)
+        except FileNotFoundError:
+            return []
+        except OSError as exc:
+            raise DebtLedgerUnreadable(f"{DEBTS_FILE}: {exc}") from None
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode):
+                raise DebtLedgerUnreadable(f"{DEBTS_FILE} is not a regular file")
+            if info.st_size > DEBTS_MAX_BYTES:
+                raise DebtLedgerUnreadable(f"{DEBTS_FILE} is over {DEBTS_MAX_BYTES} bytes")
+            raw = os.read(descriptor, DEBTS_MAX_BYTES + 1)
+        finally:
+            os.close(descriptor)
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            raise DebtLedgerUnreadable(f"{DEBTS_FILE} does not parse") from None
+        if not isinstance(data, list):
+            raise DebtLedgerUnreadable(f"{DEBTS_FILE} has an unknown shape")
+        debts = []
+        for entry in data:
+            if (
+                not isinstance(entry, dict) or not isinstance(entry.get("instance_id"), str)
+                or isinstance(entry.get("generation"), bool) or not isinstance(entry.get("generation"), int)
+            ):
+                raise DebtLedgerUnreadable(f"{DEBTS_FILE} has an unknown shape")
+            debts.append((entry["instance_id"], entry["generation"]))
+        return debts
+
+    def _write_in(self, run_fd: int, debts: list[tuple[str, int]]) -> None:
+        tmp = f".{DEBTS_FILE}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+        descriptor = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=run_fd)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump([{"instance_id": i, "generation": g} for i, g in debts], handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.rename(tmp, DEBTS_FILE, src_dir_fd=run_fd, dst_dir_fd=run_fd)
+        except BaseException:
+            try:
+                os.unlink(tmp, dir_fd=run_fd)
+            except OSError:
+                pass
+            raise
+
+    def _locked(self, action, *, create: bool):
+        try:
+            root_fd, run_fd = self._run(create=create)
+        except FileNotFoundError:
+            if create:
+                raise
+            # No run directory yet: nothing was ever written down. Absence, not damage.
+            return []
+        try:
+            # Created exclusively first, then opened: on macOS two openat(O_CREAT)
+            # of the same new name can answer ENOENT to the loser.
+            try:
+                os.close(os.open(DEBTS_LOCK, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=run_fd))
+            except FileExistsError:
+                pass
+            lock = os.open(DEBTS_LOCK, os.O_WRONLY | os.O_NOFOLLOW, dir_fd=run_fd)
+            try:
+                import fcntl
+
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                try:
+                    return action(run_fd)
+                finally:
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+            finally:
+                os.close(lock)
+        finally:
+            os.close(run_fd)
+            os.close(root_fd)
+
+    def read(self) -> list[tuple[str, int]]:
+        """Read-only: a ledger that was never started is empty; nothing is created."""
+        return self._locked(self._read_in, create=False)
+
+    def add(self, instance_id: str, generation: int) -> None:
+        def action(run_fd):
+            debts = self._read_in(run_fd)          # unreadable: raises, nothing replaced
+            if (instance_id, generation) not in debts:
+                self._write_in(run_fd, [*debts, (instance_id, generation)])
+        self._locked(action, create=True)
+
+    def remove(self, instance_id: str, generation: int) -> None:
+        def action(run_fd):
+            debts = self._read_in(run_fd)
+            if (instance_id, generation) in debts:
+                self._write_in(run_fd, [d for d in debts if d != (instance_id, generation)])
+        self._locked(action, create=False)
+
+    def status(self) -> dict:
+        """{"readable": bool, "debts": [...], "error": str|None} without raising."""
+        try:
+            return {"readable": True, "debts": [list(d) for d in self.read()], "error": None}
+        except DebtLedgerUnreadable as exc:
+            return {"readable": False, "debts": [], "error": str(exc)}
+        except OSError as exc:
+            return {"readable": False, "debts": [], "error": f"ledger unavailable: {exc}"}
+
+
+class ConnectorRecovery:
+    """The lodge-wide step: every recorded debt settled, every stale pending revoked.
+
+    Independent of launch planning: it runs whether or not any connector is
+    enabled, for every instance in the ledger, and touches exactly those
+    generations. An unreadable ledger is a failure to report and retry,
+    never an empty ledger.
+    """
+
+    def __init__(self, root: Path, store_factory: Callable[[], object], *, clock: Callable[[], float] = time.time):
+        self.root = canonical_root(root)
+        self._store_factory = store_factory
+        self._clock = clock
+        self.last: dict = {"ran": False}
+
+    def run(self) -> dict:
+        ledger = DebtLedger(self.root)
+        outcome = {"ran": True, "at": self._clock(), "settled": [], "owed": [], "errors": []}
+        try:
+            debts = ledger.read()
+        except (DebtLedgerUnreadable, OSError) as exc:
+            outcome["errors"].append(f"ledger: {exc}")
+            debts = None
+        if debts is not None:
+            try:
+                store = self._store_factory()
+            except Exception as exc:  # noqa: BLE001 - the lodge's state code or registry is unavailable
+                store = None
+                outcome["errors"].append(f"store: {exc}")
+            for instance_id, generation in debts:
+                if store is None:
+                    outcome["owed"].append([instance_id, generation])
+                    continue
+                try:
+                    try:
+                        store.revoke_generation(instance_id, generation)
+                    except Exception as exc:  # noqa: BLE001
+                        # An instance that is gone took its tokens with it; anything else is still owed.
+                        if getattr(exc, "reason", "") != "unknown_instance":
+                            raise
+                    ledger.remove(instance_id, generation)
+                    outcome["settled"].append([instance_id, generation])
+                except Exception as exc:  # noqa: BLE001 - kept owed, retried next time
+                    outcome["owed"].append([instance_id, generation])
+                    outcome["errors"].append(f"{instance_id}/{generation}: {exc}")
+        try:
+            store = self._store_factory()
+            for instance_id, generation in store.revoke_stale_pending(self._clock() - CONSUME_TIMEOUT):
+                outcome["settled"].append([instance_id, generation])
+        except Exception as exc:  # noqa: BLE001
+            outcome["errors"].append(f"stale pending: {exc}")
+        outcome["ok"] = not outcome["errors"] and not outcome["owed"]
+        self.last = outcome
+        return outcome

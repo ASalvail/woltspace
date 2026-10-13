@@ -66,6 +66,24 @@ def telegram_runtime(layout: RuntimeLayout) -> str:
 _CHILD_BASE_ENV = ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL")
 
 
+def connector_recovery(layout: RuntimeLayout):
+    """The lodge-wide debt recovery step, built without any connector plan.
+
+    None when the lodge's own state code is not beside this CLI; the
+    supervisor then reports recovery as unavailable rather than done.
+    """
+    from .handoff import ConnectorRecovery
+
+    try:
+        connectors = _connectors_module(layout)
+    except ImportError:
+        return None
+    return ConnectorRecovery(
+        layout.platform_state,
+        lambda: connectors.ConnectorStore(layout.wolts_dir / ".space" / "connectors"),
+    )
+
+
 def _module_available(name: str) -> bool:
     try:
         return importlib.util.find_spec(name) is not None

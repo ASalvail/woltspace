@@ -26,8 +26,9 @@ from server import connector_api  # noqa: E402
 from server.connectors import ConnectorError, ConnectorStore, Limits, set_channel_runtime  # noqa: E402
 from woltspace import handoff as handoff_module  # noqa: E402
 from woltspace.channel_supervisor import ChannelSupervisor, read_connector_report  # noqa: E402
-from woltspace.channels import ConnectorPlan, TelegramConnector, TelegramRuntimeConnector, plan_connectors  # noqa: E402
-from woltspace.handoff import ConnectorHandoff  # noqa: E402
+from woltspace.channels import ConnectorPlan, TelegramConnector, TelegramRuntimeConnector, connector_recovery, plan_connectors  # noqa: E402
+from woltspace.doctor import check_connector_ledger  # noqa: E402
+from woltspace.handoff import ConnectorHandoff, ConnectorRecovery, DebtLedger, DebtLedgerUnreadable  # noqa: E402
 from woltspace.layout import RuntimeLayout  # noqa: E402
 from woltspace_telegram.runner import read_handoff  # noqa: E402
 
@@ -180,7 +181,7 @@ def test_launch_hands_a_pending_token_over_by_file_and_the_child_activates_it(la
     monkeypatch.setenv("SECRET_OF_THE_LODGE", "leaks?")
     report = layout.wolts_dir / "child-report.jsonl"
     plan = _child_plan(TelegramRuntimeConnector().plan(layout, ENV), report, colony)
-    sup = ChannelSupervisor(layout, [plan], poll_interval=0.05)
+    sup = ChannelSupervisor(layout, [plan], poll_interval=0.05, recovery=connector_recovery(layout))
     sup.start()
     try:
         assert _wait_for(lambda: _records(report))
@@ -197,6 +198,7 @@ def test_launch_hands_a_pending_token_over_by_file_and_the_child_activates_it(la
         state = sup.report()["connectors"][0]
         assert state["state"] == "running" and TOKEN not in json.dumps(state)
         assert state["handoff"] == {"generation": 1, "activated": True, "pending_file": False, "unrevoked": {}, "uncleaned": {}}
+        assert sup.report()["recovery"]["ok"] is True
     finally:
         sup.stop()
     after = read_connector_report(layout)["connectors"][0]
@@ -441,13 +443,15 @@ def test_a_failed_revocation_is_kept_visible_and_retried(layout, colony, monkeyp
 
     monkeypatch.setattr(ConnectorStore, "revoke_generation", flaky)
     handoff.abandon()
-    assert handoff.status()["unrevoked"] == {"1": "registry on fire"}
+    assert handoff.status()["unrevoked"] == {"1": {"error": "registry on fire", "durable": True}}
+    assert DebtLedger(handoff.root).read() == [("tg", 1)]
     assert colony.token_state("tg", 1) == "pending"     # still owed
     handoff.check()
-    assert handoff.status()["unrevoked"] == {"1": "registry on fire"}
+    assert handoff.status()["unrevoked"] == {"1": {"error": "registry on fire", "durable": True}}
     broken[0] = False
     handoff.check()
     assert handoff.status()["unrevoked"] == {} and colony.token_state("tg", 1) == "revoked"
+    assert DebtLedger(handoff.root).read() == []
 
 
 def test_a_handoff_taken_but_never_acknowledged_fails_closed(layout, colony, monkeypatch):
@@ -687,18 +691,18 @@ def test_debts_are_retried_from_a_failed_spawn_state_on_later_ticks(layout, colo
     sup = ChannelSupervisor(layout, [broken])
     sup.start(watch=False)
     state = sup.report()["connectors"][0]
-    assert state["state"] == "failed" and state["handoff"]["unrevoked"] == {"1": "registry on fire"}
+    assert state["state"] == "failed" and state["handoff"]["unrevoked"] == {"1": {"error": "registry on fire", "durable": True}}
     assert colony.token_state("tg", 1) == "pending"
     sup.poll_once()
-    assert sup.report()["connectors"][0]["handoff"]["unrevoked"] == {"1": "registry on fire"}
+    assert sup.report()["connectors"][0]["handoff"]["unrevoked"] == {"1": {"error": "registry on fire", "durable": True}}
     failing[0] = False
-    sup.poll_once()                       # a tick in the failed, childless state pays the debt
+    sup.poll_once()                       # a tick in the failed, childless state settles the debt
     assert sup.report()["connectors"][0]["handoff"]["unrevoked"] == {}
     assert colony.token_state("tg", 1) == "revoked"
     sup.stop()
 
 
-def test_a_debt_left_at_exit_is_paid_at_the_next_start_and_a_newer_live_generation_survives(layout, colony, monkeypatch):
+def test_a_debt_left_at_exit_is_settled_at_the_next_start_and_a_newer_live_generation_survives(layout, colony, monkeypatch):
     """Active generation, revocation fails, the supervisor exits: the next start revokes exactly it."""
     first = ConnectorHandoff(lambda: colony, "tg", layout.platform_state)
     env = first.prepare()
@@ -718,19 +722,18 @@ def test_a_debt_left_at_exit_is_paid_at_the_next_start_and_a_newer_live_generati
     data = json.loads(Path(env["WOLTSPACE_CONNECTOR_TOKEN_FILE"]).read_text())
     colony.activate(data["token"], lodge_id=data["lodge_id"], instance_id="tg", generation=2)
     assert colony.token_state("tg", 1) == "revoked"     # the mint already revoked the older one...
-    # ...but make the debt real again to prove recovery pays exactly it: re-arm generation 1.
+    # ...but make the debt real again to prove recovery settles exactly it: re-arm generation 1.
     registry = colony._registry()
     for token in registry["tokens"]:
         if token["generation"] == 1:
             token["revoked"] = None
     colony._write_json(colony.registry_path, registry)
     assert colony.token_state("tg", 1) == "active"
-    restarted = ConnectorHandoff(lambda: colony, "tg", layout.platform_state)
-    restarted.recover()
+    outcome = ConnectorRecovery(layout.platform_state, lambda: colony).run()
+    assert outcome["ok"] is True and outcome["settled"] == [["tg", 1]]
     assert colony.token_state("tg", 1) == "revoked"
     assert colony.token_state("tg", 2) == "active"
     assert json.loads((layout.platform_state / "run" / "debts.json").read_text()) == []
-    assert restarted.status()["unrevoked"] == {}
 
 
 def test_a_stillborn_child_that_cannot_be_confirmed_gone_is_reported_unknown(layout, colony, monkeypatch):
@@ -779,3 +782,219 @@ def test_the_writer_is_anchored_too(layout, colony, tmp_path):
     assert Path(env["WOLTSPACE_CONNECTOR_TOKEN_FILE"]).parent == Path(env["WOLTSPACE_HANDOFF_ROOT"]) / "run"
     assert stat.S_IMODE((layout.platform_state / "run").stat().st_mode) == 0o700
     handoff.abandon()
+
+
+# ------------------------------------- round 4: lodge-wide recovery, ledger integrity
+
+
+def _owe(colony, layout, instance_id="tg", monkeypatch=None) -> int:
+    """An active generation whose revocation failed at shutdown: a debt in the ledger."""
+    handoff = ConnectorHandoff(lambda: colony, instance_id, layout.platform_state)
+    env = handoff.prepare()
+    data = json.loads(Path(env["WOLTSPACE_CONNECTOR_TOKEN_FILE"]).read_text())
+    generation = data["generation"]
+    colony.activate(data["token"], lodge_id=data["lodge_id"], instance_id=instance_id, generation=generation)
+    real = ConnectorStore.revoke_generation
+    ConnectorStore.revoke_generation = lambda self, i, g: (_ for _ in ()).throw(OSError("registry on fire"))
+    try:
+        handoff.abandon()
+    finally:
+        ConnectorStore.revoke_generation = real
+    assert colony.token_state(instance_id, generation) == "active"
+    assert (instance_id, generation) in DebtLedger(handoff.root).read()
+    return generation
+
+
+@pytest.mark.parametrize("how", ["channel disabled", "instance disabled", "runtime adapter", "no token"])
+def test_recovery_runs_from_real_planner_output_whatever_the_plans_say(layout, colony, how):
+    """Finding 1: a debt is settled at start even when nothing launches."""
+    owed = _owe(colony, layout)
+    if how == "channel disabled":
+        (layout.platform_state / "config.json").write_text(json.dumps({"channels": {"telegram": {"enabled": False, "token": TOKEN}}}))
+    elif how == "instance disabled":
+        colony.disable("tg")
+    elif how == "runtime adapter":
+        set_channel_runtime(layout.wolts_dir / "woltspace.json", "telegram", "adapter")
+    elif how == "no token":
+        (layout.platform_state / "config.json").write_text(json.dumps({"channels": {"telegram": {"enabled": True}}}))
+    env = {k: v for k, v in ENV.items() if k != "TELEGRAM_BOT_TOKEN"}
+    plans = plan_connectors(layout, env)
+    assert not any(p.enabled and p.name.startswith("telegram-connector") for p in plans)
+    assert all(p.handoff is None for p in plans)
+    sup = ChannelSupervisor(layout, plans, recovery=connector_recovery(layout))
+    sup.start(watch=False)
+    try:
+        assert colony.token_state("tg", owed) == "revoked"
+        report = sup.report()["recovery"]
+        assert report["ok"] is True and ["tg", owed] in report["settled"]
+        assert DebtLedger(str(layout.platform_state)).read() == []
+    finally:
+        sup.stop()
+
+
+def test_recovery_settles_other_instances_debts_and_leaves_newer_generations_alone(layout, colony):
+    colony.add_instance("tg-old", "telegram", "bot:old")
+    colony.bind("tg-old", sender="1", conversation="1", default_wolt="softie")
+    colony.disable("tg")
+    colony.enable("tg-old")
+    old_owed = _owe(colony, layout, "tg-old")
+    colony.disable("tg-old")
+    colony.enable("tg")
+    # The selected instance has a live, newer generation of its own; an old debt of its own too.
+    tg_owed = _owe(colony, layout, "tg")
+    live = ConnectorHandoff(lambda: colony, "tg", layout.platform_state)
+    env = live.prepare()
+    data = json.loads(Path(env["WOLTSPACE_CONNECTOR_TOKEN_FILE"]).read_text())
+    colony.activate(data["token"], lodge_id=data["lodge_id"], instance_id="tg", generation=data["generation"])
+    # Re-arm the old debts (the newer mint revoked tg's older generation) so recovery has work to prove.
+    registry = colony._registry()
+    for token in registry["tokens"]:
+        if (token["instance_id"], token["generation"]) in {("tg", tg_owed), ("tg-old", old_owed)}:
+            token["revoked"] = None
+    colony._write_json(colony.registry_path, registry)
+    plans = plan_connectors(layout, ENV)
+    sup = ChannelSupervisor(layout, [p for p in plans if not p.enabled], recovery=connector_recovery(layout))
+    sup.start(watch=False)
+    try:
+        assert colony.token_state("tg-old", old_owed) == "revoked"
+        assert colony.token_state("tg", tg_owed) == "revoked"
+        assert colony.token_state("tg", data["generation"]) == "active"
+        assert sorted(sup.report()["recovery"]["settled"]) == sorted([["tg", tg_owed], ["tg-old", old_owed]])
+    finally:
+        sup.stop()
+    # A removed instance's debt is settled by its removal.
+    _owe(colony, layout, "tg-old")
+    colony.remove_instance("tg-old")
+    outcome = ConnectorRecovery(layout.platform_state, lambda: colony).run()
+    assert outcome["ok"] is True and DebtLedger(str(layout.platform_state)).read() == []
+
+
+def test_recovery_reports_unavailable_when_it_cannot_be_built(layout, colony):
+    plans = plan_connectors(layout, ENV)
+    sup = ChannelSupervisor(layout, [p for p in plans if not p.enabled], recovery=None)
+    sup.start(watch=False)
+    try:
+        report = sup.report()["recovery"]
+        assert report["ok"] is False and "unavailable" in report["errors"][0]
+    finally:
+        sup.stop()
+
+
+@pytest.mark.parametrize("damage", ["corrupt", "shape", "directory", "oversized"])
+def test_an_unreadable_ledger_is_kept_reported_and_never_overwritten(layout, colony, damage):
+    """Astre's probe: corrupt evidence is preserved; recovery fails and retries; a new debt is not durable."""
+    ledger_path = layout.platform_state / "run" / "debts.json"
+    (layout.platform_state / "run").mkdir(parents=True, mode=0o700)
+    if damage == "corrupt":
+        ledger_path.write_text('[{"instance_id":"tg","generation":123},')
+    elif damage == "shape":
+        ledger_path.write_text('{"instance_id":"tg","generation":123}')
+    elif damage == "directory":
+        ledger_path.mkdir()
+    elif damage == "oversized":
+        ledger_path.write_text("[" + ",".join('{"instance_id":"tg","generation":123}' for _ in range(3000)) + "]")
+    if ledger_path.is_file():
+        ledger_path.chmod(0o600)
+        before = ledger_path.read_bytes()
+    ledger = DebtLedger(str(layout.platform_state))
+    with pytest.raises(DebtLedgerUnreadable):
+        ledger.read()
+    with pytest.raises(DebtLedgerUnreadable):
+        ledger.add("tg", 456)
+    if ledger_path.is_file():
+        assert ledger_path.read_bytes() == before
+    else:
+        assert ledger_path.is_dir()
+    status = ledger.status()
+    assert status["readable"] is False and status["error"]
+    # Recovery fails, says so, and does not call it done.
+    outcome = ConnectorRecovery(layout.platform_state, lambda: colony).run()
+    assert outcome["ok"] is False and outcome["errors"][0].startswith("ledger:")
+    sup = ChannelSupervisor(layout, [p for p in plan_connectors(layout, ENV) if not p.enabled], recovery=connector_recovery(layout))
+    sup.start(watch=False)
+    try:
+        assert sup.report()["recovery"]["ok"] is False
+    finally:
+        sup.stop()
+    # Doctor warns, and so does the connector listing.
+    check = check_connector_ledger(layout)
+    assert check.status == "warn" and "unreadable" in check.detail
+    # A handoff that owes a revocation now cannot write it down: in memory only, and visible as such.
+    handoff = ConnectorHandoff(lambda: colony, "tg", layout.platform_state)
+    handoff.prepare()
+    real = ConnectorStore.revoke_generation
+    ConnectorStore.revoke_generation = lambda self, i, g: (_ for _ in ()).throw(OSError("registry on fire"))
+    try:
+        handoff.abandon()
+    finally:
+        ConnectorStore.revoke_generation = real
+    entry = handoff.status()["unrevoked"]["1"]
+    assert entry["durable"] is False and entry["ledger"]
+    if ledger_path.is_file():
+        assert ledger_path.read_bytes() == before
+
+
+def test_concurrent_debt_additions_both_survive(layout, colony):
+    ledger = DebtLedger(str(layout.platform_state))
+    barrier = threading.Barrier(8)
+    errors = []
+
+    def add(generation):
+        barrier.wait()
+        try:
+            ledger.add("tg", generation)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(repr(exc))
+
+    threads = [threading.Thread(target=add, args=(g,)) for g in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    assert sorted(ledger.read()) == [("tg", g) for g in range(8)]
+    assert sorted(p.name for p in (layout.platform_state / "run").iterdir()) == ["debts.json", "debts.lock"]
+    # Two processes as well: a child adds while this one does.
+    code = (
+        "import sys; sys.path.insert(0, %r); from woltspace.handoff import DebtLedger; "
+        "DebtLedger(%r).add('tg', 99)" % (str(ROOT / "src"), str(layout.platform_state))
+    )
+    child = subprocess.Popen([sys.executable, "-c", code])
+    ledger.add("tg", 100)
+    assert child.wait(timeout=30) == 0
+    assert ("tg", 99) in ledger.read() and ("tg", 100) in ledger.read()
+
+
+def test_the_status_line_and_doctor_name_what_is_owed(layout, colony):
+    owed = _owe(colony, layout)
+    from woltspace.cli import format_connector_lines
+
+    report = {"connectors": [], "recovery": {"ran": True, "ok": False, "owed": [["tg", owed]], "errors": ["tg/%d: registry on fire" % owed]}}
+    lines = format_connector_lines(report)
+    assert lines == ["connector recovery: 1 revocation(s) still owed", "  error: tg/%d: registry on fire" % owed]
+    check = check_connector_ledger(layout)
+    assert check.status == "warn" and f"tg/{owed}" in check.detail
+    assert ConnectorRecovery(layout.platform_state, lambda: colony).run()["ok"] is True
+    assert check_connector_ledger(layout).status == "pass"
+
+
+def test_failing_recovery_is_retried_every_few_seconds_not_every_tick(layout, colony):
+    runs = []
+
+    class Failing:
+        def run(self):
+            runs.append(now[0])
+            return {"ran": True, "ok": False, "at": now[0], "owed": [], "settled": [], "errors": ["ledger: broken"]}
+
+    now = [1000.0]
+    plans = plan_connectors(layout, ENV)
+    sup = ChannelSupervisor(layout, [p for p in plans if not p.enabled], recovery=Failing(), clock=lambda: now[0])
+    sup.start(watch=False)
+    try:
+        assert runs == [1000.0]
+        for _ in range(20):
+            now[0] += 0.25
+            sup.poll_once()
+        assert runs == [1000.0, 1005.0]
+    finally:
+        sup.stop()
