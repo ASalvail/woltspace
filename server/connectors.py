@@ -20,6 +20,19 @@ the previous state rather than half of the next one. A file that does not
 parse is `ConnectorStateUnreadable`: nothing is guessed from it and no
 credential it would have vouched for is accepted.
 
+Transitions never need two files to agree. Enable, disable, rotation, bind
+and unbind are single registry writes; what they mean for a queue (paused
+clocks, released leases, cancelled deliveries) is derived from the registry
+every time the queue is read. Removal writes the registry first and then
+cancels the queue; a queue file whose instance is gone is an orphan that
+`recover()` cancels the same way, so a crash in between is finished on the
+next load. Transfer to a replacement instance is not in this slice: removal
+cancels, always.
+
+Listeners and the router run after the lock is released and the state is on
+disk, so they may call back into the store. A call made while the lock is
+held by the same thread is refused, not blocked.
+
 Stdlib only; the connector API and the CLI both import this.
 """
 
@@ -33,6 +46,7 @@ import json
 import os
 import secrets
 import shutil
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -49,26 +63,39 @@ class Limits:
     """Every bound the protocol enforces. Tests shrink them; nothing widens them."""
 
     lease_seconds: float = 60.0
+    # Failed attempts (a nack, or a lease that expired) before the delivery is
+    # failed for good. The schedule: after failure n the delivery waits
+    # backoff_seconds[n - 1]; the fifth failure is terminal, so only four
+    # delays are ever used. An expired lease re-queues at once.
     max_attempts: int = 5
+    backoff_seconds: tuple[float, ...] = (2.0, 5.0, 15.0, 30.0)
+    # Enabled time only: a disabled instance's clock stands still.
     retry_window_seconds: float = 600.0
-    # Backoff after a failed attempt, indexed by how many have failed so far.
-    backoff_seconds: tuple[float, ...] = (2.0, 5.0, 15.0, 30.0, 60.0)
     dedup_retention_seconds: float = 7 * 86400.0
     upload_ttl_seconds: float = 3600.0
     upload_max_bytes: int = 50 * 1024 * 1024
-    # Unclaimed plus in-flight upload bytes one instance may hold at once.
+    # One outbound attachment; v1 sends at most one per delivery.
+    outbound_file_max_bytes: int = 50 * 1024 * 1024
+    # Every byte an instance has on disk at once: stored handles, claimed
+    # ones a router has not released yet, and uploads still arriving.
     upload_disk_cap_bytes: int = 200 * 1024 * 1024
     file_retention_seconds: float = 86400.0
     text_max_bytes: int = 16 * 1024
+    outbound_text_max_bytes: int = 64 * 1024
+    # The whole JSON request body, counted before it is parsed.
+    request_max_bytes: int = 64 * 1024
     id_max_chars: int = 256
+    display_max_chars: int = 256
     error_max_chars: int = 1000
     event_max_attachments: int = 10
     lease_max_batch: int = 10
     lease_max_wait_seconds: float = 30.0
     max_in_flight: int = 50
+    max_queued: int = 1000
     events_per_minute: int = 120
     uploads_per_hour: int = 60
     upload_bytes_per_hour: int = 500 * 1024 * 1024
+    journal_max_bytes: int = 10 * 1024 * 1024
 
 
 class ConnectorStateUnreadable(RuntimeError):
@@ -76,12 +103,18 @@ class ConnectorStateUnreadable(RuntimeError):
 
 
 class ConnectorError(ValueError):
-    """A request the protocol refuses. `reason` is machine-readable."""
+    """A request the protocol refuses. `reason` is machine-readable.
+
+    `retry` says whether the same request may succeed later: a 429 is a
+    limit that clears with time (an upload it refused kept no bytes, so it
+    is uploaded again); everything else is final for that request.
+    """
 
     def __init__(self, status: int, reason: str, message: str = ""):
         super().__init__(message or reason)
         self.status = status
         self.reason = reason
+        self.retry = status == 429
 
 
 class NoConnectorBinding(LookupError):
@@ -90,13 +123,19 @@ class NoConnectorBinding(LookupError):
 
 @dataclass(frozen=True)
 class Principal:
-    """What a connector token proves: one instance, one process generation."""
+    """What a connector token proves: one instance, one process generation.
+
+    A Principal is a snapshot. Every store operation re-reads the registry
+    under its lock and refuses a principal whose token was revoked or whose
+    generation moved on in the meantime.
+    """
 
     instance_id: str
     generation: int
     channel: str
     account: str
     enabled: bool
+    digest: str = field(repr=False, compare=False, default="")
 
 
 @dataclass(frozen=True)
@@ -112,7 +151,9 @@ class AcceptedEvent:
     conversation: dict
     text: str
     # [{"upload_id", "path", "name", "size"}]: the router owns these bytes
-    # from here on and must move them before the upload TTL sweeps them.
+    # from here on. They count against the instance's disk cap until the
+    # router calls `release_uploads` (after moving them) or the TTL sweep
+    # deletes them.
     attachments: tuple[dict, ...]
     # The session the replied-to delivery came from, when reply_to resolved.
     reply_to_session: str | None
@@ -142,10 +183,16 @@ class _Queue:
         if not (isinstance(queue.deliveries, list) and isinstance(queue.dedup, dict)
                 and isinstance(queue.uploads, dict) and isinstance(queue.counters, dict)):
             raise ConnectorStateUnreadable("queue file has an unknown shape")
+        queue.counters.setdefault("events", [])
+        queue.counters.setdefault("uploads", [])
         return queue
 
 
 _TERMINAL = frozenset({"delivered", "failed", "cancelled"})
+_EVENT_KEYS = frozenset({"event_id", "sender", "conversation", "text", "attachments", "reply_to"})
+_SENDER_KEYS = frozenset({"provider_id", "display"})
+_CONVERSATION_KEYS = frozenset({"provider_id", "thread"})
+_ACK_KEYS = frozenset({"attempt_id", "ok", "provider_message_id", "error", "retry"})
 
 
 def valid_id(value: object, limit: int = 256) -> bool:
@@ -174,6 +221,25 @@ def _canonical(payload: dict) -> str:
     ).hexdigest()
 
 
+def _pid_alive(pid: object) -> bool:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+class _Tx:
+    """What one locked operation wants done once the lock is gone."""
+
+    def __init__(self):
+        self.finished: list[tuple[str, dict]] = []
+
+
 class ConnectorStore:
     """The lodge's side of the connector protocol, on disk."""
 
@@ -186,8 +252,7 @@ class ConnectorStore:
         self.limits = limits or Limits()
         self.router: Callable[[AcceptedEvent], dict] = self.record_inbound
         self._failure_listeners: list[Callable[[str, dict], None]] = [self.record_failure]
-        # Upload bytes still arriving, per instance: {instance_id: {upload_id: bytes}}.
-        self._in_flight: dict[str, dict[str, int]] = {}
+        self._held = threading.local()
 
     # ----------------------------------------------------------------- files
 
@@ -201,19 +266,44 @@ class ConnectorStore:
     def _upload_dir(self, instance_id: str) -> Path:
         return self.root / "uploads" / instance_id
 
+    def _part_path(self, instance_id: str, upload_id: str) -> Path:
+        return self._upload_dir(instance_id) / f".{upload_id}.part"
+
     def _file_path(self, file_id: str) -> Path:
         return self.root / "files" / file_id
 
     @contextlib.contextmanager
     def _lock(self):
-        """Serialize every read-modify-write across the lodge and the CLI."""
+        """Serialize every read-modify-write across the lodge and the CLI.
+
+        Not re-entrant, and says so: a call from inside a locked operation
+        (a listener or router that ran under the lock) is a bug that would
+        otherwise block the lodge for good.
+        """
+        if getattr(self._held, "depth", 0):
+            raise RuntimeError("connector store called from inside its own lock")
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         with open(self.root / "lock", "w") as handle:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            self._held.depth = 1
             try:
                 yield
             finally:
+                self._held.depth = 0
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    @contextlib.contextmanager
+    def _transaction(self):
+        """A locked operation whose callbacks run after the lock is released."""
+        tx = _Tx()
+        with self._lock():
+            yield tx
+        for instance_id, delivery in tx.finished:
+            for listener in list(self._failure_listeners):
+                try:
+                    listener(instance_id, dict(delivery))
+                except Exception:
+                    pass
 
     def _read_json(self, path: Path, default: dict) -> dict:
         try:
@@ -246,9 +336,19 @@ class ConnectorStore:
             raise
 
     def _append_line(self, name: str, record: dict) -> None:
+        """Append one journal line, fsynced; the journal rotates once at its bound."""
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with open(self.root / name, "a", encoding="utf-8") as handle:
+        path = self.root / name
+        try:
+            if path.stat().st_size >= self.limits.journal_max_bytes:
+                os.replace(path, path.with_name(f"{name}.1"))
+        except FileNotFoundError:
+            pass
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
 
     def _registry(self) -> dict:
         data = self._read_json(
@@ -278,7 +378,10 @@ class ConnectorStore:
         ]
 
     def add_instance(self, instance_id: str, channel: str, account: str) -> dict:
-        """Register an install, disabled: nothing routes to it until `enable`."""
+        """Register an instance, disabled: nothing routes to it until `enable`.
+
+        Registration only: this slice installs no code.
+        """
         if not valid_id(instance_id, 64):
             raise ConnectorError(400, "invalid_instance_id")
         if not valid_id(channel, 32):
@@ -291,7 +394,8 @@ class ConnectorStore:
                 raise ConnectorError(409, "instance_exists")
             registry["instances"][instance_id] = {
                 "channel": channel, "account": account, "enabled": False,
-                "generation": 0, "created": self.clock(),
+                "generation": 0, "created": self.clock(), "disabled_at": self.clock(),
+                "paused_seconds": 0.0,
             }
             self._write_json(self.registry_path, registry)
             return {"instance_id": instance_id, **registry["instances"][instance_id]}
@@ -303,7 +407,7 @@ class ConnectorStore:
             raise ConnectorError(404, "unknown_instance") from None
 
     def enable(self, instance_id: str) -> None:
-        """Resume routing and the retry clocks of everything that waited."""
+        """Resume routing; the retry clocks resume by derivation. One write."""
         with self._lock():
             registry = self._registry()
             instance = self._instance(registry, instance_id)
@@ -313,115 +417,78 @@ class ConnectorStore:
                         409, "channel_taken",
                         f"{other_id} already serves {instance['channel']}; disable it first",
                     )
+            if instance.get("disabled_at") is not None:
+                instance["paused_seconds"] = instance.get("paused_seconds", 0.0) + max(
+                    0.0, self.clock() - instance["disabled_at"],
+                )
+                instance["disabled_at"] = None
             instance["enabled"] = True
             self._write_json(self.registry_path, registry)
-            queue = self._queue(instance_id)
-            now = self.clock()
-            for delivery in queue.deliveries:
-                if delivery.get("clock_paused"):
-                    delivery["clock_started"] = now
-                    delivery["clock_paused"] = False
-            self._sweep(instance_id, queue, enabled=True)
-            self._save_queue(instance_id, queue)
 
     def disable(self, instance_id: str) -> None:
-        """Pause: nothing is leased, the retry window stops counting, files are kept."""
+        """Pause: nothing is leased, the retry window stops, files are kept. One write."""
         with self._lock():
             registry = self._registry()
             instance = self._instance(registry, instance_id)
+            if instance["enabled"] or instance.get("disabled_at") is None:
+                instance["disabled_at"] = self.clock()
             instance["enabled"] = False
             self._write_json(self.registry_path, registry)
-            queue = self._queue(instance_id)
-            now = self.clock()
-            for delivery in queue.deliveries:
-                if delivery["status"] in _TERMINAL:
-                    continue
-                started = delivery.get("clock_started")
-                if started is not None:
-                    delivery["clock_used"] = delivery.get("clock_used", 0.0) + max(0.0, now - started)
-                    delivery["clock_started"] = None
-                    delivery["clock_paused"] = True
-            self._save_queue(instance_id, queue)
 
-    def remove_instance(
-        self, instance_id: str, *, transfer_to: str | None = None,
-        mapping: list[dict] | None = None,
-    ) -> dict:
-        """Revoke, detach and cancel; or transfer what an explicit mapping covers.
+    def remove_instance(self, instance_id: str) -> dict:
+        """Revoke, detach and cancel the queue. Transfer is not in this slice.
 
-        A mapping entry is {"from": {account, conversation, thread}, "to":
-        {account, conversation, thread}} and its "to" must be a binding of
-        the replacement. Nothing is matched by looking alike: a delivery with
-        no entry is cancelled, and no mapping at all cancels everything.
+        The registry write comes first; the queue is then an orphan and is
+        cancelled, here or by `recover()` after a crash. Either way it is
+        cancelled exactly once.
         """
-        with self._lock():
+        with self._transaction() as tx:
             registry = self._registry()
+            self._recover_orphans(registry, tx)
             self._instance(registry, instance_id)
-            queue = self._queue(instance_id)
-            self._sweep(instance_id, queue, enabled=False)
-            outcome = {"cancelled": 0, "transferred": 0}
-            pending = [d for d in queue.deliveries if d["status"] not in _TERMINAL]
-            moved: list[dict] = []
-            if transfer_to is not None:
-                replacement = self._instance(registry, transfer_to)
-                if transfer_to == instance_id:
-                    raise ConnectorError(400, "transfer_to_self")
-                targets = {
-                    (b["account"], b["conversation"], b.get("thread"))
-                    for b in registry["bindings"] if b["instance_id"] == transfer_to
-                }
-                routes = {}
-                for entry in mapping or ():
-                    source, target = entry.get("from") or {}, entry.get("to") or {}
-                    key = (source.get("account"), source.get("conversation"), source.get("thread"))
-                    dest = (target.get("account"), target.get("conversation"), target.get("thread"))
-                    if dest not in targets or dest[0] != replacement["account"]:
-                        raise ConnectorError(
-                            400, "unmapped_destination",
-                            f"{dest[0]}/{dest[1]} is not a binding of {transfer_to}",
-                        )
-                    routes[key] = dest
-                for delivery in pending:
-                    key = (delivery["account"], delivery["conversation"], delivery.get("thread"))
-                    dest = routes.get(key)
-                    if dest is None:
-                        continue
-                    copy = dict(delivery)
-                    copy.update({
-                        "account": dest[0], "conversation": dest[1], "thread": dest[2],
-                        "status": "queued", "lease": None, "clock_started": None,
-                        "clock_paused": False,
-                        "transferred_from": instance_id,
-                    })
-                    moved.append(copy)
-                    delivery["status"] = "transferred"
-                    outcome["transferred"] += 1
-                if moved:
-                    target_queue = self._queue(transfer_to)
-                    target_queue.deliveries.extend(moved)
-                    # Dedup lineage follows an account that stays itself.
-                    same_account = {s for (s, _c, _t), (d, _dc, _dt) in routes.items() if s == d}
-                    for key, record in queue.dedup.items():
-                        if key.split("\x00", 1)[0] in same_account:
-                            target_queue.dedup.setdefault(key, record)
-                    self._save_queue(transfer_to, target_queue)
-            for delivery in pending:
-                if delivery["status"] == "transferred":
-                    continue
-                self._finish(instance_id, delivery, "cancelled", "instance removed")
-                outcome["cancelled"] += 1
+            now = self.clock()
             for token in registry["tokens"]:
                 if token["instance_id"] == instance_id and token.get("revoked") is None:
-                    token["revoked"] = self.clock()
+                    token["revoked"] = now
             registry["bindings"] = [
                 b for b in registry["bindings"] if b["instance_id"] != instance_id
             ]
             del registry["instances"][instance_id]
             self._write_json(self.registry_path, registry)
-            self._queue_path(instance_id).unlink(missing_ok=True)
-            shutil.rmtree(self._upload_dir(instance_id), ignore_errors=True)
-            self._in_flight.pop(instance_id, None)
-            return outcome
+            return {"cancelled": self._cancel_orphan_queue(instance_id, tx), "transferred": 0}
+
+    def recover(self) -> int:
+        """Finish interrupted removals: cancel every queue whose instance is gone."""
+        with self._transaction() as tx:
+            return self._recover_orphans(self._registry(), tx)
+
+    def _recover_orphans(self, registry: dict, tx: _Tx) -> int:
+        cancelled = 0
+        try:
+            entries = sorted((self.root / "queues").glob("*.json"))
+        except OSError:
+            return 0
+        for path in entries:
+            instance_id = path.stem
+            if instance_id not in registry["instances"]:
+                cancelled += self._cancel_orphan_queue(instance_id, tx)
+        for directory in (self.root / "uploads").glob("*"):
+            if directory.is_dir() and directory.name not in registry["instances"]:
+                shutil.rmtree(directory, ignore_errors=True)
+        return cancelled
+
+    def _cancel_orphan_queue(self, instance_id: str, tx: _Tx) -> int:
+        queue = self._queue(instance_id)
+        cancelled = 0
+        for delivery in queue.deliveries:
+            if delivery["status"] not in _TERMINAL:
+                self._finish(instance_id, delivery, "cancelled", "instance removed", tx)
+                cancelled += 1
+        for upload_id in queue.uploads:
+            self._part_path(instance_id, upload_id).unlink(missing_ok=True)
+        self._queue_path(instance_id).unlink(missing_ok=True)
+        shutil.rmtree(self._upload_dir(instance_id), ignore_errors=True)
+        return cancelled
 
     # -------------------------------------------------------------- bindings
 
@@ -436,7 +503,11 @@ class ConnectorStore:
         self, instance_id: str, *, sender: str, conversation: str, default_wolt: str,
         thread: str | None = None, may_wake: bool = False,
     ) -> dict:
-        """Allow one provider sender in one conversation; the owner's grant, typed."""
+        """Allow one provider sender in one conversation; the owner's grant, typed.
+
+        Binding the same sender, conversation and thread again changes the
+        grant in place and keeps its id, so deliveries made under it stand.
+        """
         limit = self.limits.id_max_chars
         if _provider_id(sender, limit) is None:
             raise ConnectorError(400, "invalid_sender")
@@ -449,21 +520,25 @@ class ConnectorStore:
         with self._lock():
             registry = self._registry()
             instance = self._instance(registry, instance_id)
+            key = (instance_id, sender, conversation, thread)
+            existing = next(
+                (b for b in registry["bindings"]
+                 if (b["instance_id"], b["sender"], b["conversation"], b.get("thread")) == key),
+                None,
+            )
             binding = {
+                "binding_id": existing["binding_id"] if existing else secrets.token_hex(8),
                 "instance_id": instance_id, "account": instance["account"],
                 "sender": sender, "conversation": conversation, "thread": thread,
                 "default_wolt": default_wolt, "may_wake": bool(may_wake),
             }
-            key = ("instance_id", "sender", "conversation", "thread")
-            registry["bindings"] = [
-                b for b in registry["bindings"]
-                if tuple(b.get(k) for k in key) != tuple(binding[k] for k in key)
-            ]
+            registry["bindings"] = [b for b in registry["bindings"] if b is not existing]
             registry["bindings"].append(binding)
             self._write_json(self.registry_path, registry)
             return dict(binding)
 
     def unbind(self, instance_id: str, *, sender: str, conversation: str, thread: str | None = None) -> bool:
+        """Withdraw a grant. Its queued and leased deliveries are cancelled on the next read."""
         with self._lock():
             registry = self._registry()
             before = len(registry["bindings"])
@@ -496,9 +571,10 @@ class ConnectorStore:
     def issue_token(self, instance_id: str) -> str:
         """Mint the next generation's token; older generations are revoked.
 
-        Leases the old generation held are released at once (its acks are
-        refused anyway), the queue itself is untouched. Called when a runner
-        is actually relaunched, never because the lodge restarted.
+        One registry write. Leases the old generation held are released when
+        the queue is next read (its acks are refused anyway); the queue itself
+        is untouched. Called when a runner is actually relaunched, never
+        because the lodge restarted.
         """
         with self._lock():
             registry = self._registry()
@@ -518,13 +594,6 @@ class ConnectorStore:
                 if t.get("revoked") is None or now - t["revoked"] < 86400
             ]
             self._write_json(self.registry_path, registry)
-            queue = self._queue(instance_id)
-            for delivery in queue.deliveries:
-                lease = delivery.get("lease")
-                if lease and lease["generation"] < instance["generation"]:
-                    delivery["lease"] = None
-                    delivery["status"] = "queued"
-            self._save_queue(instance_id, queue)
             return plain
 
     def revoke_tokens(self, instance_id: str) -> int:
@@ -540,6 +609,18 @@ class ConnectorStore:
                 self._write_json(self.registry_path, registry)
             return count
 
+    def _principal(self, registry: dict, digest: str) -> Principal | None:
+        for record in registry["tokens"]:
+            if hmac.compare_digest(record["digest"], digest) and record.get("revoked") is None:
+                instance = registry["instances"].get(record["instance_id"])
+                if instance is None or instance["generation"] != record["generation"]:
+                    return None
+                return Principal(
+                    record["instance_id"], record["generation"], instance["channel"],
+                    instance["account"], bool(instance["enabled"]), digest,
+                )
+        return None
+
     def authenticate(self, token: object) -> Principal | None:
         """The principal a bearer token proves, or None for anything else.
 
@@ -548,115 +629,154 @@ class ConnectorStore:
         """
         if not isinstance(token, str) or not token.startswith(TOKEN_PREFIX) or len(token) > 128:
             return None
-        registry = self._registry()
-        digest = _digest(token)
-        for record in registry["tokens"]:
-            if hmac.compare_digest(record["digest"], digest) and record.get("revoked") is None:
-                instance = registry["instances"].get(record["instance_id"])
-                if instance is None or instance["generation"] != record["generation"]:
-                    return None
-                return Principal(
-                    record["instance_id"], record["generation"], instance["channel"],
-                    instance["account"], bool(instance["enabled"]),
-                )
-        return None
+        return self._principal(self._registry(), _digest(token))
+
+    def _live(self, registry: dict, who: Principal) -> Principal:
+        """The principal as the registry has it now, or a refusal.
+
+        Called under the lock by every operation: a request that waited on
+        its body or a stream carries a snapshot, and the owner may have
+        revoked, rotated or removed in the meantime.
+        """
+        current = self._principal(registry, who.digest) if who.digest else None
+        if current is None or (current.instance_id, current.generation) != (who.instance_id, who.generation):
+            raise ConnectorError(401, "connector_token_required", "connector token required")
+        return current
 
     # ------------------------------------------------------------- sweeping
 
-    def _finish(self, instance_id: str, delivery: dict, status: str, error: str) -> None:
+    def _finish(self, instance_id: str, delivery: dict, status: str, error: str, tx: _Tx) -> None:
         delivery.update({
             "status": status, "lease": None, "error": error[: self.limits.error_max_chars],
             "finished": self.clock(),
         })
         self._drop_files(delivery)
-        for listener in list(self._failure_listeners):
-            try:
-                listener(instance_id, dict(delivery))
-            except Exception:
-                pass
+        tx.finished.append((instance_id, dict(delivery)))
 
     def _drop_files(self, delivery: dict) -> None:
         for attachment in delivery.get("attachments", ()):
             self._file_path(attachment["file_id"]).unlink(missing_ok=True)
 
-    def _attempt_failed(self, instance_id: str, delivery: dict, error: str, *, backoff: bool) -> None:
-        """One more attempt gone; retry (with backoff after a nack), or give up for good."""
-        delivery["attempts"] = delivery.get("attempts", 0) + 1
+    def _attempt_failed(self, instance_id: str, delivery: dict, error: str, tx: _Tx, *, backoff: bool) -> None:
+        """One more failed attempt; retry (with backoff after a nack), or give up."""
+        delivery["failed_attempts"] = delivery.get("failed_attempts", 0) + 1
         delivery["lease"] = None
         delivery["last_error"] = error[: self.limits.error_max_chars]
-        if delivery["attempts"] >= self.limits.max_attempts:
-            self._finish(instance_id, delivery, "failed", f"{delivery['attempts']} attempts: {error}")
+        if delivery["failed_attempts"] >= self.limits.max_attempts:
+            self._finish(
+                instance_id, delivery, "failed", f"{delivery['failed_attempts']} failed attempts: {error}", tx,
+            )
             return
-        step = min(delivery["attempts"], len(self.limits.backoff_seconds)) - 1
+        step = min(delivery["failed_attempts"], len(self.limits.backoff_seconds)) - 1
         delivery["status"] = "queued"
         delivery["not_before"] = self.clock() + (self.limits.backoff_seconds[step] if backoff else 0)
 
-    def _window_used(self, delivery: dict) -> float:
-        used = delivery.get("clock_used", 0.0)
+    def _window_used(self, delivery: dict, instance: dict) -> float:
+        """Enabled seconds since the first lease: disabled time is subtracted."""
         started = delivery.get("clock_started")
-        if started is not None:
-            used += max(0.0, self.clock() - started)
-        return used
+        if started is None:
+            return 0.0
+        now = self.clock()
+        paused = instance.get("paused_seconds", 0.0) - delivery.get("paused_base", 0.0)
+        if instance.get("disabled_at") is not None:
+            paused += max(0.0, now - max(instance["disabled_at"], started))
+        return max(0.0, now - started - paused)
 
-    def _sweep(self, instance_id: str, queue: _Queue, *, enabled: bool) -> None:
-        """Apply the clocks: leases, retry windows, file and upload retention."""
+    def _sweep(self, instance_id: str, queue: _Queue, registry: dict, tx: _Tx) -> None:
+        """Apply the registry and the clocks to a queue, before anything reads it."""
         now = self.clock()
         limits = self.limits
+        instance = registry["instances"].get(instance_id) or {"enabled": False, "generation": 0}
+        bindings = {b["binding_id"] for b in registry["bindings"] if b["instance_id"] == instance_id}
         for delivery in queue.deliveries:
-            if delivery["status"] in _TERMINAL or delivery["status"] == "transferred":
+            if delivery["status"] in _TERMINAL:
+                continue
+            if delivery.get("binding_id") not in bindings:
+                # The owner withdrew the destination: queued or leased, it is over.
+                self._finish(instance_id, delivery, "cancelled", "binding removed", tx)
                 continue
             lease = delivery.get("lease")
+            if lease and lease["generation"] < instance["generation"]:
+                # Rotation: the old process is gone; not a failed attempt.
+                delivery["lease"] = None
+                delivery["status"] = "queued"
+                lease = None
             if lease and lease["expires"] <= now:
-                self._attempt_failed(instance_id, delivery, "lease expired without an ack", backoff=False)
+                self._attempt_failed(instance_id, delivery, "lease expired without an ack", tx, backoff=False)
                 if delivery["status"] in _TERMINAL:
                     continue
             for attachment in delivery.get("attachments", ()):
                 if attachment["expires"] <= now:
                     # Disabled or not: a delivery never waits without its file.
-                    self._finish(instance_id, delivery, "failed", "attachment retention expired")
+                    self._finish(instance_id, delivery, "failed", "attachment retention expired", tx)
                     break
             if delivery["status"] in _TERMINAL:
                 continue
-            if enabled and self._window_used(delivery) >= limits.retry_window_seconds and not delivery.get("lease"):
+            if (
+                instance["enabled"] and not delivery.get("lease")
+                and self._window_used(delivery, instance) >= limits.retry_window_seconds
+            ):
                 self._finish(
                     instance_id, delivery, "failed",
-                    f"{delivery.get('attempts', 0)} attempts in the retry window",
+                    f"{delivery.get('failed_attempts', 0)} failed attempts in the retry window", tx,
                 )
         queue.deliveries = [
             d for d in queue.deliveries
             if not (d["status"] in _TERMINAL and now - d.get("finished", now) > limits.dedup_retention_seconds)
-            and d["status"] != "transferred"
         ]
-        for upload_id, record in list(queue.uploads.items()):
-            if record["expires"] <= now:
+        for upload_id, handle in list(queue.uploads.items()):
+            if handle.get("state") == "in_flight":
+                stale = now - handle.get("started", now) > limits.upload_ttl_seconds
+                if stale or not _pid_alive(handle.get("pid")):
+                    # The process that was streaming it is gone: reclaim the bytes.
+                    self._part_path(instance_id, upload_id).unlink(missing_ok=True)
+                    (self._upload_dir(instance_id) / upload_id).unlink(missing_ok=True)
+                    del queue.uploads[upload_id]
+            elif handle["expires"] <= now:
                 (self._upload_dir(instance_id) / upload_id).unlink(missing_ok=True)
                 del queue.uploads[upload_id]
+        try:
+            for part in self._upload_dir(instance_id).glob(".*.part"):
+                if part.name[1:-5] not in queue.uploads:
+                    part.unlink(missing_ok=True)
+        except OSError:
+            pass
         queue.dedup = {
             key: record for key, record in queue.dedup.items()
             if now - record["at"] < limits.dedup_retention_seconds
         }
-        queue.counters["events"] = [t for t in queue.counters.get("events", []) if now - t < 60]
+        queue.counters["events"] = [t for t in queue.counters["events"] if now - t < 60]
         queue.counters["uploads"] = [
-            entry for entry in queue.counters.get("uploads", []) if now - entry[0] < 3600
+            entry for entry in queue.counters["uploads"] if now - entry[0] < 3600
         ]
 
     # --------------------------------------------------------------- inbound
 
     def _parse_event(self, payload: object) -> dict:
-        """Bound and normalize an inbound event, or say what is wrong with it."""
+        """Bound and normalize an inbound event, or say what is wrong with it.
+
+        The schema is closed: a key the protocol does not name is a fault.
+        """
         limits = self.limits
         if not isinstance(payload, dict):
             raise ConnectorError(400, "malformed_event", "event must be an object")
+        if not set(payload) <= _EVENT_KEYS:
+            raise ConnectorError(400, "malformed_event", "unknown field in event")
         event_id = _provider_id(payload.get("event_id"), limits.id_max_chars)
         if event_id is None:
             raise ConnectorError(400, "malformed_event", "event_id is required")
         sender, conversation = payload.get("sender"), payload.get("conversation")
         if not isinstance(sender, dict) or not isinstance(conversation, dict):
             raise ConnectorError(400, "malformed_event", "sender and conversation are required")
+        if not set(sender) <= _SENDER_KEYS or not set(conversation) <= _CONVERSATION_KEYS:
+            raise ConnectorError(400, "malformed_event", "unknown field in sender or conversation")
         sender_id = _provider_id(sender.get("provider_id"), limits.id_max_chars)
         conversation_id = _provider_id(conversation.get("provider_id"), limits.id_max_chars)
         if sender_id is None or conversation_id is None:
             raise ConnectorError(400, "malformed_event", "provider ids are required")
+        display = sender.get("display", "")
+        if not isinstance(display, str) or len(display) > limits.display_max_chars:
+            raise ConnectorError(400, "malformed_event", "display is not a short string")
         thread = conversation.get("thread")
         if thread is not None and _provider_id(thread, limits.id_max_chars) is None:
             raise ConnectorError(400, "malformed_event", "thread is not a provider id")
@@ -665,12 +785,15 @@ class ConnectorStore:
             raise ConnectorError(400, "malformed_event", "text must be a string")
         if len(text.encode("utf-8")) > limits.text_max_bytes:
             raise ConnectorError(413, "text_too_long", f"text is over {limits.text_max_bytes} bytes")
-        attachments = payload.get("attachments") or []
+        attachments = payload.get("attachments")
+        attachments = [] if attachments is None else attachments
         if not isinstance(attachments, list) or len(attachments) > limits.event_max_attachments:
             raise ConnectorError(400, "malformed_event", "too many attachments")
         upload_ids = []
         for entry in attachments:
-            upload_id = entry.get("upload_id") if isinstance(entry, dict) else None
+            if not isinstance(entry, dict) or set(entry) != {"upload_id"}:
+                raise ConnectorError(400, "malformed_event", "attachment needs exactly an upload_id")
+            upload_id = entry["upload_id"]
             if not isinstance(upload_id, str) or outbox.ENTRY_ID_RE.fullmatch(upload_id) is None:
                 raise ConnectorError(400, "malformed_event", "attachment needs an upload_id")
             upload_ids.append(upload_id)
@@ -679,13 +802,13 @@ class ConnectorStore:
         reply_to = payload.get("reply_to")
         reply_delivery = None
         if reply_to is not None:
-            reply_delivery = reply_to.get("delivery_id") if isinstance(reply_to, dict) else None
+            if not isinstance(reply_to, dict) or set(reply_to) != {"delivery_id"}:
+                raise ConnectorError(400, "malformed_event", "reply_to needs exactly a delivery_id")
+            reply_delivery = reply_to["delivery_id"]
             if not isinstance(reply_delivery, str) or outbox.ENTRY_ID_RE.fullmatch(reply_delivery) is None:
                 raise ConnectorError(400, "malformed_event", "reply_to needs a delivery_id")
-        display = sender.get("display")
         return {
-            "event_id": event_id, "sender": sender_id,
-            "display": display if isinstance(display, str) else "",
+            "event_id": event_id, "sender": sender_id, "display": display,
             "conversation": conversation_id, "thread": thread, "text": text,
             "attachments": upload_ids, "reply_to": reply_delivery,
         }
@@ -693,35 +816,44 @@ class ConnectorStore:
     def accept_event(self, who: Principal, payload: object) -> tuple[int, dict]:
         """Admit one provider event: dedup, binding, reply scope, uploads, route.
 
-        Returns (status, body). Policy drops are 200 with accepted=false so a
-        provider never retries them; protocol faults are 4xx.
+        Returns (status, body). Policy drops are 200 with accepted=false and
+        are final: a provider must not retry them, and the same event id
+        gets the same answer for seven days, whatever changed since. That
+        includes `instance_disabled`: an event that reaches a disabled
+        instance is dropped, not buffered, so a connector stops forwarding
+        while its lease polls answer `paused`. Protocol faults are 4xx;
+        a 429 may be retried.
+
+        The claim (dedup record, upload handles) is on disk before the
+        router runs, outside the lock. A crash between the two can lose or
+        repeat the event at the session: the documented known limit.
         """
         event = self._parse_event(payload)
         # The digest leaves out the display name: it is shown, never routed on.
         digest = _canonical({k: v for k, v in event.items() if k != "display"})
         key = f"{who.account}\x00{event['event_id']}"
-        with self._lock():
+        with self._transaction() as tx:
             registry = self._registry()
+            who = self._live(registry, who)
             queue = self._queue(who.instance_id)
-            self._sweep(who.instance_id, queue, enabled=who.enabled)
+            self._sweep(who.instance_id, queue, registry, tx)
             now = self.clock()
             record = queue.dedup.get(key)
             if record is not None:
                 # Same answer first, before any question about its uploads.
                 if record["digest"] != digest:
-                    self._release_uploads(who.instance_id, queue, event["attachments"])
+                    self._release_unclaimed(who.instance_id, queue, event["attachments"])
                     self._save_queue(who.instance_id, queue)
                     raise ConnectorError(409, "event_conflict", "event_id seen with another payload")
                 return record["status"], dict(record["body"])
             if len(queue.counters["events"]) >= self.limits.events_per_minute:
-                self._release_uploads(who.instance_id, queue, event["attachments"])
                 self._save_queue(who.instance_id, queue)
                 raise ConnectorError(429, "events_rate_limited")
             queue.counters["events"].append(now)
 
             def drop(reason: str) -> tuple[int, dict]:
                 body = {"accepted": False, "reason": reason, "event_id": event["event_id"]}
-                self._release_uploads(who.instance_id, queue, event["attachments"])
+                self._release_unclaimed(who.instance_id, queue, event["attachments"])
                 queue.dedup[key] = {"digest": digest, "status": 200, "body": body, "at": now}
                 self._save_queue(who.instance_id, queue)
                 return 200, body
@@ -738,21 +870,27 @@ class ConnectorStore:
                 target = next(
                     (d for d in queue.deliveries if d["delivery_id"] == event["reply_to"]), None,
                 )
-                if target is None or (target["account"], target["conversation"]) != (
-                    who.account, event["conversation"],
-                ) or (target.get("thread") is not None and target["thread"] != event["thread"]):
+                # The exact binding, not a conversation that looks the same.
+                if target is None or target.get("binding_id") != binding["binding_id"]:
                     return drop("reply_to_out_of_binding")
                 reply_session = target.get("session")
             claimed = []
             for upload_id in event["attachments"]:
                 handle = queue.uploads.get(upload_id)
-                if handle is None or handle["expires"] <= now:
+                if handle is None or handle.get("state") != "stored" or handle["expires"] <= now:
                     return drop("upload_expired")
                 if handle.get("claimed_by") is not None:
                     return drop("upload_consumed")
                 claimed.append((upload_id, handle))
             for upload_id, handle in claimed:
                 handle["claimed_by"] = event["event_id"]
+            body = {
+                "accepted": True, "event_id": event["event_id"],
+                "wolt": binding["default_wolt"], "may_wake": binding["may_wake"],
+                "session": reply_session,
+            }
+            queue.dedup[key] = {"digest": digest, "status": 200, "body": body, "at": now}
+            self._save_queue(who.instance_id, queue)
             accepted = AcceptedEvent(
                 who.instance_id, who.channel, who.account, event["event_id"], dict(binding),
                 {"provider_id": event["sender"], "display": outbox.display_name(event["display"]) if event["display"] else ""},
@@ -766,25 +904,35 @@ class ConnectorStore:
                 ),
                 reply_session,
             )
-            # Under the store lock: the router hands off and returns, it does
-            # not wait on a session.
-            routed = self.router(accepted)
-            body = {
-                "accepted": True, "event_id": event["event_id"],
-                "wolt": binding["default_wolt"], "may_wake": binding["may_wake"],
-                "session": reply_session, **(routed or {}),
-            }
-            queue.dedup[key] = {"digest": digest, "status": 200, "body": body, "at": now}
-            self._save_queue(who.instance_id, queue)
-            return 200, dict(body)
+        # Outside the lock, after the claim is durable: the router may use the store.
+        try:
+            routed = self.router(accepted) or {}
+        except Exception as exc:
+            routed = {"routed": "error", "error": str(exc)[: self.limits.error_max_chars]}
+        with self._lock():
+            queue = self._queue(who.instance_id)
+            record = queue.dedup.get(key)
+            if record is not None and record["digest"] == digest:
+                record["body"] = {**record["body"], **routed}
+                self._save_queue(who.instance_id, queue)
+        return 200, {**body, **routed}
 
-    def _release_uploads(self, instance_id: str, queue: _Queue, upload_ids: list[str]) -> None:
-        """A rejected event gives its handles back at once: bytes and quota both."""
+    def _release_unclaimed(self, instance_id: str, queue: _Queue, upload_ids: list[str]) -> None:
+        """A rejected event gives back the handles it named and nobody else holds."""
         for upload_id in upload_ids:
             handle = queue.uploads.get(upload_id)
-            if handle is not None and handle.get("claimed_by") is None:
+            if handle is not None and handle.get("state") == "stored" and handle.get("claimed_by") is None:
                 del queue.uploads[upload_id]
                 (self._upload_dir(instance_id) / upload_id).unlink(missing_ok=True)
+
+    def release_uploads(self, instance_id: str, upload_ids: list[str]) -> None:
+        """The router has moved or consumed these claimed uploads: free their bytes."""
+        with self._lock():
+            queue = self._queue(instance_id)
+            for upload_id in upload_ids:
+                if queue.uploads.pop(upload_id, None) is not None:
+                    (self._upload_dir(instance_id) / upload_id).unlink(missing_ok=True)
+            self._save_queue(instance_id, queue)
 
     def record_inbound(self, event: AcceptedEvent) -> dict:
         """The default router: a durable record, until sessions take events."""
@@ -800,97 +948,160 @@ class ConnectorStore:
 
     # --------------------------------------------------------------- uploads
 
-    def begin_upload(self, who: Principal) -> tuple[str, Path]:
-        """Open an upload: rate windows and the disk cap are checked before a byte lands.
+    @staticmethod
+    def _held_bytes(queue: _Queue, *, except_id: str | None = None) -> int:
+        return sum(h["size"] for u, h in queue.uploads.items() if u != except_id)
 
-        Quota is the instance's, whoever the eventual sender turns out to be:
-        an unbound sender's bytes count exactly like a bound one's, so the
-        event's sender check (which comes later) can never be used to fill
-        the disk for free.
+    @staticmethod
+    def _hourly_bytes(queue: _Queue, *, except_id: str | None = None) -> int:
+        return sum(entry[1] for entry in queue.counters["uploads"] if entry[2] != except_id)
+
+    def begin_upload(self, who: Principal) -> tuple[str, Path]:
+        """Open an upload: the slot and the disk cap are reserved before a byte lands.
+
+        The reservation is a handle in the queue file, so two uploads arriving
+        together see each other, and one that outlives its process is
+        reclaimed by the sweep. Quota is the instance's, whoever the eventual
+        sender turns out to be: an unbound sender's bytes count exactly like
+        a bound one's, so the event's sender check (which comes later) can
+        never be used to fill the disk for free.
         """
-        with self._lock():
+        with self._transaction() as tx:
+            registry = self._registry()
+            who = self._live(registry, who)
             queue = self._queue(who.instance_id)
-            self._sweep(who.instance_id, queue, enabled=who.enabled)
-            self._save_queue(who.instance_id, queue)
-            window = queue.counters["uploads"]
-            if len(window) >= self.limits.uploads_per_hour:
+            self._sweep(who.instance_id, queue, registry, tx)
+            if len(queue.counters["uploads"]) >= self.limits.uploads_per_hour:
+                self._save_queue(who.instance_id, queue)
                 raise ConnectorError(429, "uploads_rate_limited")
-            if sum(size for _at, size in window) >= self.limits.upload_bytes_per_hour:
+            if self._hourly_bytes(queue) >= self.limits.upload_bytes_per_hour:
+                self._save_queue(who.instance_id, queue)
                 raise ConnectorError(429, "upload_bytes_rate_limited")
-            stored = sum(h["size"] for h in queue.uploads.values() if h.get("claimed_by") is None)
-        in_flight = self._in_flight.setdefault(who.instance_id, {})
-        if stored + sum(size for size, _stored in in_flight.values()) >= self.limits.upload_disk_cap_bytes:
-            raise ConnectorError(429, "upload_quota")
-        upload_id = secrets.token_hex(16)
-        directory = self._upload_dir(who.instance_id)
-        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        # [bytes so far, stored unclaimed bytes when this upload began].
-        in_flight[upload_id] = [0, stored]
-        return upload_id, directory / f".{upload_id}.part"
+            if self._held_bytes(queue) >= self.limits.upload_disk_cap_bytes:
+                self._save_queue(who.instance_id, queue)
+                raise ConnectorError(429, "upload_quota")
+            upload_id = secrets.token_hex(16)
+            now = self.clock()
+            queue.uploads[upload_id] = {
+                "state": "in_flight", "size": 0, "pid": os.getpid(), "started": now,
+            }
+            queue.counters["uploads"].append([now, 0, upload_id])
+            self._upload_dir(who.instance_id).mkdir(mode=0o700, parents=True, exist_ok=True)
+            self._save_queue(who.instance_id, queue)
+            return upload_id, self._part_path(who.instance_id, upload_id)
 
     def account_upload_bytes(self, who: Principal, upload_id: str, received: int) -> None:
-        """Count bytes as they arrive; raises once the instance is over a cap."""
-        in_flight = self._in_flight.setdefault(who.instance_id, {})
-        entry = in_flight.setdefault(upload_id, [0, 0])
-        entry[0] = received
+        """Count bytes as they arrive; raises once the instance is over a cap.
+
+        Checked against what every other handle holds right now, under the
+        lock, so overlapping uploads cannot each fit under the cap alone.
+        """
         if received > self.limits.upload_max_bytes:
             raise ConnectorError(413, "upload_too_large")
-        held = entry[1] + sum(size for other, (size, _s) in in_flight.items() if other != upload_id)
-        if held + received > self.limits.upload_disk_cap_bytes:
-            raise ConnectorError(429, "upload_quota")
+        with self._lock():
+            registry = self._registry()
+            who = self._live(registry, who)
+            queue = self._queue(who.instance_id)
+            handle = queue.uploads.get(upload_id)
+            if handle is None or handle.get("state") != "in_flight":
+                raise ConnectorError(409, "upload_reclaimed", "the upload was reclaimed")
+            if self._held_bytes(queue, except_id=upload_id) + received > self.limits.upload_disk_cap_bytes:
+                raise ConnectorError(429, "upload_quota")
+            if self._hourly_bytes(queue, except_id=upload_id) + received > self.limits.upload_bytes_per_hour:
+                raise ConnectorError(429, "upload_bytes_rate_limited")
+            handle["size"] = received
+            for entry in queue.counters["uploads"]:
+                if entry[2] == upload_id:
+                    entry[1] = received
+            self._save_queue(who.instance_id, queue)
 
     def abort_upload(self, who: Principal, upload_id: str, part: Path) -> None:
-        self._in_flight.get(who.instance_id, {}).pop(upload_id, None)
+        """Drop an upload that did not finish; its bytes still count against the hour."""
         part.unlink(missing_ok=True)
+        try:
+            with self._lock():
+                queue = self._queue(who.instance_id)
+                if queue.uploads.get(upload_id, {}).get("state") == "in_flight":
+                    del queue.uploads[upload_id]
+                    self._save_queue(who.instance_id, queue)
+        except (ConnectorStateUnreadable, OSError, RuntimeError):
+            pass
 
     def commit_upload(self, who: Principal, upload_id: str, part: Path, name: object) -> dict:
         try:
-            size = part.stat().st_size
-            if size == 0:
-                raise ConnectorError(400, "upload_empty")
             with self._lock():
+                registry = self._registry()
+                who = self._live(registry, who)
                 queue = self._queue(who.instance_id)
+                handle = queue.uploads.get(upload_id)
+                if handle is None or handle.get("state") != "in_flight":
+                    raise ConnectorError(409, "upload_reclaimed", "the upload was reclaimed")
+                size = part.stat().st_size
+                if size == 0:
+                    raise ConnectorError(400, "upload_empty")
                 now = self.clock()
                 queue.uploads[upload_id] = {
-                    "name": outbox.display_name(name), "size": size, "created": now,
-                    "expires": now + self.limits.upload_ttl_seconds, "claimed_by": None,
+                    "state": "stored", "name": outbox.display_name(name), "size": size,
+                    "created": now, "expires": now + self.limits.upload_ttl_seconds, "claimed_by": None,
                 }
-                queue.counters["uploads"].append([now, size])
+                for entry in queue.counters["uploads"]:
+                    if entry[2] == upload_id:
+                        entry[1] = size
                 os.replace(part, self._upload_dir(who.instance_id) / upload_id)
                 self._save_queue(who.instance_id, queue)
-        finally:
+                return {"upload_id": upload_id, "size": size, "expires": queue.uploads[upload_id]["expires"]}
+        except BaseException:
             self.abort_upload(who, upload_id, part)
-        return {"upload_id": upload_id, "size": size, "expires": queue.uploads[upload_id]["expires"]}
+            raise
 
     # -------------------------------------------------------------- outbound
 
     def enqueue(
         self, *, channel: str, account: str, conversation: str, text: str,
-        thread: str | None = None, attachment: Path | None = None,
-        attachment_name: str = "", attachment_kind: str = "file",
-        reply_footer: str = "", session: str | None = None,
+        thread: str | None = None, binding_id: str | None = None,
+        attachment: Path | None = None, attachment_name: str = "",
+        attachment_kind: str = "file", reply_footer: str = "", session: str | None = None,
     ) -> str:
         """Queue one message for the enabled connector bound to that conversation.
 
-        This is the seam notify will call. The attachment is copied into
-        core's own files, so the connector only ever reads a lodge-owned path.
+        This is the seam notify will call. The destination is a binding of
+        the one enabled instance for the channel and account: `binding_id`
+        when the caller answers a particular event, else the single binding
+        that covers the conversation (two senders bound in one conversation
+        make it ambiguous, and ambiguity is refused). The attachment is
+        copied into core's own files, so the connector only ever reads a
+        lodge-owned path.
         """
-        with self._lock():
+        if not isinstance(text, str) or len(text.encode("utf-8")) > self.limits.outbound_text_max_bytes:
+            raise ConnectorError(413, "text_too_long")
+        if attachment is not None and attachment.stat().st_size > self.limits.outbound_file_max_bytes:
+            raise ConnectorError(413, "attachment_too_large")
+        with self._transaction() as tx:
             registry = self._registry()
             instance_id = next(
                 (i for i, r in registry["instances"].items()
-                 if r["channel"] == channel and r["account"] == account),
+                 if r["channel"] == channel and r["account"] == account and r["enabled"]),
                 None,
             )
             if instance_id is None:
-                raise NoConnectorBinding(f"no {channel} connector for account {account}")
-            bound = any(
-                b["instance_id"] == instance_id and b["conversation"] == conversation
+                raise NoConnectorBinding(f"no enabled {channel} connector for account {account}")
+            candidates = [
+                b for b in registry["bindings"]
+                if b["instance_id"] == instance_id and b["conversation"] == conversation
                 and (b.get("thread") is None or b["thread"] == thread)
-                for b in registry["bindings"]
-            )
-            if not bound:
-                raise NoConnectorBinding(f"{channel} {conversation} is not bound to {instance_id}")
+            ]
+            if binding_id is not None:
+                candidates = [b for b in candidates if b["binding_id"] == binding_id]
+            if len(candidates) != 1:
+                raise NoConnectorBinding(
+                    f"{channel} {conversation} has {len(candidates)} bindings on {instance_id}; need exactly one",
+                )
+            binding = candidates[0]
+            queue = self._queue(instance_id)
+            self._sweep(instance_id, queue, registry, tx)
+            if sum(1 for d in queue.deliveries if d["status"] not in _TERMINAL) >= self.limits.max_queued:
+                self._save_queue(instance_id, queue)
+                raise ConnectorError(429, "queue_full")
             now = self.clock()
             delivery_id = secrets.token_hex(16)
             attachments = []
@@ -913,36 +1124,38 @@ class ConnectorStore:
                     "size": target.stat().st_size,
                     "expires": now + self.limits.file_retention_seconds,
                 })
-            queue = self._queue(instance_id)
             queue.deliveries.append({
-                "delivery_id": delivery_id, "account": account, "conversation": conversation,
+                "delivery_id": delivery_id, "binding_id": binding["binding_id"],
+                "account": account, "conversation": conversation,
                 "thread": thread, "text": text, "attachments": attachments,
                 "reply_footer": reply_footer, "session": session, "created": now,
-                "status": "queued", "attempts": 0, "lease": None, "acks": {},
-                "not_before": now, "clock_started": None, "clock_used": 0.0,
-                "clock_paused": False,
+                "status": "queued", "failed_attempts": 0, "lease": None, "acks": {},
+                "not_before": now, "clock_started": None, "paused_base": 0.0,
             })
             self._save_queue(instance_id, queue)
             return delivery_id
 
     def list_deliveries(self, instance_id: str) -> list[dict]:
-        """Owner view of a queue, with the clocks applied first."""
-        with self._lock():
+        """Owner view of a queue, with the registry and the clocks applied first."""
+        with self._transaction() as tx:
             registry = self._registry()
-            instance = self._instance(registry, instance_id)
+            self._instance(registry, instance_id)
             queue = self._queue(instance_id)
-            self._sweep(instance_id, queue, enabled=instance["enabled"])
+            self._sweep(instance_id, queue, registry, tx)
             self._save_queue(instance_id, queue)
             return [dict(d) for d in queue.deliveries]
 
     def lease(self, who: Principal, max_items: int) -> dict:
         """Hand out up to `max_items` queued deliveries, each leased for 60 s."""
-        if not isinstance(max_items, int) or max_items < 1:
+        if isinstance(max_items, bool) or not isinstance(max_items, int) or max_items < 1:
             raise ConnectorError(400, "malformed_lease", "max must be a positive integer")
         max_items = min(max_items, self.limits.lease_max_batch)
-        with self._lock():
+        with self._transaction() as tx:
+            registry = self._registry()
+            who = self._live(registry, who)
+            instance = registry["instances"][who.instance_id]
             queue = self._queue(who.instance_id)
-            self._sweep(who.instance_id, queue, enabled=who.enabled)
+            self._sweep(who.instance_id, queue, registry, tx)
             now = self.clock()
             leased = []
             if who.enabled:
@@ -961,8 +1174,9 @@ class ConnectorStore:
                         "expires": now + self.limits.lease_seconds,
                     }
                     delivery["status"] = "leased"
-                    if delivery.get("clock_started") is None and not delivery.get("clock_paused"):
+                    if delivery.get("clock_started") is None:
                         delivery["clock_started"] = now
+                        delivery["paused_base"] = instance.get("paused_seconds", 0.0)
                     leased.append({
                         "delivery_id": delivery["delivery_id"], "attempt_id": attempt_id,
                         "lease_expires": delivery["lease"]["expires"],
@@ -979,7 +1193,7 @@ class ConnectorStore:
 
     def ack(self, who: Principal, delivery_id: object, body: object) -> dict:
         """Close an attempt. A repeat for the same attempt returns the first answer."""
-        if not isinstance(body, dict):
+        if not isinstance(body, dict) or not set(body) <= _ACK_KEYS:
             raise ConnectorError(400, "malformed_ack")
         attempt_id = body.get("attempt_id")
         if not isinstance(attempt_id, str) or outbox.ENTRY_ID_RE.fullmatch(attempt_id) is None:
@@ -995,21 +1209,23 @@ class ConnectorStore:
         retry = body.get("retry", True)
         if not isinstance(retry, bool):
             raise ConnectorError(400, "malformed_ack", "retry must be true or false")
-        with self._lock():
+        with self._transaction() as tx:
+            registry = self._registry()
+            who = self._live(registry, who)
             queue = self._queue(who.instance_id)
             delivery = next(
                 (d for d in queue.deliveries if d["delivery_id"] == delivery_id), None,
             )
             if delivery is not None and attempt_id in delivery.get("acks", {}):
                 return dict(delivery["acks"][attempt_id])
-            self._sweep(who.instance_id, queue, enabled=who.enabled)
+            self._sweep(who.instance_id, queue, registry, tx)
             lease = delivery.get("lease") if delivery is not None else None
             if (
                 delivery is None or lease is None or lease["attempt_id"] != attempt_id
                 or lease["generation"] != who.generation
             ):
-                # Foreign, stale or expired: one answer for all three, so a
-                # connector learns nothing about queues that are not its own.
+                # Foreign, stale, expired or cancelled: one answer for all, so
+                # a connector learns nothing about queues that are not its own.
                 self._save_queue(who.instance_id, queue)
                 raise ConnectorError(409, "stale_attempt", "no active lease for that attempt")
             if body["ok"]:
@@ -1019,10 +1235,14 @@ class ConnectorStore:
                 })
                 self._drop_files(delivery)
             elif retry:
-                self._attempt_failed(who.instance_id, delivery, error or "connector reported a failure", backoff=True)
+                self._attempt_failed(
+                    who.instance_id, delivery, error or "connector reported a failure", tx, backoff=True,
+                )
             else:
-                self._finish(who.instance_id, delivery, "failed", error or "connector refused for good")
-            result = {"ok": True, "status": delivery["status"], "attempts": delivery["attempts"]}
+                self._finish(who.instance_id, delivery, "failed", error or "connector refused for good", tx)
+            result = {
+                "ok": True, "status": delivery["status"], "failed_attempts": delivery["failed_attempts"],
+            }
             if delivery["status"] == "queued":
                 result["retry_at"] = delivery["not_before"]
             delivery.setdefault("acks", {})[attempt_id] = result
@@ -1032,18 +1252,21 @@ class ConnectorStore:
     def open_file(self, who: Principal, file_id: object, attempt_id: object) -> tuple[Path, dict]:
         """The path of an attachment this attempt may read, and its metadata.
 
-        Current generation, active lease for exactly that attempt, enabled
-        instance: anything less is refused the same way, and the file itself
-        is never named by anything the connector chose.
+        Live token of the current generation, active lease for exactly that
+        attempt, enabled instance, binding still granted: anything less is
+        refused the same way, and the file itself is never named by anything
+        the connector chose.
         """
         if (
             not isinstance(file_id, str) or outbox.ENTRY_ID_RE.fullmatch(file_id) is None
             or not isinstance(attempt_id, str) or outbox.ENTRY_ID_RE.fullmatch(attempt_id) is None
         ):
             raise ConnectorError(404, "file_not_available")
-        with self._lock():
+        with self._transaction() as tx:
+            registry = self._registry()
+            who = self._live(registry, who)
             queue = self._queue(who.instance_id)
-            self._sweep(who.instance_id, queue, enabled=who.enabled)
+            self._sweep(who.instance_id, queue, registry, tx)
             self._save_queue(who.instance_id, queue)
             for delivery in queue.deliveries:
                 lease = delivery.get("lease")
@@ -1057,13 +1280,22 @@ class ConnectorStore:
                         return self._file_path(file_id), dict(attachment)
         raise ConnectorError(404, "file_not_available")
 
+    def stream_allowed(self, who: Principal, file_id: str, attempt_id: str) -> bool:
+        """Whether an open file stream may send its next chunk: same checks as `open_file`."""
+        try:
+            self.open_file(who, file_id, attempt_id)
+        except (ConnectorError, ConnectorStateUnreadable):
+            return False
+        return True
+
     # -------------------------------------------------------------- failures
 
     def on_failure(self, listener: Callable[[str, dict], None]) -> None:
         """Hear about every delivery that ends without a provider message.
 
-        The seam that will tell the session; the default writes a record.
-        Listeners must never enqueue through this store from inside the call.
+        The seam that will tell the session. Listeners run after the lock is
+        released and the state is on disk, so they may enqueue through this
+        store; the default writes a record.
         """
         self._failure_listeners.append(listener)
 
@@ -1071,7 +1303,7 @@ class ConnectorStore:
         self._append_line("failures.jsonl", {
             "at": self.clock(), "instance_id": instance_id,
             "delivery_id": delivery["delivery_id"], "status": delivery["status"],
-            "attempts": delivery.get("attempts", 0), "error": delivery.get("error", ""),
+            "failed_attempts": delivery.get("failed_attempts", 0), "error": delivery.get("error", ""),
             "session": delivery.get("session"), "conversation": delivery["conversation"],
             "delivered": False,
         })

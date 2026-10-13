@@ -4,10 +4,13 @@ refusal and limit, against the lodge's own ASGI app."""
 import asyncio
 import json
 import sys
+import types
 from pathlib import Path
 
 import httpx
 import pytest
+from starlette.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -29,10 +32,11 @@ LOCAL = "http://localhost:7777"
 REMOTE = "https://owner.woltspace.test"
 LIMITS = Limits(
     lease_seconds=60, max_attempts=5, retry_window_seconds=600,
-    backoff_seconds=(1, 1, 1, 1, 1), upload_ttl_seconds=600, upload_max_bytes=1000,
+    backoff_seconds=(1, 1, 1, 1), upload_ttl_seconds=600, upload_max_bytes=1000,
     upload_disk_cap_bytes=2500, file_retention_seconds=86400, text_max_bytes=64,
-    events_per_minute=20, uploads_per_hour=10, upload_bytes_per_hour=10_000,
-    max_in_flight=3, lease_max_batch=10,
+    request_max_bytes=4096, events_per_minute=20, uploads_per_hour=10,
+    upload_bytes_per_hour=10_000, max_in_flight=3, lease_max_batch=10, max_queued=6,
+    journal_max_bytes=400, outbound_file_max_bytes=1_000_000,
 )
 
 
@@ -50,9 +54,9 @@ class Clock:
 class Lodge:
     """One lodge with a store the API serves, an enabled instance and a binding."""
 
-    def __init__(self, root: Path, clock: Clock):
+    def __init__(self, root: Path, clock: Clock, limits: Limits = LIMITS):
         self.clock = clock
-        self.store = ConnectorStore(root, clock=clock, limits=LIMITS)
+        self.store = ConnectorStore(root, clock=clock, limits=limits)
         self.routed: list = []
         self.failed: list = []
 
@@ -63,7 +67,7 @@ class Lodge:
         self.store.router = router
         self.store.on_failure(lambda instance_id, delivery: self.failed.append((instance_id, delivery)))
         self.store.add_instance("tg-main", "telegram", "bot:1")
-        self.store.bind("tg-main", sender="u1", conversation="c1", default_wolt="softie")
+        self.binding = self.store.bind("tg-main", sender="u1", conversation="c1", default_wolt="softie")
         self.store.enable("tg-main")
         self.token = self.store.issue_token("tg-main")
 
@@ -83,6 +87,13 @@ class Lodge:
             self.store.disable("tg-main")
             self.store.enable(instance_id)
         return self.store.issue_token(instance_id)
+
+    def reload(self) -> "ConnectorStore":
+        """A lodge restart: a new store over the same files, served by the API."""
+        self.store = ConnectorStore(self.store.root, clock=self.clock, limits=self.store.limits)
+        self.store.on_failure(lambda instance_id, delivery: self.failed.append((instance_id, delivery)))
+        connector_api._store = self.store
+        return self.store
 
 
 @pytest.fixture
@@ -109,6 +120,10 @@ def _remote_lodge(monkeypatch):
     monkeypatch.setattr(server_app.tunnel_mgr, "_tunnel_domain", "woltspace.test")
 
 
+def _principal(lodge):
+    return lodge.store.authenticate(lodge.token)
+
+
 # --------------------------------------------------------------- admission
 
 
@@ -132,6 +147,104 @@ async def test_two_bearer_headers_are_401_even_when_one_is_valid(lodge):
     async with _client() as client:
         response = await client.post("/connector/v1/deliveries/lease", json={"max": 1}, headers=headers)
     assert response.status_code == 401
+
+
+OWNER_ROUTES = [
+    ("GET", "/sessions", None),
+    ("GET", "/settings/access", None),
+    ("POST", "/settings/access", {"team_domain": "x.cloudflareaccess.com", "lodge_aud": "a", "owner_email": "o@example.com"}),
+    ("POST", "/notify", {"message": "hi"}),
+    ("GET", "/tui", None),
+    ("GET", "/apps", None),
+    ("POST", "/sessions/redirect", {"from": "a", "to": "b"}),
+]
+
+
+@pytest.mark.parametrize("method, path, body", OWNER_ROUTES)
+async def test_a_connector_bearer_opens_no_other_route_and_causes_no_side_effect(lodge, monkeypatch, method, path, body):
+    """Finding 1: the credential works on /connector/v1 and nowhere else."""
+    touched = []
+    monkeypatch.setattr(server_app, "send_notification", lambda *a, **k: touched.append(("notify", a)))
+    async with _client() as client:
+        response = await client.request(
+            method, path, json=body, headers={"Authorization": f"Bearer {lodge.token}"},
+        )
+    assert response.status_code == 401
+    assert response.json() == {"error": "connector token not accepted here"}
+    assert touched == []
+    assert not (lodge.store.root.parent / "woltspace.json").exists()
+
+
+@pytest.mark.parametrize("headers", [
+    [("Authorization", "Bearer wct_unknown")],
+    [("Authorization", "Basic abc")],
+    [("Authorization", "Bearer")],
+    [("Authorization", "bearer wct_lowercase")],
+    [("Authorization", "Bearer wct_a wct_b")],
+    [("Authorization", "Bearer wst_session_shaped")],
+    [("Authorization", "Token x")],
+    [("Authorization", "")],
+])
+async def test_malformed_or_duplicate_authorization_never_becomes_the_owner(lodge, headers):
+    """Finding 1 (b): no happy-path parser; any Authorization outside the API is 401."""
+    async with _client() as client:
+        single = await client.get("/sessions", headers=headers)
+        twice = await client.get(
+            "/sessions", headers=headers + [("Authorization", f"Bearer {lodge.token}")],
+        )
+        plain = await client.get("/sessions")
+    assert single.status_code == 401
+    assert twice.status_code == 401
+    # Token-less local compatibility (row 4) is untouched.
+    assert plain.status_code == 200
+
+
+async def test_websocket_with_a_connector_bearer_is_closed_before_accept(lodge):
+    client = TestClient(server_app.app, base_url=LOCAL)
+    local = {"host": "localhost:7777", "origin": "http://localhost:7777"}
+    for value in (f"Bearer {lodge.token}", "Bearer wct_unknown", "Basic abc", "Bearer"):
+        with pytest.raises(WebSocketDisconnect) as refused:
+            with client.websocket_connect("/livereload", headers={**local, "Authorization": value}):
+                pass
+        assert refused.value.code == 1008
+    # Two Authorization headers, one of them valid: refused at the ASGI edge.
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    async def receive():
+        return {"type": "websocket.connect"}
+
+    await server_app.app({
+        "type": "websocket", "asgi": {"version": "3.0"}, "path": "/livereload", "raw_path": b"/livereload",
+        "query_string": b"", "scheme": "ws", "server": ("localhost", 7777), "client": ("127.0.0.1", 1),
+        "headers": [
+            (b"host", b"localhost:7777"), (b"origin", b"http://localhost:7777"),
+            (b"authorization", f"Bearer {lodge.token}".encode()), (b"authorization", b"Bearer x"),
+        ],
+    }, receive, send)
+    assert sent == [{"type": "websocket.close", "code": 1008}]
+    # Token-less, the same socket opens as before.
+    with client.websocket_connect("/livereload", headers=local):
+        pass
+
+
+async def test_host_and_origin_checks_stay_independent_of_the_bearer_guard(lodge, monkeypatch):
+    monkeypatch.setattr(server_app, "load_access_settings", lambda _root: None)
+    sent = []
+    monkeypatch.setattr(server_app, "send_notification", lambda *a, **k: sent.append(a))
+    async with _client(remote=True) as client:
+        bad_host = await client.get("/sessions")
+        bad_host_with_bearer = await client.get("/sessions", headers={"Authorization": f"Bearer {lodge.token}"})
+    assert bad_host.status_code == 403
+    assert bad_host_with_bearer.status_code == 401
+    async with _client() as client:
+        cross_origin = await client.post(
+            "/notify", json={"message": "hi"}, headers={"Origin": "https://evil.example"},
+        )
+    assert cross_origin.status_code == 403
+    assert sent == []
 
 
 async def test_revoked_and_rotated_tokens_are_refused(lodge):
@@ -183,6 +296,124 @@ async def test_corrupt_registry_refuses_every_token_and_corrupt_queue_fails_clos
         assert (await connector.upload(b"x")).status_code == 503
 
 
+# ------------------------------------------------- stale principals (finding 2)
+
+
+def test_a_principal_captured_before_a_revoke_is_refused_inside_the_lock(lodge, tmp_path):
+    """Astre's probe: authenticate, revoke, then act with the old snapshot."""
+    who = _principal(lodge)
+    lodge.enqueue()
+    lodge.store.revoke_tokens("tg-main")
+    event = {"event_id": "e1", "sender": {"provider_id": "u1"}, "conversation": {"provider_id": "c1"}, "text": "hi"}
+    for call in (
+        lambda: lodge.store.accept_event(who, event),
+        lambda: lodge.store.lease(who, 1),
+        lambda: lodge.store.begin_upload(who),
+        lambda: lodge.store.ack(who, "0" * 32, {"attempt_id": "1" * 32, "ok": True}),
+        lambda: lodge.store.open_file(who, "0" * 32, "1" * 32),
+    ):
+        with pytest.raises(ConnectorError) as refused:
+            call()
+        assert refused.value.status == 401
+    assert lodge.routed == []
+    assert lodge.deliveries()[next(iter(lodge.deliveries()))]["status"] == "queued"
+    # A rotation is just as final for the old snapshot, and so is removal.
+    stale = _principal(Lodge(tmp_path / "other", lodge.clock))
+    with pytest.raises(ConnectorError):
+        lodge.store.lease(stale, 1)
+
+
+async def test_a_request_whose_body_arrives_after_a_revoke_or_rotation_is_refused(lodge):
+    event = json.dumps({
+        "event_id": "slow", "sender": {"provider_id": "u1"}, "conversation": {"provider_id": "c1"}, "text": "hi",
+    }).encode()
+
+    def body(after_first):
+        async def stream():
+            yield event[:10]
+            after_first()
+            yield event[10:]
+        return stream()
+
+    async with _client() as client:
+        connector = FakeConnector(client, lodge.token)
+        revoked = await client.post(
+            "/connector/v1/events", content=body(lambda: lodge.store.revoke_tokens("tg-main")),
+            headers=connector.headers,
+        )
+        assert revoked.status_code == 401
+        token = lodge.store.issue_token("tg-main")
+        connector = FakeConnector(client, token)
+        rotated = await client.post(
+            "/connector/v1/events", content=body(lambda: lodge.store.issue_token("tg-main")),
+            headers=connector.headers,
+        )
+        assert rotated.status_code == 401
+        token = lodge.store.issue_token("tg-main")
+        connector = FakeConnector(client, token)
+        disabled = await client.post(
+            "/connector/v1/events", content=body(lambda: lodge.store.disable("tg-main")),
+            headers=connector.headers,
+        )
+        assert disabled.json()["reason"] == "instance_disabled"
+        lodge.store.enable("tg-main")
+        removed = await client.post(
+            "/connector/v1/events", content=body(lambda: lodge.store.remove_instance("tg-main")),
+            headers=connector.headers,
+        )
+        assert removed.status_code == 401
+    assert lodge.routed == []
+
+
+async def test_an_upload_whose_stream_outlives_its_token_leaves_nothing_behind(lodge):
+    async with _client() as client:
+        connector = FakeConnector(client, lodge.token)
+
+        async def stream():
+            yield b"first"
+            lodge.store.revoke_tokens("tg-main")
+            yield b"second"
+
+        response = await client.post(
+            "/connector/v1/uploads", content=stream(), headers=connector.headers,
+        )
+    assert response.status_code == 401
+    uploads = lodge.store.root / "uploads" / "tg-main"
+    assert not uploads.exists() or list(uploads.iterdir()) == []
+    queue = json.loads((lodge.store.root / "queues" / "tg-main.json").read_text())
+    assert queue["uploads"] == {}
+
+
+async def test_a_file_stream_is_cut_when_its_lease_expires_mid_transfer(lodge, tmp_path, monkeypatch):
+    big = tmp_path / "big.bin"
+    big.write_bytes(b"z" * (connector_api._CHUNK * 3))
+    lodge.enqueue(attachment=big)
+    allowed = lodge.store.stream_allowed
+    calls = []
+
+    def expiring(who, file_id, attempt_id):
+        calls.append(1)
+        if len(calls) == 2:
+            lodge.clock.advance(LIMITS.lease_seconds + 1)
+        return allowed(who, file_id, attempt_id)
+
+    monkeypatch.setattr(lodge.store, "stream_allowed", expiring)
+    async with _client() as client:
+        connector = FakeConnector(client, lodge.token)
+        leased = (await connector.lease()).json()["deliveries"][0]
+        received = b""
+        try:
+            async with client.stream(
+                "GET", f"/connector/v1/files/{leased['attachments'][0]['file_id']}",
+                params={"attempt_id": leased["attempt_id"]}, headers=connector.headers,
+            ) as response:
+                async for chunk in response.aiter_bytes():
+                    received += chunk
+        except httpx.HTTPError:
+            pass
+    assert len(received) == connector_api._CHUNK
+
+
 # ------------------------------------------------------------------ events
 
 
@@ -199,7 +430,7 @@ async def test_bound_sender_is_accepted_once_and_routed_once(lodge):
     assert len(lodge.routed) == 1
     event = lodge.routed[0]
     assert (event.account, event.event_id, event.text) == ("bot:1", "tg:1", "hello")
-    assert event.binding["default_wolt"] == "softie"
+    assert event.binding["binding_id"] == lodge.binding["binding_id"]
 
 
 async def test_same_event_id_with_another_payload_is_409(lodge):
@@ -210,6 +441,7 @@ async def test_same_event_id_with_another_payload_is_409(lodge):
         other_route = await connector.send_event("tg:1", "u1", "c1", "hello", reply_to="a" * 32)
     assert conflict.status_code == 409
     assert conflict.json()["reason"] == "event_conflict"
+    assert conflict.json()["retry"] is False
     assert other_route.status_code == 409
     assert len(lodge.routed) == 1
 
@@ -268,27 +500,103 @@ async def test_malformed_oversize_and_flooding_events_are_refused(lodge):
         assert (await FakeConnector(client, lodge.token).send_event("tg:later", "u1", "c1", "hi")).status_code == 200
 
 
-async def test_disabled_instance_drops_events_and_hands_out_nothing(lodge):
+async def test_oversized_chunked_json_is_refused_before_it_is_parsed(lodge, monkeypatch):
+    """Finding 5: the body bound is counted while streaming, not after loading."""
+    parsed = []
+    real_loads = connector_api.json.loads
+    monkeypatch.setattr(
+        connector_api, "json",
+        types.SimpleNamespace(loads=lambda raw: parsed.append(raw) or real_loads(raw)),
+    )
+    padding = "x" * (LIMITS.request_max_bytes * 2)
+
+    async def chunks():
+        payload = json.dumps({"event_id": "e", "sender": {"provider_id": "u1", "display": padding}}).encode()
+        for offset in range(0, len(payload), 512):
+            yield payload[offset:offset + 512]
+
+    async with _client() as client:
+        connector = FakeConnector(client, lodge.token)
+        response = await client.post("/connector/v1/events", content=chunks(), headers=connector.headers)
+        assert (response.status_code, response.json()["reason"]) == (413, "request_too_large")
+        assert parsed == []
+        lease = await client.post(
+            "/connector/v1/deliveries/lease", content=b"{" + b" " * LIMITS.request_max_bytes + b"}",
+            headers=connector.headers,
+        )
+    assert lease.status_code == 413
+    assert lodge.routed == []
+
+
+async def test_display_and_unknown_fields_are_bounded(lodge):
+    async with _client() as client:
+        connector = FakeConnector(client, lodge.token)
+        long_display = await connector.send_event("tg:1", "u1", "c1", "hi", display="d" * 257)
+        unknown_top = await connector.send_event("tg:2", "u1", "c1", "hi", surprise="x")
+        unknown_nested = await client.post("/connector/v1/events", json={
+            "event_id": "tg:3", "sender": {"provider_id": "u1", "role": "owner"},
+            "conversation": {"provider_id": "c1"}, "text": "hi",
+        }, headers=connector.headers)
+        unknown_ack = await client.post(
+            "/connector/v1/deliveries/" + "0" * 32 + "/ack",
+            json={"attempt_id": "1" * 32, "ok": True, "extra": 1}, headers=connector.headers,
+        )
+        fine = await connector.send_event("tg:4", "u1", "c1", "hi", display="d" * 256)
+    assert long_display.status_code == unknown_top.status_code == unknown_nested.status_code == 400
+    assert unknown_ack.status_code == 400
+    assert fine.json()["accepted"] is True
+    assert len(lodge.routed) == 1
+
+
+async def test_lease_wait_must_be_finite(lodge):
+    async with _client() as client:
+        connector = FakeConnector(client, lodge.token)
+        for raw in (b'{"max": 1, "wait": NaN}', b'{"max": 1, "wait": Infinity}', b'{"max": 1, "wait": -1}',
+                    b'{"max": 1, "wait": "5"}', b'{"max": 1, "wait": 1, "poll": true}'):
+            response = await client.post("/connector/v1/deliveries/lease", content=raw, headers=connector.headers)
+            assert (response.status_code, response.json()["reason"]) == (400, "malformed_lease"), raw
+        assert (await connector.lease(1, wait=0.5)).status_code == 200
+
+
+async def test_disabled_instance_drops_events_for_good_and_hands_out_nothing(lodge):
+    """Interpretation (d): disable pauses outbound, it does not buffer inbound.
+
+    An event that reaches a disabled instance is dropped, the connector is
+    told `paused` and stops forwarding, and the same event id replays the
+    recorded drop after re-enable: nothing received while disabled is
+    delivered later.
+    """
     lodge.enqueue()
     lodge.store.disable("tg-main")
     async with _client() as client:
         connector = FakeConnector(client, lodge.token)
         event = await connector.send_event("tg:1", "u1", "c1", "hi")
         lease = await connector.lease()
-    assert event.json()["reason"] == "instance_disabled"
-    assert lease.json() == {"deliveries": [], "paused": True}
+        assert event.json() == {"accepted": False, "reason": "instance_disabled", "event_id": "tg:1"}
+        assert lease.json() == {"deliveries": [], "paused": True}
+        lodge.store.enable("tg-main")
+        replay = await connector.send_event("tg:1", "u1", "c1", "hi")
+        fresh = await connector.send_event("tg:2", "u1", "c1", "hi")
+    assert replay.json() == event.json()
+    assert fresh.json()["accepted"] is True
+    assert [e.event_id for e in lodge.routed] == ["tg:2"]
 
 
-async def test_reply_to_resolves_only_inside_the_events_own_binding(lodge):
+async def test_reply_to_resolves_only_through_the_events_exact_binding(lodge):
+    """Finding 3: the same conversation is not the same binding."""
+    other_sender = lodge.store.bind("tg-main", sender="u2", conversation="c1", default_wolt="softie")
     lodge.store.bind("tg-main", sender="u1", conversation="c2", default_wolt="softie")
-    own = lodge.enqueue(conversation="c1")
+    own = lodge.enqueue(conversation="c1", binding_id=lodge.binding["binding_id"])
+    theirs = lodge.enqueue(conversation="c1", binding_id=other_sender["binding_id"])
     elsewhere = lodge.enqueue(conversation="c2")
     async with _client() as client:
         connector = FakeConnector(client, lodge.token)
-        cross = await connector.send_event("tg:1", "u1", "c1", "re", reply_to=elsewhere)
-        missing = await connector.send_event("tg:2", "u1", "c1", "re", reply_to="f" * 32)
-        good = await connector.send_event("tg:3", "u1", "c1", "re", reply_to=own)
-    assert cross.json() == {"accepted": False, "reason": "reply_to_out_of_binding", "event_id": "tg:1"}
+        same_conversation = await connector.send_event("tg:1", "u1", "c1", "re", reply_to=theirs)
+        cross = await connector.send_event("tg:2", "u1", "c1", "re", reply_to=elsewhere)
+        missing = await connector.send_event("tg:3", "u1", "c1", "re", reply_to="f" * 32)
+        good = await connector.send_event("tg:4", "u1", "c1", "re", reply_to=own)
+    assert same_conversation.json() == {"accepted": False, "reason": "reply_to_out_of_binding", "event_id": "tg:1"}
+    assert cross.json()["reason"] == "reply_to_out_of_binding"
     assert missing.json()["reason"] == "reply_to_out_of_binding"
     assert good.json()["accepted"] is True
     assert good.json()["session"] == "softie-1"
@@ -322,12 +630,12 @@ async def test_upload_over_its_cap_is_cut_as_it_arrives(lodge):
         connector = FakeConnector(client, lodge.token)
         response = await connector.upload(b"x" * (LIMITS.upload_max_bytes + 1), chunk=100)
         empty = await connector.upload(b"")
-    assert (response.status_code, response.json()["reason"]) == (413, "upload_too_large")
+    assert (response.status_code, response.json()["reason"], response.json()["retry"]) == (413, "upload_too_large", False)
     assert empty.status_code == 400
     assert list((lodge.store.root / "uploads" / "tg-main").iterdir()) == []
 
 
-async def test_upload_quota_is_counted_before_the_sender_check_and_released_on_rejection(lodge):
+async def test_upload_quota_is_counted_before_the_sender_check_and_only_own_handles_are_released(lodge):
     async with _client() as client:
         connector = FakeConnector(client, lodge.token)
         ids = []
@@ -336,14 +644,80 @@ async def test_upload_quota_is_counted_before_the_sender_check_and_released_on_r
             assert response.status_code == 200
             ids.append(response.json()["upload_id"])
         # 2000 of 2500 bytes held: the next 1000 trips the cap while arriving,
-        # without any event having named a sender.
+        # without any event having named a sender. 429 says: try again later.
         over = await connector.upload(b"x" * 1000, chunk=200)
-        assert (over.status_code, over.json()["reason"]) == (429, "upload_quota")
-        # An unbound sender's event is dropped and gives its bytes back at once.
+        assert (over.status_code, over.json()["reason"], over.json()["retry"]) == (429, "upload_quota", True)
+        # A bound sender claims one; an unbound sender's drop names both but
+        # may only release the one nobody holds.
+        claimed = await connector.send_event("tg:0", "u1", "c1", "", attachments=(ids[0],))
+        assert claimed.json()["accepted"] is True
         dropped = await connector.send_event("tg:1", "u2", "c1", "", attachments=tuple(ids))
         assert dropped.json()["reason"] == "sender_not_allowed"
+        assert sorted(p.name for p in (lodge.store.root / "uploads" / "tg-main").iterdir()) == [ids[0]]
         assert (await connector.upload(b"x" * 1000)).status_code == 200
-    assert len(list((lodge.store.root / "uploads" / "tg-main").iterdir())) == 1
+        # Claimed bytes count until the router releases them.
+        full = await connector.upload(b"x" * 1000, chunk=500)
+        assert full.status_code == 429
+        lodge.store.release_uploads("tg-main", [ids[0]])
+        assert (await connector.upload(b"x" * 1000)).status_code == 200
+
+
+def test_overlapping_uploads_share_one_cap_and_one_hourly_window(lodge):
+    """Astre's probe: two 7-byte uploads under a 10-byte cap, begun together."""
+    store = ConnectorStore(lodge.store.root, clock=lodge.clock, limits=Limits(
+        upload_disk_cap_bytes=10, upload_max_bytes=1000, uploads_per_hour=3, upload_bytes_per_hour=100,
+    ))
+    who = store.authenticate(lodge.token)
+    a_id, a_part = store.begin_upload(who)
+    b_id, b_part = store.begin_upload(who)
+    store.account_upload_bytes(who, a_id, 7)
+    with pytest.raises(ConnectorError) as refused:
+        store.account_upload_bytes(who, b_id, 7)
+    assert (refused.value.status, refused.value.reason, refused.value.retry) == (429, "upload_quota", True)
+    store.abort_upload(who, b_id, b_part)
+    a_part.write_bytes(b"x" * 7)
+    store.commit_upload(who, a_id, a_part, "a")
+    queue = json.loads((store.root / "queues" / "tg-main.json").read_text())
+    assert sum(h["size"] for h in queue["uploads"].values()) == 7
+    # A third begin sees the committed 7 and the slot count: two begins already used slots.
+    c_id, c_part = store.begin_upload(who)
+    with pytest.raises(ConnectorError, match="upload_quota"):
+        store.account_upload_bytes(who, c_id, 4)
+    store.abort_upload(who, c_id, c_part)
+    with pytest.raises(ConnectorError, match="uploads_rate_limited"):
+        store.begin_upload(who)
+
+
+def test_abandoned_upload_parts_are_reclaimed_after_a_restart(lodge):
+    """A process died mid-upload: its reservation and bytes are freed on reload."""
+    who = _principal(lodge)
+    dead_id, dead_part = lodge.store.begin_upload(who)
+    dead_part.write_bytes(b"half")
+    lodge.store.account_upload_bytes(who, dead_id, 900)
+    queue_path = lodge.store.root / "queues" / "tg-main.json"
+    queue = json.loads(queue_path.read_text())
+    queue["uploads"][dead_id]["pid"] = 2 ** 22 + 7  # not a live process
+    queue_path.write_text(json.dumps(queue))
+    (lodge.store.root / "uploads" / "tg-main" / ".deadbeef.part").write_bytes(b"orphan")
+    # Nothing reclaims it on its own in the dead process's accounting...
+    live_id, live_part = lodge.store.begin_upload(who)
+    live_part.write_bytes(b"x" * 900)
+    lodge.store.account_upload_bytes(who, live_id, 900)
+    # ...so a reload, which sweeps dead reservations, is what frees the room.
+    reloaded = lodge.reload()
+    fresh_id, fresh_part = reloaded.begin_upload(who)
+    fresh_part.write_bytes(b"x" * 900)
+    reloaded.account_upload_bytes(who, fresh_id, 900)
+    assert not dead_part.exists()
+    assert sorted(p.name for p in (reloaded.root / "uploads" / "tg-main").iterdir()) == sorted(
+        [f".{live_id}.part", f".{fresh_id}.part"],
+    )
+    # The two live reservations are still coherent: a third 900 is over the cap.
+    third_id, third_part = reloaded.begin_upload(who)
+    with pytest.raises(ConnectorError, match="upload_quota"):
+        reloaded.account_upload_bytes(who, third_id, 900)
+    for upload_id, part in ((third_id, third_part), (fresh_id, fresh_part), (live_id, live_part)):
+        reloaded.abort_upload(who, upload_id, part)
 
 
 async def test_expired_upload_and_upload_rate_limits_are_refused(lodge):
@@ -356,19 +730,39 @@ async def test_expired_upload_and_upload_rate_limits_are_refused(lodge):
         for _ in range(LIMITS.uploads_per_hour - 1):
             assert (await connector.upload(b"y")).status_code == 200
         limited = await connector.upload(b"y")
-    assert (limited.status_code, limited.json()["reason"]) == (429, "uploads_rate_limited")
+    assert (limited.status_code, limited.json()["reason"], limited.json()["retry"]) == (429, "uploads_rate_limited", True)
 
 
 # -------------------------------------------------------------- deliveries
 
 
-def test_enqueue_needs_an_instance_for_the_account_and_a_binding_for_the_conversation(lodge):
+def test_enqueue_targets_the_enabled_instance_and_exactly_one_binding(lodge):
+    """Finding 3: never a disabled older instance, never an ambiguous conversation."""
     with pytest.raises(NoConnectorBinding):
         lodge.store.enqueue(channel="telegram", account="bot:2", conversation="c1", text="x")
     with pytest.raises(NoConnectorBinding):
         lodge.store.enqueue(channel="telegram", account="bot:1", conversation="c2", text="x")
     with pytest.raises(NoConnectorBinding):
         lodge.store.enqueue(channel="slack", account="bot:1", conversation="c1", text="x")
+    # Two senders bound in one conversation: the caller must say which.
+    second = lodge.store.bind("tg-main", sender="u2", conversation="c1", default_wolt="softie")
+    with pytest.raises(NoConnectorBinding, match="2 bindings"):
+        lodge.enqueue()
+    chosen = lodge.enqueue(binding_id=second["binding_id"])
+    assert lodge.deliveries()[chosen]["binding_id"] == second["binding_id"]
+    with pytest.raises(NoConnectorBinding):
+        lodge.enqueue(binding_id="not-a-binding")
+    # A replacement with the same channel and account: only the enabled one receives.
+    lodge.store.disable("tg-main")
+    lodge.store.add_instance("tg-replacement", "telegram", "bot:1")
+    lodge.store.bind("tg-replacement", sender="u1", conversation="c1", default_wolt="softie")
+    lodge.store.enable("tg-replacement")
+    routed = lodge.enqueue()
+    assert routed in lodge.deliveries("tg-replacement")
+    assert routed not in lodge.deliveries("tg-main")
+    lodge.store.disable("tg-replacement")
+    with pytest.raises(NoConnectorBinding, match="no enabled"):
+        lodge.enqueue()
 
 
 async def test_lease_send_ack_delivers_with_its_attachment(lodge, tmp_path):
@@ -378,7 +772,7 @@ async def test_lease_send_ack_delivers_with_its_attachment(lodge, tmp_path):
     async with _client() as client:
         connector = FakeConnector(client, lodge.token)
         results = await connector.run_once()
-    assert results == [{"ok": True, "status": "delivered", "attempts": 0}]
+    assert results == [{"ok": True, "status": "delivered", "failed_attempts": 0}]
     sent = connector.provider.sent[0]
     assert (sent["delivery_id"], sent["text"], sent["files"]) == (delivery_id, "listen", [b"opus" * 10])
     assert sent["conversation"] == {"provider_id": "c1", "thread": None}
@@ -391,9 +785,7 @@ async def test_lease_send_ack_delivers_with_its_attachment(lodge, tmp_path):
 
 async def test_lodge_restart_and_token_rotation_keep_the_queue(lodge):
     delivery_id = lodge.enqueue()
-    # A lodge restart is a new store over the same files.
-    restarted = ConnectorStore(lodge.store.root, clock=lodge.clock, limits=LIMITS)
-    connector_api._store = restarted
+    restarted = lodge.reload()
     async with _client() as client:
         survivor = FakeConnector(client, lodge.token)
         leased = (await survivor.lease()).json()["deliveries"]
@@ -408,7 +800,7 @@ async def test_lodge_restart_and_token_rotation_keep_the_queue(lodge):
         assert [d["delivery_id"] for d in again] == [delivery_id]
         assert again[0]["attempt_id"] != leased[0]["attempt_id"]
         assert (await relaunched.ack(delivery_id, again[0]["attempt_id"], provider_message_id="m")).json()["status"] == "delivered"
-    assert restarted.list_deliveries("tg-main")[0]["attempts"] == 0
+    assert restarted.list_deliveries("tg-main")[0]["failed_attempts"] == 0
 
 
 async def test_disable_pauses_the_retry_clock_and_enable_resumes_it(lodge):
@@ -423,11 +815,52 @@ async def test_disable_pauses_the_retry_clock_and_enable_resumes_it(lodge):
         lodge.store.enable("tg-main")
         lodge.clock.advance(2)
         results = await connector.run_once()
-    assert results == [{"ok": True, "status": "delivered", "attempts": 1}]
+    assert results == [{"ok": True, "status": "delivered", "failed_attempts": 1}]
     assert lodge.deliveries()[delivery_id]["status"] == "delivered"
 
 
-async def test_remove_cancels_the_queue_revokes_and_detaches(lodge):
+def test_enable_disable_and_rotation_are_single_write_transitions(lodge, monkeypatch):
+    """Finding 6: no second file to crash between; a failed write changes nothing."""
+    delivery_id = lodge.enqueue()
+    who = _principal(lodge)
+    leased = lodge.store.lease(who, 1)["deliveries"][0]
+    queue_path = lodge.store.root / "queues" / "tg-main.json"
+    queue_before = queue_path.read_text()
+    registry_before = lodge.store.registry_path.read_text()
+
+    def crash(_path, _data):
+        raise OSError("disk gone")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(ConnectorStore, "_write_json", staticmethod(crash))
+        for transition in (
+            lambda: lodge.store.disable("tg-main"),
+            lambda: lodge.store.issue_token("tg-main"),
+            lambda: lodge.store.enable("tg-main"),
+        ):
+            with pytest.raises(OSError):
+                transition()
+    assert lodge.store.registry_path.read_text() == registry_before
+    assert queue_path.read_text() == queue_before
+
+    # Each transition is one registry write; the queue file is not touched.
+    lodge.store.disable("tg-main")
+    lodge.clock.advance(1000)
+    new_token = lodge.store.issue_token("tg-main")
+    lodge.store.enable("tg-main")
+    assert queue_path.read_text() == queue_before
+    # A reload derives everything: the old lease is released without a failed
+    # attempt, and the paused second did not count against the window.
+    reloaded = lodge.reload()
+    record = {d["delivery_id"]: d for d in reloaded.list_deliveries("tg-main")}[delivery_id]
+    assert (record["status"], record["failed_attempts"]) == ("queued", 0)
+    fresh = reloaded.authenticate(new_token)
+    again = reloaded.lease(fresh, 1)["deliveries"][0]
+    assert again["attempt_id"] != leased["attempt_id"]
+    assert reloaded.ack(fresh, delivery_id, {"attempt_id": again["attempt_id"], "ok": True})["status"] == "delivered"
+
+
+def test_remove_cancels_the_queue_revokes_and_detaches(lodge):
     delivery_id = lodge.enqueue()
     outcome = lodge.store.remove_instance("tg-main")
     assert outcome == {"cancelled": 1, "transferred": 0}
@@ -436,29 +869,63 @@ async def test_remove_cancels_the_queue_revokes_and_detaches(lodge):
     assert lodge.failed[0][1]["status"] == "cancelled"
     record = json.loads((lodge.store.root / "failures.jsonl").read_text())
     assert (record["delivery_id"], record["status"], record["delivered"]) == (delivery_id, "cancelled", False)
-    async with _client() as client:
-        assert (await FakeConnector(client, lodge.token).lease()).status_code == 401
+    assert lodge.store.authenticate(lodge.token) is None
 
 
-async def test_remove_transfers_only_what_an_explicit_mapping_covers(lodge):
-    lodge.store.bind("tg-main", sender="u1", conversation="c2", default_wolt="softie")
-    moved = lodge.enqueue(conversation="c1")
-    dropped = lodge.enqueue(conversation="c2")
-    new_token = lodge.second_instance()
-    same_ids = [{"from": {"account": "bot:1", "conversation": "c1"}, "to": {"account": "bot:1", "conversation": "c1"}}]
-    with pytest.raises(ConnectorError, match="not a binding"):
-        lodge.store.remove_instance("tg-main", transfer_to="tg-new", mapping=same_ids)
-    mapping = [{"from": {"account": "bot:1", "conversation": "c1"}, "to": {"account": "bot:2", "conversation": "c9"}}]
-    outcome = lodge.store.remove_instance("tg-main", transfer_to="tg-new", mapping=mapping)
-    assert outcome == {"cancelled": 1, "transferred": 1}
-    assert [failed["delivery_id"] for _instance, failed in lodge.failed] == [dropped]
-    lodge.store.enable("tg-new")
+def test_remove_interrupted_after_its_registry_write_is_finished_on_reload(lodge, monkeypatch):
+    """Finding 6: the orphan queue is cancelled once, by recovery, never twice."""
+    delivery_id = lodge.enqueue()
+
+    def crash(self, instance_id, tx):
+        raise OSError("crashed mid-removal")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(ConnectorStore, "_cancel_orphan_queue", crash)
+        with pytest.raises(OSError):
+            lodge.store.remove_instance("tg-main")
+    assert lodge.store.list_instances() == []
+    assert (lodge.store.root / "queues" / "tg-main.json").exists()
+    assert lodge.failed == []
+    reloaded = lodge.reload()
+    assert reloaded.recover() == 1
+    assert not (reloaded.root / "queues" / "tg-main.json").exists()
+    assert [f[1]["delivery_id"] for f in lodge.failed] == [delivery_id]
+    assert reloaded.recover() == 0
+    assert len((reloaded.root / "failures.jsonl").read_text().splitlines()) == 1
+    # The API's store does the same on first load.
+    connector_api._store = None
+    assert connector_api.get_store().root == reloaded.root
+
+
+async def test_unbind_cancels_queued_deliveries_and_ends_in_flight_authority(lodge, tmp_path):
+    """Finding 3 and (c): withdrawing the grant withdraws the queue, the lease and the file."""
+    note = tmp_path / "n.ogg"
+    note.write_bytes(b"audio")
+    in_flight = lodge.enqueue(attachment=note)
+    queued = lodge.enqueue("second")
     async with _client() as client:
-        connector = FakeConnector(client, new_token)
-        results = await connector.run_once()
-    assert results[0]["status"] == "delivered"
-    sent = connector.provider.sent[0]
-    assert (sent["delivery_id"], sent["conversation"]["provider_id"]) == (moved, "c9")
+        connector = FakeConnector(client, lodge.token)
+        leased = (await connector.lease(1)).json()["deliveries"][0]
+        assert leased["delivery_id"] == in_flight
+        file_id, attempt_id = leased["attachments"][0]["file_id"], leased["attempt_id"]
+        assert (await connector.fetch_file(file_id, attempt_id)).status_code == 200
+        assert lodge.store.unbind("tg-main", sender="u1", conversation="c1") is True
+        assert (await connector.lease()).json()["deliveries"] == []
+        assert (await connector.fetch_file(file_id, attempt_id)).status_code == 404
+        ack = await connector.ack(in_flight, attempt_id, provider_message_id="m")
+        assert (ack.status_code, ack.json()["reason"]) == (409, "stale_attempt")
+    records = lodge.deliveries()
+    assert {records[in_flight]["status"], records[queued]["status"]} == {"cancelled"}
+    assert records[queued]["error"] == "binding removed"
+    assert sorted(f[1]["delivery_id"] for f in lodge.failed) == sorted([in_flight, queued])
+    assert list((lodge.store.root / "files").iterdir()) == []
+    # A withdrawn grant is gone: binding the sender again is a new grant.
+    again = lodge.store.bind("tg-main", sender="u1", conversation="c1", default_wolt="softie")
+    assert again["binding_id"] != lodge.binding["binding_id"]
+    # Changing a standing grant in place keeps its id, so its deliveries stand.
+    changed = lodge.store.bind("tg-main", sender="u1", conversation="c1", default_wolt="softie", may_wake=True)
+    assert (changed["binding_id"], changed["may_wake"]) == (again["binding_id"], True)
+    assert len(lodge.store.list_bindings("tg-main")) == 1
 
 
 async def test_lease_expiry_redelivers_and_the_stale_attempt_cannot_ack(lodge):
@@ -473,7 +940,7 @@ async def test_lease_expiry_redelivers_and_the_stale_attempt_cannot_ack(lodge):
         stale = await connector.ack(delivery_id, first["attempt_id"], provider_message_id="m1")
         assert (stale.status_code, stale.json()["reason"]) == (409, "stale_attempt")
         good = await connector.ack(delivery_id, second["attempt_id"], provider_message_id="m2")
-    assert good.json() == {"ok": True, "status": "delivered", "attempts": 1}
+    assert good.json() == {"ok": True, "status": "delivered", "failed_attempts": 1}
 
 
 async def test_cross_instance_and_cross_generation_acks_are_refused(lodge):
@@ -522,7 +989,7 @@ async def test_crash_after_provider_send_before_ack_duplicates_exactly_as_docume
         lodge.clock.advance(LIMITS.lease_seconds + 1)
         restarted = FakeConnector(client, lodge.token, provider)
         results = await restarted.run_once()
-    assert results == [{"ok": True, "status": "delivered", "attempts": 1}]
+    assert results == [{"ok": True, "status": "delivered", "failed_attempts": 1}]
     assert [s["delivery_id"] for s in provider.sent] == [delivery_id, delivery_id]
 
 
@@ -539,11 +1006,11 @@ async def test_retries_are_bounded_and_the_terminal_failure_is_reported(lodge):
     assert statuses == ["queued"] * (LIMITS.max_attempts - 1) + ["failed"]
     assert connector.provider.sent == []
     record = lodge.deliveries()[delivery_id]
-    assert (record["status"], record["attempts"]) == ("failed", LIMITS.max_attempts)
+    assert (record["status"], record["failed_attempts"]) == ("failed", LIMITS.max_attempts)
     assert "down 4" in record["error"]
     assert lodge.failed[0][1]["delivery_id"] == delivery_id
     failure = json.loads((lodge.store.root / "failures.jsonl").read_text())
-    assert (failure["session"], failure["delivered"], failure["attempts"]) == ("softie-1", False, 5)
+    assert (failure["session"], failure["delivered"], failure["failed_attempts"]) == ("softie-1", False, 5)
 
 
 async def test_the_retry_window_ends_a_delivery_and_a_permanent_nack_ends_it_at_once(lodge):
@@ -558,7 +1025,7 @@ async def test_the_retry_window_ends_a_delivery_and_a_permanent_nack_ends_it_at_
         assert (await connector.lease()).json()["deliveries"] == []
     records = lodge.deliveries()
     assert records[refused]["error"] == "chat not found"
-    assert (records[slow]["status"], records[slow]["attempts"]) == ("failed", 1)
+    assert (records[slow]["status"], records[slow]["failed_attempts"]) == ("failed", 1)
     assert "retry window" in records[slow]["error"]
 
 
@@ -593,6 +1060,30 @@ async def test_in_flight_leases_are_capped_and_the_batch_is_bounded(lodge):
         assert len((await connector.lease(1)).json()["deliveries"]) == 1
 
 
+def test_queue_length_text_size_and_journals_are_bounded(lodge, tmp_path):
+    """Finding 5: outbound bounds and journal rotation."""
+    for i in range(LIMITS.max_queued):
+        lodge.enqueue(f"m{i}")
+    with pytest.raises(ConnectorError) as refused:
+        lodge.enqueue("one too many")
+    assert (refused.value.status, refused.value.reason) == (429, "queue_full")
+    with pytest.raises(ConnectorError, match="text_too_long"):
+        lodge.store.enqueue(
+            channel="telegram", account="bot:1", conversation="c1",
+            text="x" * (LIMITS.outbound_text_max_bytes + 1),
+        )
+    big = tmp_path / "big.bin"
+    big.write_bytes(b"x" * (LIMITS.outbound_file_max_bytes + 1))
+    with pytest.raises(ConnectorError, match="attachment_too_large"):
+        lodge.enqueue(attachment=big)
+    for delivery_id in list(lodge.deliveries()):
+        lodge.store.unbind("tg-main", sender="u1", conversation="c1")
+    lodge.store.list_deliveries("tg-main")
+    journal = lodge.store.root / "failures.jsonl"
+    assert journal.stat().st_size <= LIMITS.journal_max_bytes + 400
+    assert (lodge.store.root / "failures.jsonl.1").exists()
+
+
 async def test_a_waiting_lease_returns_when_work_arrives_and_dies_with_its_token(lodge):
     async with _client() as client:
         connector = FakeConnector(client, lodge.token)
@@ -613,7 +1104,78 @@ async def test_a_waiting_lease_returns_when_work_arrives_and_dies_with_its_token
             lodge.store.revoke_tokens("tg-main")
 
         response, _ = await asyncio.gather(connector.lease(1, wait=5), revoke_soon())
-    assert response.status_code == 401
+        assert response.status_code == 401
+
+        token = lodge.store.issue_token("tg-main")
+        connector = FakeConnector(client, token)
+
+        async def disable_soon():
+            await asyncio.sleep(0.05)
+            lodge.store.disable("tg-main")
+
+        response, _ = await asyncio.gather(connector.lease(1, wait=5), disable_soon())
+    assert response.json() == {"deliveries": [], "paused": True}
+
+
+# ------------------------------------------------- callbacks (finding 6)
+
+
+def test_failure_listeners_run_after_the_lock_and_may_enqueue(lodge):
+    """A listener that tells the session by sending another message does not deadlock."""
+    told = []
+
+    def tell_the_session(instance_id, delivery):
+        told.append(delivery["delivery_id"])
+        lodge.store.enqueue(
+            channel="telegram", account="bot:1", conversation="c1",
+            text=f"could not deliver {delivery['delivery_id']}",
+        )
+
+    lodge.store.on_failure(tell_the_session)
+    who = _principal(lodge)
+    delivery_id = lodge.enqueue()
+    leased = lodge.store.lease(who, 1)["deliveries"][0]
+    result = lodge.store.ack(who, delivery_id, {"attempt_id": leased["attempt_id"], "ok": False, "retry": False})
+    assert result["status"] == "failed"
+    assert told == [delivery_id]
+    texts = [d["text"] for d in lodge.store.list_deliveries("tg-main") if d["status"] == "queued"]
+    assert texts == [f"could not deliver {delivery_id}"]
+
+
+def test_the_router_runs_after_the_claim_is_durable_and_may_use_the_store(lodge):
+    seen = []
+
+    def router(event):
+        queue = json.loads((lodge.store.root / "queues" / "tg-main.json").read_text())
+        seen.append(("claimed", queue["uploads"][event.attachments[0]["upload_id"]]["claimed_by"]))
+        seen.append(("deliveries", len(lodge.store.list_deliveries("tg-main"))))
+        raise RuntimeError("session unreachable")
+
+    lodge.store.router = router
+    who = _principal(lodge)
+    upload_id, part = lodge.store.begin_upload(who)
+    part.write_bytes(b"x")
+    lodge.store.commit_upload(who, upload_id, part, "x")
+    event = {
+        "event_id": "e1", "sender": {"provider_id": "u1"}, "conversation": {"provider_id": "c1"},
+        "text": "hi", "attachments": [{"upload_id": upload_id}],
+    }
+    status, body = lodge.store.accept_event(who, event)
+    assert (status, body["accepted"], body["routed"]) == (200, True, "error")
+    assert seen == [("claimed", "e1"), ("deliveries", 0)]
+    # The record keeps the outcome; a retry does not run the router again.
+    assert lodge.store.accept_event(who, event) == (200, body)
+    assert len(seen) == 2
+
+
+def test_a_store_call_from_inside_the_lock_is_refused_not_deadlocked(lodge):
+    with lodge.store._lock():
+        with pytest.raises(RuntimeError, match="inside its own lock"):
+            lodge.store.add_instance("x", "telegram", "bot:x")
+        with pytest.raises(RuntimeError, match="inside its own lock"):
+            lodge.enqueue()
+    # Released: the same calls work again.
+    assert lodge.store.list_instances()[0]["instance_id"] == "tg-main"
 
 
 # ------------------------------------------------------------------- files
@@ -660,16 +1222,16 @@ async def test_revoking_mid_stream_cuts_the_file_at_the_next_chunk(lodge, tmp_pa
     big = tmp_path / "big.bin"
     big.write_bytes(b"z" * (connector_api._CHUNK * 3))
     lodge.enqueue(attachment=big)
-    checks = []
-    authenticate = lodge.store.authenticate
+    allowed = lodge.store.stream_allowed
+    calls = []
 
-    def revoking_authenticate(token):
-        checks.append(token)
-        if len(checks) == 4:
+    def revoking(who, file_id, attempt_id):
+        calls.append(1)
+        if len(calls) == 2:
             lodge.store.revoke_tokens("tg-main")
-        return authenticate(token)
+        return allowed(who, file_id, attempt_id)
 
-    monkeypatch.setattr(lodge.store, "authenticate", revoking_authenticate)
+    monkeypatch.setattr(lodge.store, "stream_allowed", revoking)
     async with _client() as client:
         connector = FakeConnector(client, lodge.token)
         leased = (await connector.lease()).json()["deliveries"][0]
@@ -683,4 +1245,4 @@ async def test_revoking_mid_stream_cuts_the_file_at_the_next_chunk(lodge, tmp_pa
                     received += chunk
         except httpx.HTTPError:
             pass
-    assert 0 < len(received) < connector_api._CHUNK * 3
+    assert len(received) == connector_api._CHUNK

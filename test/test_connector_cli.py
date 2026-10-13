@@ -40,7 +40,9 @@ def test_add_bind_enable_token_disable_unbind_remove(colony, capsys):
         "connector", "bind", "tg-main", "--sender", "u1", "--conversation", "c1",
         "--wolt", "softie", "--may-wake", "--json",
     ]) == 0
-    assert _out(capsys)["binding"] == {
+    binding = _out(capsys)["binding"]
+    assert binding.pop("binding_id")
+    assert binding == {
         "instance_id": "tg-main", "account": "bot:1", "sender": "u1", "conversation": "c1",
         "thread": None, "default_wolt": "softie", "may_wake": True,
     }
@@ -89,28 +91,40 @@ def test_one_enabled_instance_per_channel_and_refusals_exit_1(colony, capsys):
     assert "unknown_instance" in capsys.readouterr().err
 
 
-def test_remove_with_transfer_needs_a_mapping_onto_the_replacements_bindings(colony, capsys):
+def test_remove_is_cancel_only_and_recovery_runs_before_every_verb(colony, capsys):
+    """Transfer is not in this slice: removal cancels, and an interrupted removal
+    is finished by the next command."""
     assert cli_main(["connector", "add", "old", "--channel", "telegram", "--account", "bot:1"]) == 0
     assert cli_main(["connector", "bind", "old", "--sender", "u1", "--conversation", "c1", "--wolt", "softie"]) == 0
-    assert cli_main(["connector", "add", "new", "--channel", "telegram", "--account", "bot:2"]) == 0
-    assert cli_main(["connector", "bind", "new", "--sender", "u1", "--conversation", "c7", "--wolt", "softie"]) == 0
+    assert cli_main(["connector", "enable", "old"]) == 0
     store = ConnectorStore(colony / ".space" / "connectors")
     for text in ("one", "two"):
         store.enqueue(channel="telegram", account="bot:1", conversation="c1", text=text)
     capsys.readouterr()
     assert cli_main(["connector", "queue", "old"]) == 0
     assert capsys.readouterr().out.count("queued") == 2
-
-    assert cli_main(["connector", "remove", "old", "--transfer-to", "new", "--map", "bot:1/c1=bot:1/c1"]) == 1
-    assert "not a binding of new" in capsys.readouterr().err
     with pytest.raises(SystemExit):
-        cli_main(["connector", "remove", "old", "--transfer-to", "new", "--map", "nonsense"])
+        cli_main(["connector", "remove", "old", "--transfer-to", "new"])
     capsys.readouterr()
-    assert cli_main(["connector", "remove", "old", "--transfer-to", "new", "--map", "bot:1/c1=bot:2/c7", "--json"]) == 0
-    assert _out(capsys) == {"ok": True, "cancelled": 0, "transferred": 2}
-    moved = store.list_deliveries("new")
-    assert sorted(d["text"] for d in moved) == ["one", "two"]
-    assert {(d["account"], d["conversation"], d["transferred_from"]) for d in moved} == {("bot:2", "c7", "old")}
+    assert cli_main(["connector", "remove", "old", "--json"]) == 0
+    assert _out(capsys) == {"ok": True, "cancelled": 2, "transferred": 0}
+    assert len((colony / ".space" / "connectors" / "failures.jsonl").read_text().splitlines()) == 2
+
+    # An orphan queue (registry written, queue not yet cancelled) is recovered
+    # by whatever command runs next.
+    assert cli_main(["connector", "add", "late", "--channel", "telegram", "--account", "bot:3"]) == 0
+    assert cli_main(["connector", "bind", "late", "--sender", "u1", "--conversation", "c1", "--wolt", "softie"]) == 0
+    assert cli_main(["connector", "enable", "late"]) == 0
+    store.enqueue(channel="telegram", account="bot:3", conversation="c1", text="stranded")
+    registry_path = colony / ".space" / "connectors" / "registry.json"
+    registry = json.loads(registry_path.read_text())
+    del registry["instances"]["late"]
+    registry_path.write_text(json.dumps(registry))
+    capsys.readouterr()
+    assert cli_main(["connector", "list", "--json"]) == 0
+    assert _out(capsys)["instances"] == []
+    assert not (colony / ".space" / "connectors" / "queues" / "late.json").exists()
+    assert len((colony / ".space" / "connectors" / "failures.jsonl").read_text().splitlines()) == 3
 
 
 def test_unreadable_state_is_a_message_and_nothing_is_written(colony, capsys):

@@ -1,9 +1,12 @@
 """`python -m woltspace_connector_fake`: echo every delivery to stdout and ack it.
 
-The runner contract in one screen: `WOLTSPACE_API` names the lodge, the
-token comes from the handoff file `WOLTSPACE_CONNECTOR_TOKEN_FILE` names
-(read once, then unlinked) and never from argv. There is no provider: a
-delivery is "sent" by printing it.
+Fixture only. This is the shape of the runner contract in one screen, not
+the production runner: `WOLTSPACE_API` names the lodge and the token comes
+from the file `WOLTSPACE_CONNECTOR_TOKEN_FILE` names (read once, then
+unlinked) or, for tests, from `WOLTSPACE_CONNECTOR_TOKEN`; never from argv.
+The hardened handoff (exclusive create, no-follow, bounded size, lodge id
+and generation checked) belongs to the supervisor slice and is not done
+here. There is no provider: a delivery is "sent" by printing it.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from . import FakeConnector, FakeProvider
 
 
 def _token() -> str:
+    # Plain open/json/unlink: enough for a fixture, not the hardened handoff.
     path = os.environ.get("WOLTSPACE_CONNECTOR_TOKEN_FILE")
     if path:
         with open(path, encoding="utf-8") as handle:

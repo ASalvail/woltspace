@@ -1085,6 +1085,7 @@ def _connector_run(args, action) -> int:
     """Run one owner action; a refusal or unreadable state is a message and exit 1."""
     connectors, store = _connector_store(RuntimeLayout.from_env())
     try:
+        store.recover()
         payload = action(connectors, store)
     except (connectors.ConnectorError, connectors.ConnectorStateUnreadable) as exc:
         print(f"woltspace connector: {exc}", file=sys.stderr)
@@ -1096,23 +1097,6 @@ def _connector_run(args, action) -> int:
     for line in lines:
         print(line)
     return 0
-
-
-def _connector_route(spec: str) -> dict:
-    """`account/conversation[/thread]` as a transfer endpoint."""
-    parts = spec.split("/")
-    if len(parts) not in (2, 3) or not all(parts):
-        raise argparse.ArgumentTypeError(
-            f"{spec!r} is not account/conversation[/thread]"
-        )
-    return {"account": parts[0], "conversation": parts[1], "thread": parts[2] if len(parts) == 3 else None}
-
-
-def _connector_mapping(spec: str) -> dict:
-    source, sep, target = spec.partition("=")
-    if not sep:
-        raise argparse.ArgumentTypeError(f"{spec!r} is not FROM=TO")
-    return {"from": _connector_route(source), "to": _connector_route(target)}
 
 
 def _connector_list(args) -> int:
@@ -1145,7 +1129,7 @@ def _connector_add(args) -> int:
     def action(_connectors, store):
         instance = store.add_instance(args.instance_id, args.channel, args.account)
         return {"instance": instance, "lines": [
-            f"added {args.instance_id} (disabled); bind a sender, then enable it",
+            f"registered {args.instance_id} (disabled, no code installed); bind a sender, then enable it",
         ]}
     return _connector_run(args, action)
 
@@ -1166,12 +1150,9 @@ def _connector_disable(args) -> int:
 
 def _connector_remove(args) -> int:
     def action(_connectors, store):
-        outcome = store.remove_instance(
-            args.instance_id, transfer_to=args.transfer_to, mapping=args.map or [],
-        )
+        outcome = store.remove_instance(args.instance_id)
         return {"ok": True, **outcome, "lines": [
-            f"removed {args.instance_id}: {outcome['transferred']} deliveries transferred, "
-            f"{outcome['cancelled']} cancelled",
+            f"removed {args.instance_id}: {outcome['cancelled']} queued deliveries cancelled",
         ]}
     return _connector_run(args, action)
 
@@ -1499,7 +1480,9 @@ def build_parser() -> argparse.ArgumentParser:
     connector_list = connector_sub.add_parser("list", help="every instance and its bindings")
     connector_list.add_argument("--json", action="store_true")
     connector_list.set_defaults(func=_connector_list)
-    connector_add = connector_sub.add_parser("add", help="register an instance, disabled")
+    connector_add = connector_sub.add_parser(
+        "add", help="register an instance, disabled (registration only: installs no code)"
+    )
     connector_add.add_argument("instance_id")
     connector_add.add_argument("--channel", required=True, help="the chat kind it serves, e.g. telegram")
     connector_add.add_argument("--account", required=True, help="the provider account it is, e.g. a bot id")
@@ -1515,14 +1498,9 @@ def build_parser() -> argparse.ArgumentParser:
         verb_parser.add_argument("--json", action="store_true")
         verb_parser.set_defaults(func=func)
     connector_remove = connector_sub.add_parser(
-        "remove", help="revoke, detach and cancel the queue, or transfer what --map covers"
+        "remove", help="revoke its tokens, drop its bindings and cancel its queue"
     )
     connector_remove.add_argument("instance_id")
-    connector_remove.add_argument("--transfer-to", default=None, help="the replacement instance")
-    connector_remove.add_argument(
-        "--map", action="append", type=_connector_mapping, metavar="FROM=TO",
-        help="account/conversation[/thread]=account/conversation[/thread]; unmapped deliveries are cancelled",
-    )
     connector_remove.add_argument("--json", action="store_true")
     connector_remove.set_defaults(func=_connector_remove)
     connector_bind = connector_sub.add_parser(
