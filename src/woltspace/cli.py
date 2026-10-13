@@ -1200,12 +1200,13 @@ def _connector_token(args) -> int:
 def _connector_runtime(args) -> int:
     """Show or set which runtime owns a channel: its adapter or its connector.
 
-    A switch is refused while the lodge runs, or might: it is made under
-    the lodge's own control-plane lock, the one `woltspace start` holds for
-    the lodge's whole life, so no adapter child or connector API can be
-    live when the file changes and no start can slip in between the check
-    and the write. Unknown state refuses too. Nothing is polled by either
-    runtime until the next start, which reads the new setting.
+    A switch is refused while either runtime runs, or might: it is made
+    under two locks taken without waiting, the lodge's own control-plane
+    lock (held by `woltspace start` for the lodge's whole life, so no
+    adapter child or connector API is live) and the channel's run lock
+    (held by a running connector process until it exits, so no provider
+    call of its is in flight). Held or unknown refuses. Nothing is polled
+    by either runtime until the next start, which reads the new setting.
     """
     def action(connectors, store):
         layout = RuntimeLayout.from_env()
@@ -1226,7 +1227,19 @@ def _connector_runtime(args) -> int:
                     409, "lodge_state_unknown", f"cannot tell whether the lodge runs: {exc}",
                 ) from None
             try:
-                connectors.set_channel_runtime(path, args.channel, args.runtime)
+                try:
+                    with connectors.held_run_lock(connectors.run_lock_path(store.root, args.channel)):
+                        connectors.set_channel_runtime(path, args.channel, args.runtime)
+                except BlockingIOError:
+                    raise connectors.ConnectorError(
+                        409, "connector_running",
+                        f"a {args.channel} connector process is running; stop it, then switch",
+                    ) from None
+                except OSError as exc:
+                    raise connectors.ConnectorError(
+                        409, "connector_state_unknown",
+                        f"cannot tell whether a {args.channel} connector runs: {exc}",
+                    ) from None
             finally:
                 lock.release()
         runtime = connectors.channel_runtime(path, args.channel)
@@ -1248,7 +1261,7 @@ def _connector_handoffs(args) -> int:
             return {"cancelled": done, "lines": ["cancelled; its files are released" if done else "no such pending event"]}
         records = store.handoffs(args.instance_id)
         lines = [
-            f"{r['key'].split(chr(0))[-1]}  {r['state']}  attempts={r.get('attempts', 0)}"
+            f"{r['event_id']}  {r['state']}  attempts={r.get('attempts', 0)}"
             + (f"  {r['last_error']}" if r.get("last_error") else "")
             for r in records
         ] or ["nothing waiting"]
@@ -1602,8 +1615,8 @@ def build_parser() -> argparse.ArgumentParser:
         "handoffs", help="accepted events not yet handed to a session; --retry or --cancel one by event id"
     )
     connector_handoffs.add_argument("instance_id")
-    connector_handoffs.add_argument("--retry", metavar="KEY", default=None, help="the record key (account NUL event id)")
-    connector_handoffs.add_argument("--cancel", metavar="KEY", default=None)
+    connector_handoffs.add_argument("--retry", metavar="EVENT_ID", default=None, help="the event id shown by the listing")
+    connector_handoffs.add_argument("--cancel", metavar="EVENT_ID", default=None)
     connector_handoffs.add_argument("--json", action="store_true")
     connector_handoffs.set_defaults(func=_connector_handoffs)
     connector_cursor = connector_sub.add_parser(

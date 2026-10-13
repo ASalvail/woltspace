@@ -15,7 +15,7 @@ import sys
 
 import httpx
 
-from . import LEASE_WAIT, LodgeRefused, TelegramConnector, redact
+from . import LEASE_WAIT, LodgeRefused, NotOwner, TelegramConnector, redact
 
 logger = logging.getLogger("woltspace_telegram")
 
@@ -74,6 +74,9 @@ async def run(connector: TelegramConnector, *, bot_token: str) -> int:
     except LodgeRefused:
         logger.error("the lodge refused the connector token; exiting")
         return 1
+    except NotOwner as exc:
+        logger.error("%s; exiting", exc)
+        return 1
     logger.info("started: cursor=%s paused=%s owned=%s", state.get("cursor"), state.get("paused"), state.get("runtime_active"))
 
     async def inbound():
@@ -118,4 +121,8 @@ async def main() -> int:
         base_url="https://api.telegram.org", timeout=httpx.Timeout(30.0, read=120.0),
     ) as bot:
         connector = TelegramConnector(lodge, bot, bot_token=bot_token, connector_token=connector_token())
-        return await run(connector, bot_token=bot_token)
+        try:
+            return await run(connector, bot_token=bot_token)
+        finally:
+            # Both loops are over and so are their calls: the lock may go.
+            connector.stop()

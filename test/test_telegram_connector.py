@@ -163,6 +163,7 @@ async def test_text_updates_become_accepted_events_and_the_cursor_follows(lodge,
     # The next poll asks from the cursor, and a restart takes it from core.
     await connector.poll_once(timeout=0)
     assert api.polled_offsets[-1] == 44
+    connector.stop()
     fresh = _connector(lodge, api)
     assert (await fresh.start())["cursor"] == 44
     assert len(lodge.routed) == 2
@@ -551,3 +552,147 @@ async def test_the_runners_logging_never_shows_the_token_even_at_debug(lodge, ap
     finally:
         logging.setLogRecordFactory(logging.LogRecord)
         logging.getLogger().setLevel(logging.WARNING)
+
+
+# ------------------------------------------------- round 3: per-call fences, run lock
+
+
+async def test_the_fence_sits_before_every_provider_call_not_every_delivery(tmp_path):
+    """Astre's probe: ownership withdrawn after part one; and _confirm while not owning."""
+    from woltspace_telegram import Report
+
+    active = [True]
+    calls = []
+    acks = []
+
+    def lodge(request):
+        if request.url.path.endswith("/state"):
+            return httpx.Response(200, json={"runtime_active": active[0], "paused": False, "cursor": 8})
+        if request.url.path.endswith("/ack"):
+            acks.append(json.loads(request.content))
+        return httpx.Response(200, json={"ok": True})
+
+    def bot(request):
+        calls.append(request.url.path.rsplit("/", 1)[-1])
+        active[0] = False
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": len(calls)}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lodge), base_url="http://fixture.invalid") as lc, httpx.AsyncClient(transport=httpx.MockTransport(bot), base_url=BOT_API) as bc:
+        connector = TelegramConnector(lc, bc, bot_token="FAKE", connector_token="FAKE")
+        await connector.start()
+        delivery = {"delivery_id": "d", "attempt_id": "a", "conversation": {"provider_id": "chat"}, "text": "x" * 5000}
+        report = await connector.send_leased([delivery], Report())
+        assert calls == ["sendMessage"]
+        assert report.fenced is True
+        assert acks == [{"attempt_id": "a", "ok": False, "retry": True, "error": "not sending sendMessage: the channel is no longer ours", "provider_message_ids": ["1"]}]
+        calls.clear()
+        connector.cursor = 9
+        await connector._confirm()
+        assert calls == []
+        # A file send's fallback is fenced too: ownership back, lost after the first file call.
+        active[0] = True
+        acks.clear()
+
+        def bot_refusing_voice(request):
+            calls.append(request.url.path.rsplit("/", 1)[-1])
+            active[0] = False
+            return httpx.Response(200, json={"ok": False, "error_code": 400, "description": "VOICE_MESSAGES_FORBIDDEN"})
+
+        def lodge_with_file(request):
+            if request.url.path.startswith("/connector/v1/files/"):
+                return httpx.Response(200, content=b"opus")
+            return lodge(request)
+
+        connector.lodge = httpx.AsyncClient(transport=httpx.MockTransport(lodge_with_file), base_url="http://fixture.invalid")
+        connector.bot = httpx.AsyncClient(transport=httpx.MockTransport(bot_refusing_voice), base_url=BOT_API)
+        delivery = {"delivery_id": "d2", "attempt_id": "b", "conversation": {"provider_id": "chat"}, "text": "",
+                    "attachments": [{"file_id": "f" * 32, "name": "n.ogg", "kind": "voice", "size": 4}]}
+        await connector.send_leased([delivery], Report())
+        assert calls == ["sendVoice"]
+        assert acks[0]["ok"] is False and acks[0]["retry"] is True
+
+
+async def test_the_run_lock_is_taken_before_the_first_provider_call_and_held_until_stop(lodge, api):
+    import fcntl
+
+    lock_path = lodge.store.root / "run-telegram.lock"
+    held_at_call = []
+
+    def is_held():
+        with open(lock_path, "a+") as probe:
+            try:
+                fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+            return False
+
+    real = api.handle
+
+    def observing(request):
+        held_at_call.append(is_held())
+        return real(request)
+
+    api.updates = [_update(41, "hi")]
+    connector = _connector(lodge, api)
+    connector.bot = httpx.AsyncClient(transport=httpx.MockTransport(observing), base_url=BOT_API)
+    state = await connector.start()
+    assert state["run_lock"] == str(lock_path) and is_held()
+    lodge.enqueue("hello")
+    await connector.poll_once(timeout=0)
+    await connector.deliver_once()
+    assert held_at_call and all(held_at_call)
+    # A second connector for the channel cannot start, and neither loop runs without the lock.
+    from woltspace_telegram import NotOwner
+    second = _connector(lodge, api)
+    with pytest.raises(NotOwner):
+        await second.start()
+    second.started, second.run_lock = True, str(lock_path)
+    with pytest.raises(NotOwner):
+        await second.poll_once(timeout=0)
+    with pytest.raises(NotOwner):
+        await second.deliver_once()
+    assert len(held_at_call) == 3   # getUpdates, confirm, sendMessage; nothing from the second
+    connector.stop()
+    assert not is_held()
+
+
+async def test_the_runner_holds_the_lock_through_both_loops_and_their_calls(lodge, api, monkeypatch):
+    """`run()` ends only when both loops have ended; the lock is still held then, released after."""
+    import fcntl
+    import woltspace_telegram.runner as runner
+
+    lock_path = lodge.store.root / "run-telegram.lock"
+
+    def is_held():
+        with open(lock_path, "a+") as probe:
+            try:
+                fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+            return False
+
+    api.updates = [_update(41, "hi")]
+    connector = _connector(lodge, api)
+    turns = {"poll": 0, "deliver": 0}
+    real_poll, real_deliver = connector.poll_once, connector.deliver_once
+
+    async def poll_then_die(**kwargs):
+        turns["poll"] += 1
+        await real_poll(timeout=0)
+        assert is_held()
+        lodge.store.revoke_tokens("tg")
+        return await real_poll(timeout=0)
+
+    async def deliver_until_refused(**kwargs):
+        turns["deliver"] += 1
+        return await real_deliver()
+
+    monkeypatch.setattr(connector, "poll_once", poll_then_die)
+    monkeypatch.setattr(connector, "deliver_once", deliver_until_refused)
+    assert await runner.run(connector, bot_token=BOT_TOKEN) == 1
+    assert turns["poll"] >= 1 and turns["deliver"] >= 1
+    assert is_held()
+    connector.stop()
+    assert not is_held()

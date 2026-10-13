@@ -1463,11 +1463,11 @@ def test_a_router_that_keeps_failing_is_retried_up_to_the_cap_then_parked(lodge)
     lodge.clock.advance(LIMITS.dedup_retention_seconds + 1)
     store.lease(who, 1)
     assert [h["state"] for h in store.handoffs("tg-main")] == ["handoff_failed"]
-    assert store.retry_handoff("tg-main", "bot:1\x00e1") is True
+    assert store.retry_handoff("tg-main", "e1") is True
     lodge.clock.advance(1)
     store.lease(who, 1)
     assert len(tries) == LIMITS.handoff_max_attempts + 1
-    assert store.cancel_handoff("tg-main", "bot:1\x00e1") is True
+    assert store.cancel_handoff("tg-main", "e1") is True
     assert store.handoffs("tg-main") == []
 
 
@@ -1738,3 +1738,72 @@ async def test_message_map_is_scoped_by_conversation_and_keeps_parts_of_failed_a
             headers=connector.headers,
         )
     assert lodge.deliveries()[partial]["provider_message_ids"] == ["201", "202"]
+
+
+# ----------------------------------------- round 3: claim identity
+
+
+def test_an_owner_retry_during_an_old_dispatch_keeps_the_new_attempts_result(lodge):
+    """Astre's probe: old attempt in flight, owner retries, new attempt fails, old receipt arrives."""
+    who = _principal(lodge)
+    seen = []
+
+    def old_router(event):
+        seen.append("old started")
+        assert lodge.store.retry_handoff("tg-main", "e1") is True
+        lodge.store.router = lambda e: seen.append("new") or {"routed": "error", "error": "new attempt failed"}
+        lodge.store.lease(who, 1)
+        record = lodge.store._queue("tg-main").inbound["bot:1\x00e1"]
+        assert record["result"] == {"routed": "error", "error": "new attempt failed"}
+        return {"routed": "delivered", "session": "OLD"}
+
+    lodge.store.router = old_router
+    lodge.store.accept_event(who, _event())
+    record = lodge.store._queue("tg-main").inbound["bot:1\x00e1"]
+    assert seen == ["old started", "new"]
+    assert (record["state"], record["result"]) == ("accepted", {"routed": "error", "error": "new attempt failed"})
+    assert record["attempts"] == 1 and record["claim"]
+    # The budget was reset by the retry; the claim identity was not reused.
+    lodge.clock.advance(LIMITS.handoff_retry_seconds + 1)
+    lodge.store.router = lambda e: {"routed": "delivered", "session": "NEW"}
+    lodge.store.lease(who, 1)
+    record = lodge.store._queue("tg-main").inbound["bot:1\x00e1"]
+    assert (record["state"], record["result"]["session"], record["attempts"]) == ("handed_off", "NEW", 2)
+
+
+def test_a_late_receipt_after_pause_and_resume_is_ignored(lodge):
+    who = _principal(lodge)
+    claims = []
+
+    def old_router(event):
+        claims.append(lodge.store._queue("tg-main").inbound["bot:1\x00e1"]["claim"])
+        # The owner pauses and resumes while this attempt is still running;
+        # then a connector tick claims a new attempt with a new identity.
+        lodge.store.disable("tg-main")
+        lodge.store.enable("tg-main")
+        lodge.clock.advance(LIMITS.handoff_retry_seconds + 1)
+        lodge.store.router = lambda e: {"routed": "delivered", "session": "NEW"}
+        lodge.store.lease(who, 1)
+        claims.append(lodge.store._queue("tg-main").inbound["bot:1\x00e1"]["claim"])
+        return {"routed": "delivered", "session": "OLD"}
+
+    lodge.store.router = old_router
+    lodge.store.accept_event(who, _event())
+    record = lodge.store._queue("tg-main").inbound["bot:1\x00e1"]
+    assert len(claims) == 2 and claims[0] != claims[1]
+    assert (record["state"], record["result"]["session"], record["claim"]) == ("handed_off", "NEW", claims[1])
+
+
+def test_a_returned_claim_is_a_new_identity_when_made_again(lodge):
+    who = _principal(lodge)
+    lodge.store.router = lambda e: (_ for _ in ()).throw(RuntimeError("temporary"))
+    lodge.store.accept_event(who, _event())
+    first = lodge.store._queue("tg-main").inbound["bot:1\x00e1"]["claim"]
+    lodge.store.disable("tg-main")
+    lodge.clock.advance(LIMITS.handoff_retry_seconds + 1)
+    lodge.store.lease(who, 1)
+    lodge.store.enable("tg-main")
+    lodge.store.router = lambda e: {"routed": "delivered"}
+    lodge.store.lease(who, 1)
+    record = lodge.store._queue("tg-main").inbound["bot:1\x00e1"]
+    assert record["state"] == "handed_off" and record["claim"] != first

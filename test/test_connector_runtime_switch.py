@@ -236,3 +236,47 @@ def test_a_live_switch_is_refused_under_the_lodges_own_lock_and_a_start_cannot_r
     assert channel_runtime(colony / "woltspace.json", "telegram") == "connector"
     # The lock is given back: a start can take it now.
     DataRootLock(layout, "later-start").acquire()
+
+
+def test_a_running_connector_makes_the_switch_refuse_and_the_switch_holds_both_locks(colony, store, capsys, monkeypatch):
+    """Finding 1: the standalone connector's run lock counts; the write happens under both locks."""
+    import fcntl
+    from woltspace.instance import DataRootLock
+    from server import connectors as connectors_module
+
+    layout = RuntimeLayout.from_env()
+    run_lock = connectors_module.run_lock_path(store.root, "telegram")
+    # A connector process holds the channel's run lock for its whole life.
+    holder = open(run_lock, "a+")
+    fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        assert cli_main(["connector", "runtime", "telegram", "connector"]) == 1
+        err = capsys.readouterr().err
+        assert "connector process is running" in err
+        assert channel_runtime(colony / "woltspace.json", "telegram") == "adapter"
+    finally:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+        holder.close()
+
+    def held(path):
+        with open(path, "a+") as probe:
+            try:
+                fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+            return False
+
+    observed = []
+    real = connectors_module.set_channel_runtime
+
+    def observing(path, channel, runtime):
+        observed.append((held(run_lock), held(layout.platform_state / "control-plane.lock")))
+        return real(path, channel, runtime)
+
+    monkeypatch.setattr(connectors_module, "set_channel_runtime", observing)
+    assert cli_main(["connector", "runtime", "telegram", "connector"]) == 0
+    assert observed == [(True, True)]
+    assert not held(run_lock) and not held(layout.platform_state / "control-plane.lock")
+    assert channel_runtime(colony / "woltspace.json", "telegram") == "connector"
+    DataRootLock(layout, "later-start").acquire()

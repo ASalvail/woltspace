@@ -5,12 +5,15 @@ and advances the cursor core keeps; `deliver_once` leases deliveries and
 sends them. The connector decides nothing about who may talk to whom or
 where a message goes; it carries bytes between the two APIs.
 
-Ownership fence: before every getUpdates and before every send the
-connector asks the lodge (`GET state`) whether it still owns the channel
-and is enabled. If not, it polls nothing (so Telegram confirms nothing),
-sends nothing, and acks nothing; a lease it already holds expires on its
-own. The lodge refuses a live switch, so in practice the fence trips when
-the lodge is stopped (every call fails) or an instance is disabled.
+Ownership: the process holds the channel's run lock (the lodge names it
+in `GET state`) from before its first provider call until it exits, so a
+switch (which takes that lock too) can only happen while no call of this
+process is in flight; neither loop runs without it. On top of that, a
+fence: before every provider call (each getUpdates, each text part, each
+file send and fallback, each confirmation) the connector asks the lodge
+whether it still owns the channel and is enabled. If not, the call is not
+made: nothing more is polled or confirmed, a send stops with the parts
+that went out nacked as retryable, and a lease it holds expires on its own.
 
 Inbound, per update, in the order fetched: text or caption becomes the
 event text; a photo (its largest size), document, voice note, audio or
@@ -75,6 +78,14 @@ class LodgeRefused(RuntimeError):
     """The lodge answered 401 or 403: this process must stop."""
 
 
+class NotOwner(RuntimeError):
+    """The run lock is not held by this process: no provider call is allowed."""
+
+
+class OwnershipLost(RuntimeError):
+    """The fence tripped between two provider calls of one operation."""
+
+
 class Transient(RuntimeError):
     """A failure to try again later; the update stays unanswered."""
 
@@ -126,6 +137,8 @@ class TelegramConnector:
         self._connector_token = connector_token
         self.cursor: int | None = None
         self.started = False
+        self.run_lock: str | None = None
+        self._run_lock_handle = None
 
     # ----------------------------------------------------------------- lodge
 
@@ -141,11 +154,47 @@ class TelegramConnector:
         return response
 
     async def start(self) -> dict:
-        """Take the cursor core kept; nothing is polled before this."""
+        """Take the cursor core kept and the channel's run lock; nothing is polled before this.
+
+        The lock is an exclusive flock on the file the lodge names, held by
+        this process until it exits (never released earlier, so an in-flight
+        provider call always ends before the lock does). Already held means
+        another connector runs for this channel: refuse to start.
+        """
         state = (await self._lodge("GET", "/state")).json()
         self.cursor = state.get("cursor")
+        self.run_lock = state.get("run_lock")
+        if self.run_lock and self._run_lock_handle is None:
+            import fcntl
+            from pathlib import Path
+
+            Path(self.run_lock).parent.mkdir(parents=True, exist_ok=True)
+            handle = open(self.run_lock, "a+")
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                handle.close()
+                raise NotOwner(f"another connector already runs for this channel ({self.run_lock})") from None
+            self._run_lock_handle = handle
         self.started = True
         return state
+
+    def holds_run_lock(self) -> bool:
+        return self._run_lock_handle is not None or not self.run_lock
+
+    def stop(self) -> None:
+        """Give the run lock back. Only once both loops and every call of theirs have ended:
+        the runner calls it last, after `gather` returned; tests call it to run two connectors."""
+        if self._run_lock_handle is not None:
+            import fcntl
+
+            fcntl.flock(self._run_lock_handle.fileno(), fcntl.LOCK_UN)
+            self._run_lock_handle.close()
+            self._run_lock_handle = None
+
+    def _require_lock(self) -> None:
+        if not self.holds_run_lock():
+            raise NotOwner("the run lock is not held")
 
     async def owns_channel(self) -> bool:
         """The fence: the lodge says this instance is enabled and the connector owns the channel."""
@@ -160,9 +209,16 @@ class TelegramConnector:
     # --------------------------------------------------------------- telegram
 
     async def _call(self, method: str, **params) -> httpx.Response:
+        """One Bot API call, fenced: the lock must be held and the lodge must still say we own the channel."""
+        self._require_lock()
+        if not await self.owns_channel():
+            raise OwnershipLost(f"not sending {method}: the channel is no longer ours")
         return await self.bot.post(f"/bot{self._bot_token}/{method}", json=params)
 
     async def _upload_call(self, method: str, field_name: str, data: bytes, name: str, params: dict) -> httpx.Response:
+        self._require_lock()
+        if not await self.owns_channel():
+            raise OwnershipLost(f"not sending {method}: the channel is no longer ours")
         return await self.bot.post(
             f"/bot{self._bot_token}/{method}", data=params, files={field_name: (name, data)},
         )
@@ -187,6 +243,8 @@ class TelegramConnector:
         if not path:
             raise Permanent("telegram gave no file path")
         received = bytearray()
+        if not await self.owns_channel():
+            raise OwnershipLost("not downloading: the channel is no longer ours")
         try:
             async with self.bot.stream("GET", f"/file/bot{self._bot_token}/{path}") as response:
                 if response.status_code == 429 or response.status_code >= 500:
@@ -299,6 +357,9 @@ class TelegramConnector:
         try:
             response = await self._call("getUpdates", **params)
             body = response.json()
+        except OwnershipLost:
+            report.fenced = True
+            return report
         except (httpx.HTTPError, ValueError) as exc:
             logger.warning("getUpdates failed: %s", redact(exc, self._bot_token))
             return report
@@ -308,6 +369,10 @@ class TelegramConnector:
         for update in sorted(body.get("result", []), key=lambda u: u["update_id"]):
             try:
                 payload = await self._event_for(update)
+            except OwnershipLost:
+                report.fenced = True
+                report.stopped_at = update["update_id"]
+                break
             except Transient as exc:
                 logger.warning("update %s not carried yet: %s", update["update_id"], exc)
                 report.stopped_at = update["update_id"]
@@ -335,11 +400,13 @@ class TelegramConnector:
         return report
 
     async def _confirm(self) -> None:
-        """Tell Telegram the cursor: everything below it is answered and held by core."""
+        """Tell Telegram the cursor: everything below it is answered and held by core. Fenced like any call."""
         if self.cursor is None:
             return
         try:
             await self._call("getUpdates", offset=self.cursor, limit=1, timeout=0)
+        except OwnershipLost:
+            return
         except (httpx.HTTPError, ValueError) as exc:
             logger.warning("could not confirm the cursor: %s", redact(exc, self._bot_token))
 
@@ -359,6 +426,8 @@ class TelegramConnector:
             try:
                 response = await self._call("sendMessage", chat_id=chat_id, text=part, **extra)
                 body = response.json()
+            except OwnershipLost as exc:
+                return message_ids, str(exc), True
             except (httpx.HTTPError, ValueError) as exc:
                 return message_ids, redact(exc, self._bot_token), True
             if not body.get("ok"):
@@ -383,6 +452,8 @@ class TelegramConnector:
                 try:
                     response = await self._upload_call(method, field_name, data, name, {"chat_id": chat_id, **extra})
                     body = response.json()
+                except OwnershipLost as exc:
+                    return message_ids, str(exc), True
                 except (httpx.HTTPError, ValueError) as exc:
                     return message_ids, redact(exc, self._bot_token), True
                 if body.get("ok"):
@@ -395,16 +466,30 @@ class TelegramConnector:
     async def lease_batch(self, *, max_items: int = 10, wait: float = 0) -> dict:
         if not self.started:
             await self.start()
+        self._require_lock()
         return (await self._lodge("POST", "/deliveries/lease", json={"max": max_items, "wait": wait})).json()
 
     async def send_leased(self, deliveries: list[dict], report: Report) -> Report:
         """Send what was leased, fencing before every delivery; acks carry every id that went out."""
+        self._require_lock()
         for delivery in deliveries:
             if not await self.owns_channel():
                 # Nothing more is sent or acked; the leases expire on their own.
                 report.fenced = True
                 return report
             message_ids, error, retryable = await self._send_delivery(delivery)
+            if error and "no longer ours" in error:
+                # The fence tripped mid-send: nack with what went out (best
+                # effort; if the lodge is gone the lease expires), then stop.
+                report.fenced = True
+                try:
+                    await self._lodge("POST", f"/deliveries/{delivery['delivery_id']}/ack", json={
+                        "attempt_id": delivery["attempt_id"], "ok": False, "retry": True,
+                        "error": error[:1000], "provider_message_ids": message_ids,
+                    })
+                except (httpx.HTTPError, LodgeRefused):
+                    pass
+                return report
             body = {"attempt_id": delivery["attempt_id"], "provider_message_ids": message_ids}
             if error is None:
                 body["ok"] = True
