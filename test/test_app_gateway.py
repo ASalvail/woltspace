@@ -1072,3 +1072,31 @@ def test_gateway_websocket_is_refused_while_the_apps_audience_is_empty(tmp_path,
         with TestClient(gateway.app).websocket_connect("/socket", headers=headers):
             pass
     assert exc.value.code == 1008
+
+
+
+def test_gateway_never_reaches_a_foreign_listener_on_a_refused_app_port(tmp_path, monkeypatch):
+    """An app refused because its port was taken has no running state, so the
+    gateway answers 'stopped' for HTTP and closes the websocket, without ever
+    connecting to whoever holds the port."""
+    import socket
+    import server.app_proxy as proxy
+    key = _configure(tmp_path, monkeypatch)
+    foreign = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    foreign.bind(("127.0.0.1", 0))
+    foreign.listen(1)
+    foreign.settimeout(0.2)
+    try:
+        monkeypatch.setattr(proxy, "running_app", lambda _name: None)
+        monkeypatch.setattr(proxy, "get_app", lambda name: object() if name == "notes" else None)
+        response = asyncio.run(_get("/", host="notes.owner.woltspace.app", token=_token(key, "apps-aud")))
+        assert response.status_code == 503
+        headers = {"host": "notes.owner.woltspace.app", "origin": "https://notes.owner.woltspace.app",
+                   "cf-access-jwt-assertion": _token(key, "apps-aud")}
+        with pytest.raises(WebSocketDisconnect):
+            with TestClient(gateway.app).websocket_connect("/socket", headers=headers):
+                pass
+        with pytest.raises(socket.timeout):
+            foreign.accept()  # nobody connected to the foreign listener
+    finally:
+        foreign.close()

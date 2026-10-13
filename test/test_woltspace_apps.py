@@ -471,3 +471,28 @@ class TestPortAlreadyAnswers:
         port = probe.getsockname()[1]
         probe.close()  # bound then released, nothing listening
         assert apps._port_answers(port) == ""
+
+
+def _foreign_listener():
+    import socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(64)  # room for every probe connection; nobody accepts them
+    return sock, sock.getsockname()[1]
+
+
+class TestForeignListenerAcrossLifecycle:
+    @patch("apps.subprocess.Popen")
+    def test_restore_and_restart_refuse_and_publish_nothing(self, mock_popen, wolts_dir):
+        sock, port = _foreign_listener()
+        try:
+            _make_app(wolts_dir, "squatted", start="echo hi", port=port)
+            apps._write_state("squatted", {"name": "squatted", "port": port, "pid": 999999})
+            actions = apps.apps_restore()
+            assert [a["action"] for a in actions if a["name"] == "squatted"] == ["restore-failed"]
+            with pytest.raises(RuntimeError, match="already in use by another program"):
+                apps.restart_app("squatted")
+            mock_popen.assert_not_called()
+            assert all(r["name"] != "squatted" for r in apps.running_apps())
+        finally:
+            sock.close()  # the foreign listener is never touched by the lodge
