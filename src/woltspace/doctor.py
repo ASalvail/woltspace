@@ -483,6 +483,34 @@ def _allowed_hosts_check(names: list[str]) -> DoctorCheck | None:
     )
 
 
+# Kept in step with `server/content_hosts.py`: the host label prefix that
+# names a wolt's site on the app domain. An app of that name is never served.
+SITE_HOST_PREFIX = "site-"
+
+
+def _reserved_app_names_check(layout: RuntimeLayout) -> DoctorCheck | None:
+    """Apps whose names the gateway reserves for wolt sites (`site-<wolt>`)."""
+    found = []
+    for folder in ("apps", "projects"):
+        for manifest in sorted((layout.wolts_dir / folder).glob("*/woltspace.json")):
+            names = {manifest.parent.name}
+            try:
+                data = json.loads(manifest.read_text())
+                if isinstance(data, dict) and isinstance(data.get("name"), str):
+                    names.add(data["name"])
+            except (OSError, json.JSONDecodeError):
+                pass
+            found.extend(sorted(name for name in names if name.lower().startswith(SITE_HOST_PREFIX)))
+    if not found:
+        return None
+    return DoctorCheck(
+        "app-names", "warn",
+        f"app name(s) reserved for wolt sites, not served: {', '.join(dict.fromkeys(found))}",
+        f"Rename the app directory and its woltspace.json name without the "
+        f"{SITE_HOST_PREFIX} prefix; the wolt's site keeps that host.",
+    )
+
+
 def _remote_access_check(layout: RuntimeLayout, tunnel: dict) -> DoctorCheck | None:
     """Say plainly what a published lodge's Access settings mean for it.
 
@@ -568,6 +596,9 @@ def run_doctor(
     hosts_check = _allowed_hosts_check(_allowed_hosts_values(layout))
     if hosts_check is not None:
         checks.append(hosts_check)
+    reserved_apps = _reserved_app_names_check(layout)
+    if reserved_apps is not None:
+        checks.append(reserved_apps)
     default_harness = _default_harness_check()
     if default_harness is not None:
         checks.append(default_harness)

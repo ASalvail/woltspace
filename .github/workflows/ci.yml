@@ -76,6 +76,7 @@ jobs:
           test/test_access_cli.py
           test/test_lodge_config_writes.py
           test/test_app_gateway.py
+          test/test_site_gateway.py
           test/test_closed_loop.py::TestRegressions::test_notify_footer_appended
           test/test_closed_loop.py::TestRegressions::test_notify_script_executable
           test/test_closed_loop.py::TestRegressions::test_den_reply_footer_consistent

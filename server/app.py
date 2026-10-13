@@ -58,7 +58,8 @@ from .access import (
 )
 from .notify import AttachmentError, NoNotificationTarget, send_notification
 from .speech import SpeechError
-from .app_sharing import read_app_shares, write_app_shares
+from .app_sharing import read_app_shares, read_site_shares, write_app_shares, write_site_shares
+from .content_hosts import UnsupportedWoltName, site_host_label
 from .sparks import get_spark_with_chain, list_sparks
 from .pty_bridge import (
     PtyBridgeError,
@@ -2530,6 +2531,61 @@ async def site_detail(wolt_name: str):
         "url": f"/wolt/{wolt_name}/site/",
         "dir_exists": sdir.exists(),
     }
+
+
+def _site_sharing_wolt(wolt_name: str) -> JSONResponse | None:
+    if not _WOLT_NAME_RE.fullmatch(wolt_name):
+        return JSONResponse({"error": "invalid wolt name"}, status_code=400)
+    if not (WOLTS_DIR / wolt_name / "wolt").is_dir():
+        return JSONResponse({"error": f"wolt {wolt_name} not found"}, status_code=404)
+    return None
+
+
+def _site_sharing_state(wolt_name: str, entries: list[str]) -> dict:
+    """The share list plus where the site is reachable; owner-only, like the app routes.
+
+    `host` is the wolt's label on the app domain (`site-<label>`), or null with
+    `unsupported` saying why the wolt's directory name cannot be a host.
+    """
+    state = {"entries": entries, "enabled": _app_access_settings() is not None}
+    try:
+        state["host"] = site_host_label(wolt_name)
+        state["unsupported"] = None
+    except UnsupportedWoltName as exc:
+        state["host"] = None
+        state["unsupported"] = str(exc)
+    return state
+
+
+@app.get("/sites/{wolt_name}/sharing")
+async def site_sharing_get(wolt_name: str):
+    if invalid := _site_sharing_wolt(wolt_name):
+        return invalid
+    try:
+        entries = read_site_shares(WOLTS_DIR, wolt_name.lower())
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+    return _site_sharing_state(wolt_name, entries)
+
+
+@app.put("/sites/{wolt_name}/sharing")
+async def site_sharing_put(wolt_name: str, request: Request):
+    if invalid := _site_sharing_wolt(wolt_name):
+        return invalid
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "JSON object body required"}, status_code=400)
+    if not isinstance(body, dict) or set(body) != {"entries"}:
+        return JSONResponse({"error": "entries is required"}, status_code=400)
+    try:
+        # Keyed by the host label: the gateway looks a site up by its host.
+        entries = write_site_shares(WOLTS_DIR, wolt_name.lower(), body["entries"])
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+    return {"ok": True, **_site_sharing_state(wolt_name, entries)}
 
 
 @app.api_route("/wolt/{wolt_name}/site/{path:path}", methods=["GET", "HEAD"])
