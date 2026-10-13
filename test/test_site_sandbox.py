@@ -607,3 +607,17 @@ def test_site_livereload_from_inside_the_sandbox_is_refused_not_relaxed(client):
                                       headers={"host": "localhost:7777", "origin": "null"}):
             pass
     assert exc.value.code == 1008
+
+
+def test_public_site_manifest_inlines_the_wolts_own_slots(tmp_path):
+    """On the site's own origin the shell draws only slots it was handed."""
+    import site_shell
+
+    wolt = tmp_path / "astre"
+    site = wolt / "wolt" / "site"
+    site.mkdir(parents=True)
+    (site / "header.html").write_text("<b>hello</b>")
+    cfg = {"header_html": "header.html", "footer_html": "missing.html"}
+    manifest = site_shell.public_shell_manifest("astre", wolt, site, cfg)
+    assert manifest["site"]["slots"] == {"header": "<b>hello</b>"}
+    assert "memory" not in manifest
