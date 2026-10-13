@@ -1864,7 +1864,7 @@ class ConnectorStore:
 
     def settle_operation(
         self, instance_id: str, key: str, state: str, *, expect: tuple[str, ...] | None = None,
-        grant: str | None = None, **fields,
+        grant: str | None = None, target_wolt: str | None = None, **fields,
     ) -> dict:
         """Move an operation on: effect_in_progress, started(session), associated, answered, failed, uncertain.
 
@@ -1896,7 +1896,17 @@ class ConnectorStore:
                 if allowed and grant == "create":
                     allowed = bool(binding.get("may_create")) and record.get("wolt") in (binding.get("selectable_wolts") or [])
                 elif allowed and grant == "stop":
-                    allowed = bool(binding.get("may_stop_own_sessions"))
+                    # The boolean grant, the explicit association, and the
+                    # target's real wolt (looked up by the caller from the
+                    # session registry just before) against the binding's
+                    # current selectable set and default wolt.
+                    target = fields.get("session") or record.get("session")
+                    associated = (queue.routing.get(record["binding_id"]) or {}).get("sessions") or {}
+                    current_wolts = set(binding.get("selectable_wolts") or ()) | {binding["default_wolt"]}
+                    allowed = (
+                        bool(binding.get("may_stop_own_sessions")) and target in associated
+                        and target_wolt is not None and target_wolt in current_wolts
+                    )
                 if not allowed:
                     raise ConnectorError(409, "grant_withdrawn")
             # Fenced: a transition applies only from the state its caller saw,

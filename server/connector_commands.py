@@ -463,7 +463,8 @@ class Commands:
             return self._done(event, "kill", "stopped", session=argument)
         try:
             self.store.settle_operation(
-                event.instance_id, key, "effect_in_progress", expect=("reserved",), grant="stop", session=argument,
+                event.instance_id, key, "effect_in_progress", expect=("reserved",), grant="stop",
+                target_wolt=self.wolt_of(argument), session=argument,
             )
         except ConnectorError as exc:
             if exc.reason != "grant_withdrawn":

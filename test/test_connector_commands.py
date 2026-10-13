@@ -874,3 +874,27 @@ def test_a_stop_that_raised_is_judged_by_the_session_not_the_exception(lodge, st
     lodge.store.router.commands.stop = stop
     status, body = lodge.store.accept_event(who, _event_payload("k", "u2", "c2", "/kill softie-9"))
     assert body["outcome"] == ("uncertain" if still_running else "stopped")
+
+
+@pytest.mark.parametrize("narrowing", ["selectable", "default"])
+def test_a_kill_target_whose_wolt_leaves_the_binding_at_the_effect_boundary_is_not_stopped(lodge, narrowing):
+    """Astre's probe: may_stop stays on, but the target's real wolt stops being one this chat may talk to."""
+    who = lodge.store.authenticate(lodge.token)
+    binding = _binding(lodge, "u2")
+    lodge.sessions.states["otter-1"] = "running"
+    lodge.store.associate_session("tg", binding, "otter-1", via="routed", wolt="otter")
+    if narrowing == "default":
+        # otter is reachable only as the default wolt; the boundary moves the default away.
+        lodge.store.bind("tg", sender="u2", conversation="c2", default_wolt="otter", selectable_wolts=["softie"],
+                         may_stop_own_sessions=True)
+    real = lodge.store.settle_operation
+
+    def settle(instance, key, state, **fields):
+        if state == "effect_in_progress":
+            lodge.store.bind("tg", sender="u2", conversation="c2", default_wolt="softie", selectable_wolts=["softie"],
+                             may_stop_own_sessions=True)
+        return real(instance, key, state, **fields)
+
+    lodge.store.settle_operation = settle
+    status, body = lodge.store.accept_event(who, _event_payload("k", "u2", "c2", "/kill otter-1"))
+    assert body["reason"] == "grant_withdrawn" and lodge.sessions.stopped == []
