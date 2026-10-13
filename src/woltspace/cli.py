@@ -1324,6 +1324,24 @@ def _connector_cursor(args) -> int:
     return _connector_run(args, action)
 
 
+def _connector_operations(args) -> int:
+    """Parked chat commands (effect uncertain after a crash): say what happened, nothing is rerun."""
+    def action(_connectors, store):
+        if args.done:
+            ok = store.resolve_operation(args.instance_id, args.done, session=args.session)
+            return {"resolved": ok, "lines": ["resolved" if ok else "no such parked operation"]}
+        if args.abandon:
+            ok = store.resolve_operation(args.instance_id, args.abandon, session=None)
+            return {"abandoned": ok, "lines": ["abandoned; its reservation is released" if ok else "no such parked operation"]}
+        records = store.uncertain_operations(args.instance_id)
+        lines = [
+            f"{r['event_id']}  /{r['command']} {r.get('wolt') or r.get('session') or ''}  {r.get('note', '')}".rstrip()
+            for r in records
+        ] or ["nothing parked"]
+        return {"operations": records, "lines": lines}
+    return _connector_run(args, action)
+
+
 def _connector_queue(args) -> int:
     def action(_connectors, store):
         deliveries = store.list_deliveries(args.instance_id)
@@ -1671,6 +1689,15 @@ def build_parser() -> argparse.ArgumentParser:
     connector_handoffs.add_argument("--cancel", metavar="EVENT_ID", default=None)
     connector_handoffs.add_argument("--json", action="store_true")
     connector_handoffs.set_defaults(func=_connector_handoffs)
+    connector_operations = connector_sub.add_parser(
+        "operations", help="chat commands parked after a crash; --done EVENT_ID --session NAME, or --abandon EVENT_ID"
+    )
+    connector_operations.add_argument("instance_id")
+    connector_operations.add_argument("--done", metavar="EVENT_ID", default=None)
+    connector_operations.add_argument("--session", default=None, help="the session the parked /new did start")
+    connector_operations.add_argument("--abandon", metavar="EVENT_ID", default=None)
+    connector_operations.add_argument("--json", action="store_true")
+    connector_operations.set_defaults(func=_connector_operations)
     connector_cursor = connector_sub.add_parser(
         "cursor", help="seed an instance's provider cursor (a handover), or clear it"
     )

@@ -195,3 +195,26 @@ def test_grants_are_owner_set_and_come_with_the_forged_sender_warning(colony, ca
     assert (binding["create_per_hour"], binding["create_concurrent"]) == (3, 1)
     assert cli_main(["connector", "bind", "tg", "--sender", "u3", "--conversation", "c3", "--wolt", "softie", "--selectable-wolts", "Not A Wolt"]) == 1
     assert "is not a wolt name" in capsys.readouterr().err
+
+
+def test_parked_operations_are_listed_and_resolved_by_the_owner(colony, capsys):
+    assert cli_main(["connector", "add", "tg", "--channel", "fake", "--account", "acct"]) == 0
+    assert cli_main(["connector", "bind", "tg", "--sender", "u", "--conversation", "c", "--wolt", "softie", "--selectable-wolts", "softie", "--may-create"]) == 0
+    assert cli_main(["connector", "enable", "tg"]) == 0
+    store = ConnectorStore(colony / ".space" / "connectors")
+    binding = store.list_bindings("tg")[0]["binding_id"]
+    store.reserve_create("tg", "acct\x00tg:9", binding, "softie", 0)
+    store.settle_operation("tg", "acct\x00tg:9", "uncertain")
+    capsys.readouterr()
+    assert cli_main(["connector", "operations", "tg"]) == 0
+    assert "tg:9  /new softie" in capsys.readouterr().out
+    assert cli_main(["connector", "operations", "tg", "--done", "tg:9", "--session", "softie-3", "--json"]) == 0
+    assert _out(capsys)["resolved"] is True
+    assert store.operation("tg", "acct\x00tg:9")["state"] == "answered"
+    assert store.routing_state("tg", binding)["sessions"]["softie-3"]["via"] == "created"
+    store.reserve_create("tg", "acct\x00tg:10", binding, "softie", 0)
+    store.settle_operation("tg", "acct\x00tg:10", "uncertain")
+    assert cli_main(["connector", "operations", "tg", "--abandon", "tg:10"]) == 0
+    assert store.operation("tg", "acct\x00tg:10")["state"] == "failed"
+    assert cli_main(["connector", "operations", "tg", "--abandon", "tg:99"]) == 0
+    assert "no such parked operation" in capsys.readouterr().out

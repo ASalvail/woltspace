@@ -206,8 +206,21 @@ class Router:
         text = session_text(event, files)
         binding_id = event.binding["binding_id"]
         state = self.store.routing_state(event.instance_id, binding_id)
+        # Routing memory is only as good as the current grant: a picked wolt
+        # that is no longer selectable, and a remembered session of such a
+        # wolt, are forgotten here and now; the default wolt needs no grant.
+        allowed = set(event.binding.get("selectable_wolts") or ()) | {event.binding["default_wolt"]}
         wolt = state.get("active_wolt") or event.binding["default_wolt"]
         remembered = state.get("active_session")
+        if wolt not in allowed:
+            wolt = event.binding["default_wolt"]
+            remembered = None
+            self.store.remember_route(event.instance_id, binding_id, active_wolt=None, active_session=None)
+        elif remembered:
+            known = (state.get("sessions") or {}).get(remembered) or {}
+            if known.get("wolt") and known["wolt"] not in allowed:
+                remembered = None
+                self.store.remember_route(event.instance_id, binding_id, active_session=None)
         session = event.reply_to_session or remembered or self.resolve(wolt)
         if not session:
             self._tell(event, f"🪵 {wolt} has no live session; ask the owner to start one")
@@ -216,7 +229,7 @@ class Router:
         status = result.get("status")
         if status == "delivered":
             self.store.remember_route(event.instance_id, binding_id, active_session=session)
-            self.store.associate_session(event.instance_id, binding_id, session, via="routed")
+            self.store.associate_session(event.instance_id, binding_id, session, via="routed", wolt=wolt)
             self._tell(event, f"{self._emoji(wolt)} sent to {session}")
             return {"routed": "delivered", "session": session}
         if status in {"session-dead", "agent-gone"}:
@@ -229,7 +242,7 @@ class Router:
                 self._tell(event, f"🪵 could not wake {session}: {exc}")
                 return {"routed": "refused", "reason": "resume_failed", "session": session}
             self.store.remember_route(event.instance_id, binding_id, active_session=session)
-            self.store.associate_session(event.instance_id, binding_id, session, via="routed")
+            self.store.associate_session(event.instance_id, binding_id, session, via="routed", wolt=wolt)
             self._tell(event, f"🪵 {session} was asleep; woke it and delivered")
             return {"routed": "resumed", "session": session, "detail": revived.get("status", "")}
         # no-session (the remembered or replied-to session is gone): fall back
@@ -239,7 +252,7 @@ class Router:
             result = self.deliver(live, text)
             if result.get("status") == "delivered":
                 self.store.remember_route(event.instance_id, binding_id, active_session=live)
-                self.store.associate_session(event.instance_id, binding_id, live, via="routed")
+                self.store.associate_session(event.instance_id, binding_id, live, via="routed", wolt=wolt)
                 self._tell(event, f"🪵 {session} is gone; delivered to {wolt}'s live session {live}")
                 return {"routed": "delivered", "session": live, "fallback_from": session}
         self._tell(event, f"🪵 {session} is gone and {wolt} has no live session")

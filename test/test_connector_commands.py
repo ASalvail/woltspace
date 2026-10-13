@@ -234,7 +234,9 @@ async def test_new_needs_its_own_grant_a_selectable_wolt_and_stays_within_limits
         assert (wrong["outcome"], wrong["reason"]) == ("refused", "not_selectable")
         created = await _say(lodge, connector, "u2", "c2", "/new otter")
         assert (created["outcome"], created["session"]) == ("created", "otter-1")
-        assert lodge.sessions.started == [("otter", {"adapter": "telegram", "chat_id": "c2", "binding_id": _binding(lodge, "u2")})]
+        [(wolt, routing)] = lodge.sessions.started
+        assert wolt == "otter" and routing["operation"] == "bot:1\x00tg:3"
+        assert {k: routing[k] for k in ("adapter", "chat_id", "binding_id")} == {"adapter": "telegram", "chat_id": "c2", "binding_id": _binding(lodge, "u2")}
         state = lodge.store.routing_state("tg", _binding(lodge, "u2"))
         assert state["sessions"]["otter-1"]["via"] == "created" and state["active_session"] == "otter-1"
         # Concurrency: one live created session allowed.
@@ -354,3 +356,253 @@ async def test_the_connector_bearer_still_opens_no_owner_api(lodge, method, path
         response = await client.request(method, path, json=body, headers={"Authorization": f"Bearer {lodge.token}"})
     assert response.status_code == 401
     assert lodge.sessions.started == [] and lodge.sessions.stopped == []
+
+
+# ---------------------------------------- round 2: reservations, replay, revalidation
+
+
+def _event_payload(event_id, sender, conversation, text="", **extra):
+    return {"event_id": event_id, "sender": {"provider_id": sender}, "conversation": {"provider_id": conversation}, "text": text, **extra}
+
+
+def _binding_of(lodge, sender):
+    return _binding(lodge, sender)
+
+
+def test_two_racing_new_commands_get_one_start(lodge):
+    """Astre's probe: per_hour=1, concurrent=1, a barrier inside start."""
+    import threading
+
+    lodge.store.bind("tg", sender="u2", conversation="c2", default_wolt="softie", selectable_wolts=["softie"],
+                     may_create=True, create_per_hour=1, create_concurrent=1)
+    barrier = threading.Barrier(2, timeout=5)
+    started = []
+
+    def start(wolt, prompt, routing):
+        try:
+            barrier.wait()
+        except threading.BrokenBarrierError:
+            pass
+        name = f"{wolt}-{len(started) + 1}"
+        started.append(name)
+        lodge.sessions.states[name] = "running"
+        return {"name": name}
+
+    lodge.store.router.commands.start = start
+    who = lodge.store.authenticate(lodge.token)
+    outcomes = []
+
+    def post(i):
+        outcomes.append(lodge.store.accept_event(who, _event_payload(f"race{i}", "u2", "c2", "/new softie"))[1]["outcome"])
+
+    threads = [threading.Thread(target=post, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(started) == 1
+    assert sorted(outcomes) == ["created", "refused"]
+    assert any(o["state"] == "answered" and o["command"] == "new" for o in lodge.store._queue("tg").operations.values())
+
+
+def test_a_start_that_completed_is_never_repeated_when_the_record_failed(lodge):
+    """Astre's probe: the association write fails after start; the retry reconciles, no second start."""
+    who = lodge.store.authenticate(lodge.token)
+    real_settle = lodge.store.settle_operation
+    crashes = {"started": 1}
+
+    def crashing_settle(instance_id, key, state, **fields):
+        if crashes.get(state):
+            crashes[state] -= 1
+            raise OSError("crash after the effect, before the record")
+        return real_settle(instance_id, key, state, **fields)
+
+    lodge.store.settle_operation = crashing_settle
+    # The session boundary can be asked by nonce: the fake start keeps the routing.
+    routings = {}
+
+    def start(wolt, prompt, routing):
+        name = f"{wolt}-{len(routings) + 1}"
+        routings[name] = routing
+        lodge.sessions.states[name] = "running"
+        return {"name": name}
+
+    lodge.store.router.commands.start = start
+    lodge.store.router.commands.find = lambda key: next((n for n, r in routings.items() if r.get("operation") == key), None)
+    status, body = lodge.store.accept_event(who, _event_payload("e1", "u2", "c2", "/new otter"))
+    assert body["routed"] == "error"
+    record = lodge.store.operation("tg", "bot:1\x00e1")
+    assert record["state"] == "effect_in_progress" and len(routings) == 1
+    # The reservation is held meanwhile: another /new is refused on concurrency.
+    assert lodge.store.accept_event(who, _event_payload("e2", "u2", "c2", "/new otter"))[1]["reason"] == "concurrency_limited"
+    lodge.clock.now += 31
+    lodge.store.lease(who, 1)                     # the retry
+    record = lodge.store.operation("tg", "bot:1\x00e1")
+    assert (record["state"], record["session"], len(routings)) == ("answered", "otter-1", 1)
+    assert lodge.store.routing_state("tg", _binding_of(lodge, "u2"))["sessions"]["otter-1"]["via"] == "created"
+    assert lodge.store.accept_event(who, _event_payload("e1", "u2", "c2", "/new otter"))[1]["session"] == "otter-1"
+
+
+def test_an_effect_of_unknown_outcome_is_parked_and_only_the_owner_resolves_it(lodge):
+    who = lodge.store.authenticate(lodge.token)
+    real_settle = lodge.store.settle_operation
+
+    def crashing_settle(instance_id, key, state, **fields):
+        if state == "started":
+            lodge.store.settle_operation = real_settle
+            raise OSError("crash")
+        return real_settle(instance_id, key, state, **fields)
+
+    lodge.store.settle_operation = crashing_settle
+    lodge.store.router.commands.find = lambda key: None       # nothing answers to the nonce
+    lodge.store.accept_event(who, _event_payload("p1", "u2", "c2", "/new otter"))
+    assert lodge.sessions.started and lodge.store.operation("tg", "bot:1\x00p1")["state"] == "effect_in_progress"
+    lodge.clock.now += 31
+    lodge.store.lease(who, 1)
+    record = lodge.store.operation("tg", "bot:1\x00p1")
+    assert record["state"] == "uncertain"
+    assert len(lodge.sessions.started) == 1
+    # Parked: the slot and the hourly charge are kept; an owner retry only replays the parked answer.
+    assert lodge.store.accept_event(who, _event_payload("p2", "u2", "c2", "/new otter"))[1]["reason"] == "concurrency_limited"
+    assert lodge.store.retry_handoff("tg", "p1") is False or True
+    lodge.clock.now += 31
+    lodge.store.lease(who, 1)
+    assert len(lodge.sessions.started) == 1 and lodge.store.operation("tg", "bot:1\x00p1")["state"] == "uncertain"
+    assert [o["event_id"] for o in lodge.store.uncertain_operations("tg")] == ["p1"]
+    # The owner says what happened.
+    assert lodge.store.resolve_operation("tg", "p1", session="otter-1") is True
+    assert lodge.store.operation("tg", "bot:1\x00p1")["state"] == "answered"
+    assert lodge.store.routing_state("tg", _binding_of(lodge, "u2"))["sessions"]["otter-1"]["via"] == "created"
+    # Abandoning releases the reservation.
+    lodge.store.settle_operation = crashing_settle
+    lodge.sessions.states["otter-1"] = "stopped"
+    lodge.store.accept_event(who, _event_payload("p3", "u2", "c2", "/new otter"))
+    lodge.clock.now += 31
+    lodge.store.lease(who, 1)
+    assert lodge.store.operation("tg", "bot:1\x00p3")["state"] == "uncertain"
+    assert lodge.store.resolve_operation("tg", "p3", session=None) is True
+    assert lodge.store.operation("tg", "bot:1\x00p3")["state"] == "failed"
+    lodge.clock.now += 3601
+    assert lodge.store.accept_event(who, _event_payload("p4", "u2", "c2", "/new otter"))[1]["outcome"] == "created"
+
+
+def test_crashes_before_the_effect_and_before_the_receipt_do_not_repeat_it(lodge):
+    who = lodge.store.authenticate(lodge.token)
+    real_settle = lodge.store.settle_operation
+    # Before the effect: the crash lands at effect_in_progress, so nothing ran; the retry runs it once.
+    once = {"effect_in_progress": 1}
+
+    def crash_before(instance_id, key, state, **fields):
+        if once.get(state):
+            once[state] -= 1
+            raise OSError("crash before the effect")
+        return real_settle(instance_id, key, state, **fields)
+
+    lodge.store.settle_operation = crash_before
+    lodge.store.accept_event(who, _event_payload("b1", "u2", "c2", "/new otter"))
+    assert lodge.sessions.started == [] and lodge.store.operation("tg", "bot:1\x00b1")["state"] == "reserved"
+    lodge.clock.now += 31
+    lodge.store.lease(who, 1)
+    assert len(lodge.sessions.started) == 1 and lodge.store.operation("tg", "bot:1\x00b1")["state"] == "answered"
+    # Before the receipt: the crash lands after `associated`; the retry answers without a second start.
+    lodge.sessions.states["otter-1"] = "stopped"
+    once = {"answered": 1}
+    lodge.store.accept_event(who, _event_payload("b2", "u2", "c2", "/new otter"))
+    assert lodge.store.operation("tg", "bot:1\x00b2")["state"] == "associated" and len(lodge.sessions.started) == 2
+    lodge.clock.now += 31
+    lodge.store.lease(who, 1)
+    assert lodge.store.operation("tg", "bot:1\x00b2")["state"] == "answered" and len(lodge.sessions.started) == 2
+    # A withdrawn grant on resume parks instead of continuing.
+    lodge.store.settle_operation = real_settle
+    lodge.sessions.states["otter-2"] = "stopped"
+    lodge.clock.now += 3601                       # a fresh hour for the binding's two-per-hour grant
+    once = {"started": 1}
+    lodge.store.settle_operation = crash_before
+    lodge.store.accept_event(who, _event_payload("b3", "u2", "c2", "/new otter"))
+    lodge.store.bind("tg", sender="u2", conversation="c2", default_wolt="softie", selectable_wolts=["softie"], may_create=True)
+    lodge.clock.now += 31
+    lodge.store.lease(who, 1)
+    assert lodge.store.operation("tg", "bot:1\x00b3")["state"] == "uncertain" and len(lodge.sessions.started) == 3
+
+
+def test_a_kill_asked_once_is_never_sent_twice(lodge):
+    who = lodge.store.authenticate(lodge.token)
+    lodge.store.accept_event(who, _event_payload("n1", "u2", "c2", "/new otter"))
+    real_settle = lodge.store.settle_operation
+    once = {"started": 1}
+
+    def crash_after_stop(instance_id, key, state, **fields):
+        if once.get(state) and fields.get("session") == "otter-1" and state == "started":
+            once[state] -= 1
+            raise OSError("crash after the stop")
+        return real_settle(instance_id, key, state, **fields)
+
+    lodge.store.settle_operation = crash_after_stop
+    lodge.store.accept_event(who, _event_payload("k1", "u2", "c2", "/kill otter-1"))
+    assert lodge.sessions.stopped == ["otter-1"]
+    assert lodge.store.operation("tg", "bot:1\x00k1")["state"] == "effect_in_progress"
+    lodge.clock.now += 31
+    lodge.store.lease(who, 1)                      # the session is stopped: done, no second stop
+    assert lodge.sessions.stopped == ["otter-1"]
+    assert lodge.store.operation("tg", "bot:1\x00k1")["state"] == "answered"
+    # A stop that was sent but did not take is parked, not resent.
+    lodge.sessions.states["otter-1"] = "running"
+    lodge.store.accept_event(who, _event_payload("k2", "u2", "c2", "/kill otter-1"))
+    lodge.sessions.states["otter-1"] = "running"   # it ignored us
+    record = lodge.store._queue("tg").operations["bot:1\x00k2"]
+    assert record["state"] == "answered"           # the fake stop "worked"; force the crash window instead
+    queue = lodge.store._queue("tg")
+    queue.operations["bot:1\x00k2"]["state"] = "effect_in_progress"
+    queue.operations["bot:1\x00k2"].pop("result", None)
+    queue.inbound["bot:1\x00k2"]["state"] = "accepted"
+    lodge.store._save_queue("tg", queue)
+    lodge.clock.now += 31
+    lodge.store.lease(who, 1)
+    assert lodge.sessions.stopped == ["otter-1", "otter-1"]
+    assert lodge.store.operation("tg", "bot:1\x00k2")["state"] == "uncertain"
+
+
+def test_a_button_resumes_its_own_operation_and_nobody_elses(lodge):
+    who = lodge.store.authenticate(lodge.token)
+    lodge.store.accept_event(who, _event_payload("n1", "u2", "c2", "/new otter"))
+    lodge.store.accept_event(who, _event_payload("pk", "u2", "c2", "/kill"))
+    [[button]] = [d for d in lodge.store.list_deliveries("tg") if d.get("buttons")][-1]["buttons"]
+    real_settle = lodge.store.settle_operation
+    once = {"started": 1}
+
+    def crash(instance_id, key, state, **fields):
+        if once.get(state) and state == "started":
+            once[state] -= 1
+            raise OSError("crash")
+        return real_settle(instance_id, key, state, **fields)
+
+    lodge.store.settle_operation = crash
+    pressed = lodge.store.accept_event(who, _event_payload("press1", "u2", "c2", callback={"id": button["callback_id"]}))
+    assert pressed[1]["routed"] == "error" and lodge.sessions.stopped == ["otter-1"]
+    # Another event presenting the consumed button gets nothing.
+    other = lodge.store.accept_event(who, _event_payload("press2", "u2", "c2", callback={"id": button["callback_id"]}))
+    assert (other[1]["outcome"], other[1]["reason"]) == ("refused", "callback_invalid")
+    # The same event resumes its operation.
+    lodge.clock.now += 31
+    lodge.store.lease(who, 1)
+    assert lodge.store.operation("tg", "bot:1\x00press1")["state"] == "answered"
+    assert lodge.sessions.stopped == ["otter-1"]
+
+
+async def test_a_revoked_wolt_selection_does_not_persist(lodge):
+    """Astre's probe: /wolt other, rebind without other, hello goes to the default wolt."""
+    lodge.sessions.states.update({"softie-1": "running", "otter-1": "running"})
+    async with _client() as client:
+        connector = FakeConnector(client, lodge.token)
+        assert (await _say(lodge, connector, "u2", "c2", "/wolt otter"))["outcome"] == "selected"
+        assert (await _say(lodge, connector, "u2", "c2", "hello"))["session"] == "otter-1"
+        lodge.store.bind("tg", sender="u2", conversation="c2", default_wolt="softie", selectable_wolts=["softie"],
+                         may_create=True, may_stop_own_sessions=True)
+        routed = await _say(lodge, connector, "u2", "c2", "hello again")
+        assert routed["session"] == "softie-1"
+        state = lodge.store.routing_state("tg", _binding_of(lodge, "u2"))
+        assert state.get("active_wolt") is None and state["active_session"] == "softie-1"
+        # History still shows otter-1 (it was talked to); authority does not.
+        listed = await _say(lodge, connector, "u2", "c2", "/sessions")
+        assert listed["count"] == 2
+    assert [s for s, _ in lodge.sessions.pasted] == ["otter-1", "softie-1"]

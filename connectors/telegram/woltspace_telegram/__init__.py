@@ -58,6 +58,7 @@ API and the real lodge app.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 
 import httpx
@@ -70,6 +71,8 @@ POLL_TIMEOUT = 25
 LEASE_WAIT = 20
 DOWNLOAD_CAP = 50 * 1024 * 1024
 MAX_EVENT_TEXT = 16 * 1024
+# The only callback data core ever issues; anything else is nobody's button.
+CALLBACK_DATA_RE = re.compile(r"cb_[0-9a-f]{32}")
 
 logger = logging.getLogger(__name__)
 
@@ -351,6 +354,13 @@ class TelegramConnector:
             data = query.get("data")
             if not query.get("from") or not isinstance(message, dict) or not message.get("chat") or not isinstance(data, str):
                 return {"event_id": f"tg:{update['update_id']}", "cursor": update["update_id"], "ignore": "unsupported_update"}
+            if not CALLBACK_DATA_RE.fullmatch(data):
+                # Legacy or foreign button data: not one of core's ids, disposed of for good.
+                try:
+                    await self._call("answerCallbackQuery", callback_query_id=str(query.get("id", "")))
+                except (httpx.HTTPError, ValueError, OwnershipLost):
+                    pass
+                return {"event_id": f"tg:{update['update_id']}", "cursor": update["update_id"], "ignore": "unsupported_callback"}
             # The spinner stops whatever core decides; core's answer comes as a delivery.
             try:
                 await self._call("answerCallbackQuery", callback_query_id=str(query.get("id", "")))

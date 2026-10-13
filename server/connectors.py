@@ -268,8 +268,11 @@ class _Queue:
     # Per-binding routing memory: {binding_id: {"active_session", "active_wolt",
     # "sessions": {name: {"via", "at"}}, "creates": [ts, ...]}}.
     routing: dict = field(default_factory=dict)
-    # Inline-button callbacks core issued: {id: {"binding_id", "action", "expires", "used"}}.
+    # Inline-button callbacks core issued: {id: {"binding_id", "action", "expires", "consumed_by"}}.
     callbacks: dict = field(default_factory=dict)
+    # Durable command operations keyed by the event's dedup key: {key: {"command",
+    # "argument", "binding_id", "state", "session", "wolt", "at", ...}}.
+    operations: dict = field(default_factory=dict)
     # The provider cursor the connector last confirmed, and the highest
     # position core has answered (accepted or dropped).
     cursor: int | None = None
@@ -280,7 +283,7 @@ class _Queue:
             "version": 1, "deliveries": self.deliveries, "dedup": self.dedup,
             "uploads": self.uploads, "counters": self.counters, "inbound": self.inbound,
             "provider_messages": self.provider_messages, "routing": self.routing,
-            "callbacks": self.callbacks,
+            "callbacks": self.callbacks, "operations": self.operations,
             "cursor": self.cursor, "answered_cursor": self.answered_cursor,
         }
 
@@ -292,13 +295,14 @@ class _Queue:
             data.get("deliveries", []), data.get("dedup", {}),
             data.get("uploads", {}), data.get("counters", {"events": [], "uploads": []}),
             data.get("inbound", {}), data.get("provider_messages", {}), data.get("routing", {}),
-            data.get("callbacks", {}),
+            data.get("callbacks", {}), data.get("operations", {}),
             data.get("cursor"), data.get("answered_cursor"),
         )
         if not (isinstance(queue.deliveries, list) and isinstance(queue.dedup, dict)
                 and isinstance(queue.uploads, dict) and isinstance(queue.counters, dict)
                 and isinstance(queue.inbound, dict) and isinstance(queue.provider_messages, dict)
-                and isinstance(queue.routing, dict) and isinstance(queue.callbacks, dict)):
+                and isinstance(queue.routing, dict) and isinstance(queue.callbacks, dict)
+                and isinstance(queue.operations, dict)):
             raise ConnectorStateUnreadable("queue file has an unknown shape")
         for value in (queue.cursor, queue.answered_cursor):
             if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
@@ -1216,6 +1220,10 @@ class ConnectorStore:
         queue.callbacks = {
             key: record for key, record in queue.callbacks.items() if record["expires"] > now
         }
+        queue.operations = {
+            key: record for key, record in queue.operations.items()
+            if record["state"] in ("reserved", "effect_in_progress", "started", "uncertain") or now - record["at"] < limits.dedup_retention_seconds
+        }
 
     # --------------------------------------------------------------- inbound
 
@@ -1684,34 +1692,35 @@ class ConnectorStore:
             queue.routing[binding_id] = state
             self._save_queue(instance_id, queue)
 
-    def associate_session(self, instance_id: str, binding_id: str, session: str, *, via: str) -> None:
+    def associate_session(self, instance_id: str, binding_id: str, session: str, *, via: str, wolt: str = "") -> None:
         """An explicit association: this binding created (`via="created"`) or routed to the session.
 
-        `/sessions` lists and `/kill` may stop nothing else.
+        `/sessions` lists and `/kill` may stop nothing else. The wolt is kept
+        so a later send can check the session is still one this chat may
+        talk to. A creation's hourly charge is recorded at reservation time
+        (see `reserve_create`), not here.
         """
         with self._lock():
             queue = self._queue(instance_id)
-            state = dict(queue.routing.get(binding_id) or {})
-            sessions = dict(state.get("sessions") or {})
-            if session not in sessions or via == "created":
-                sessions[session] = {"via": via, "at": self.clock()}
-            state["sessions"] = sessions
-            if via == "created":
-                creates = [t for t in state.get("creates", []) if self.clock() - t < 3600]
-                creates.append(self.clock())
-                state["creates"] = creates
-            queue.routing[binding_id] = state
+            self._associate(queue, binding_id, session, via, wolt)
             self._save_queue(instance_id, queue)
 
-    def creates_in_the_last_hour(self, instance_id: str, binding_id: str) -> int:
-        state = self.routing_state(instance_id, binding_id)
-        return sum(1 for t in state.get("creates", []) if self.clock() - t < 3600)
+    def _associate(self, queue: _Queue, binding_id: str, session: str, via: str, wolt: str) -> None:
+        state = dict(queue.routing.get(binding_id) or {})
+        sessions = dict(state.get("sessions") or {})
+        if session not in sessions or via == "created":
+            sessions[session] = {"via": via, "at": self.clock(), "wolt": wolt}
+        elif wolt and not sessions[session].get("wolt"):
+            sessions[session]["wolt"] = wolt
+        state["sessions"] = sessions
+        queue.routing[binding_id] = state
 
-    def resolve_callback(self, instance_id: str, binding_id: str, callback_id: object) -> dict | None:
-        """The action behind a button press, once: same binding, not expired, not used.
+    def claim_callback(self, instance_id: str, binding_id: str, callback_id: object, key: str) -> dict | None:
+        """The action behind a button press, bound to the operation `key`.
 
-        Anything else is None, and the connector's sender is told so by the
-        caller; a foreign id reveals nothing about the binding it belongs to.
+        Same binding, not expired, and either never consumed or consumed by
+        this very operation (a retry resumes); anything else is None. A
+        foreign id reveals nothing about the binding it belongs to.
         """
         if not isinstance(callback_id, str):
             return None
@@ -1719,13 +1728,158 @@ class ConnectorStore:
             queue = self._queue(instance_id)
             record = queue.callbacks.get(callback_id)
             if (
-                record is None or record["binding_id"] != binding_id or record["used"]
-                or record["expires"] <= self.clock()
+                record is None or record["binding_id"] != binding_id or record["expires"] <= self.clock()
+                or record.get("consumed_by") not in (None, key)
             ):
                 return None
-            record["used"] = True
-            self._save_queue(instance_id, queue)
+            if record.get("consumed_by") != key:
+                record["consumed_by"] = key
+                self._save_queue(instance_id, queue)
             return dict(record["action"])
+
+    # ------------------------------------------------------------ operations
+
+    def operation(self, instance_id: str, key: str) -> dict | None:
+        with self._lock():
+            record = self._queue(instance_id).operations.get(key)
+            return dict(record) if record else None
+
+    def begin_operation(self, instance_id: str, key: str, binding_id: str, command: str, argument: str | None) -> dict:
+        """The durable record of one command, created once per event; a retry gets the same one back."""
+        with self._lock():
+            queue = self._queue(instance_id)
+            record = queue.operations.get(key)
+            if record is None:
+                record = {
+                    "command": command, "argument": argument, "binding_id": binding_id,
+                    "state": "reserved", "at": self.clock(), "session": None, "wolt": None,
+                }
+                queue.operations[key] = record
+                self._save_queue(instance_id, queue)
+            return dict(record)
+
+    def reserve_create(self, instance_id: str, key: str, binding_id: str, wolt: str, live_created: int) -> dict:
+        """Reserve one `/new` for this event, or say why not; one locked read-modify-write.
+
+        The grant is read again from the registry here: `may_create` and the
+        wolt in `selectable_wolts`. The hourly count includes every creation
+        reserved or made in the last hour; the concurrent count is
+        `live_created` (the caller's liveness check of this binding's created
+        sessions, made outside the lock) plus every reservation still in
+        progress. A reservation already made for this event is returned as
+        it is, so a retry never reserves twice.
+        """
+        with self._lock():
+            registry = self._registry()
+            binding = next((b for b in registry["bindings"] if b["binding_id"] == binding_id), None)
+            queue = self._queue(instance_id)
+            existing = queue.operations.get(key)
+            if existing is not None and existing["state"] != "reserved" or (
+                existing is not None and existing.get("wolt")
+            ):
+                return dict(existing)
+            if binding is None or not binding.get("may_create"):
+                return {"refused": "no_grant"}
+            if wolt not in (binding.get("selectable_wolts") or []):
+                return {"refused": "not_selectable"}
+            now = self.clock()
+            def holds_a_reservation(r: dict) -> bool:
+                # A record begun but not yet reserved (no wolt) holds nothing.
+                return r["command"] == "new" and r["binding_id"] == binding_id and bool(r.get("wolt"))
+
+            # In progress, or parked unresolved: each holds its concurrency slot.
+            in_progress = [
+                r for k, r in queue.operations.items()
+                if k != key and holds_a_reservation(r)
+                and r["state"] in ("reserved", "effect_in_progress", "started", "uncertain")
+            ]
+            # Charged for the hour: everything but a released (failed) reservation,
+            # and not this event's own record-in-the-making.
+            charged = [
+                r for k, r in queue.operations.items()
+                if k != key and holds_a_reservation(r) and r["state"] != "failed" and now - r["at"] < 3600
+            ]
+            if len(charged) >= binding.get("create_per_hour", 0):
+                return {"refused": "rate_limited"}
+            if live_created + len(in_progress) >= binding.get("create_concurrent", 0):
+                return {"refused": "concurrency_limited"}
+            record = existing or {
+                "command": "new", "argument": wolt, "binding_id": binding_id, "state": "reserved",
+                "at": now, "session": None,
+            }
+            record["wolt"] = wolt
+            queue.operations[key] = record
+            self._save_queue(instance_id, queue)
+            return dict(record)
+
+    def settle_operation(self, instance_id: str, key: str, state: str, **fields) -> dict:
+        """Move an operation on: effect_in_progress, started(session), associated, answered, failed, uncertain.
+
+        `effect_in_progress` is written before the external call; found
+        after a crash it is never run again on its own. `associated` also
+        records the association and the active route in the same write, so
+        a crash cannot leave a started session unknown to its binding once
+        this returns. `failed` releases the reservation (no hourly charge,
+        no concurrency slot); `uncertain` keeps both until the owner
+        resolves it.
+        """
+        with self._lock():
+            queue = self._queue(instance_id)
+            record = queue.operations.get(key)
+            if record is None:
+                raise ConnectorError(409, "unknown_operation")
+            record.update(fields)
+            if state == "answered" and record["state"] in ("uncertain", "failed"):
+                # The answer is kept; a parked or released operation stays what it is.
+                self._save_queue(instance_id, queue)
+                return dict(record)
+            record["state"] = state
+            if state == "failed":
+                record["at"] = 0.0      # released: no longer counted for the hour
+            if state == "associated" and record.get("session"):
+                self._associate(queue, record["binding_id"], record["session"], "created", record.get("wolt") or "")
+                routing = dict(queue.routing.get(record["binding_id"]) or {})
+                routing.update({"active_wolt": record.get("wolt"), "active_session": record["session"]})
+                queue.routing[record["binding_id"]] = routing
+            self._save_queue(instance_id, queue)
+            return dict(record)
+
+    def uncertain_operations(self, instance_id: str) -> list[dict]:
+        """Owner view: commands whose effect may or may not have happened."""
+        with self._lock():
+            return [
+                {"key": key, "event_id": key.split("\x00", 1)[-1], **record}
+                for key, record in self._queue(instance_id).operations.items()
+                if record["state"] == "uncertain"
+            ]
+
+    def resolve_operation(self, instance_id: str, event_id: str, *, session: str | None) -> bool:
+        """Owner recovery for a parked operation: done with `session`, or abandoned (reservation released).
+
+        The owner says what happened; nothing is rerun. A `/new` resolved
+        with a session gets its association; abandoned, its slot and hourly
+        charge are released.
+        """
+        key = self.handoff_key(instance_id, event_id)
+        with self._lock():
+            queue = self._queue(instance_id)
+            record = queue.operations.get(key)
+            if record is None or record["state"] != "uncertain":
+                return False
+            if session is None:
+                record["state"] = "failed"
+                record["at"] = 0.0
+                record["result"] = {"routed": "command", "command": record["command"], "outcome": "abandoned"}
+            else:
+                if not valid_id(session, 128):
+                    raise ConnectorError(400, "invalid_session")
+                record["session"] = session
+                record["state"] = "answered"
+                record["result"] = {"routed": "command", "command": record["command"], "outcome": "resolved", "session": session}
+                if record["command"] == "new":
+                    self._associate(queue, record["binding_id"], session, "created", record.get("wolt") or "")
+            self._save_queue(instance_id, queue)
+            return True
 
     def record_command(self, instance_id: str, record: dict) -> None:
         """Audit: one line per command executed or refused, never the token or a body."""
@@ -1938,7 +2092,7 @@ class ConnectorStore:
                         callback_id = CALLBACK_PREFIX + secrets.token_hex(16)
                         queue.callbacks[callback_id] = {
                             "binding_id": binding["binding_id"], "action": dict(button["action"]),
-                            "expires": now + self.limits.callback_ttl_seconds, "used": False,
+                            "expires": now + self.limits.callback_ttl_seconds, "consumed_by": None,
                         }
                         issued += 1
                         line.append({"text": str(button["text"])[:64], "callback_id": callback_id})

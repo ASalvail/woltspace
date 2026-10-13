@@ -22,15 +22,35 @@ Every answer goes back through a delivery in the same binding.
     /start, /help     what this chat may do.
 
 Anything else that starts with `/` is answered "not supported"; text that
-does not is a message for the session, as before. Inline buttons carry
-opaque, binding-scoped, expiring ids core issued with the delivery; a press
-resolves exactly once, to the action core stored, which is then checked
-like a typed command. Residual trust, stated plainly to the owner who
-grants: a malicious connector can forge an allowed sender and use any grant
-turned on for that binding.
+does not is a message for the session, as before.
 
-Session access goes through callables (resolve, start, stop, live) that
-default to the lodge's own `sessions` module, so tests mock the boundary.
+Every command with an effect is a durable operation keyed by the event,
+recorded in the instance's queue before any effect: `reserved` (for `/new`,
+the reservation is made under the store lock against the current grant and
+counts toward the hourly and concurrent limits at once), then
+`effect_in_progress` written *before* the session call, `started` (the
+session named), `associated`, `answered`; or `failed` (the reservation
+released) or `uncertain` (parked). A retry resumes from the recorded state
+and never repeats the effect. An operation found `effect_in_progress` after
+a crash is never run again on its own: a `/new` is reconciled at the
+session boundary by the nonce the start carried in its routing
+(`operation`) and parked as `uncertain` if no session answers to it; a
+`/kill` is done if the session no longer runs and parked otherwise. A
+parked operation keeps its reservation until the owner resolves it
+(`woltspace connector operations --done/--abandon`); an owner retry of the
+event only replays the parked answer. Resumed work re-checks the current
+grants like a first execution. The store lock is never held across the
+session calls. A button press is bound to its operation: the button is
+consumed by that event, so a retry of the same event resumes while another
+event gets neither the result nor a repeat.
+
+Residual trust, stated plainly to the owner who grants: a malicious
+connector can forge an allowed sender and use any grant turned on for that
+binding.
+
+Session access goes through callables (resolve, start, stop, live, find)
+that default to the lodge's own `sessions` module, so tests mock the
+boundary.
 """
 
 from __future__ import annotations
@@ -43,6 +63,7 @@ from .connectors import AcceptedEvent, ConnectorError, ConnectorStore, NoConnect
 COMMANDS = ("wolt", "new", "sessions", "kill", "start", "help")
 _COMMAND_RE = re.compile(r"^/([a-z]+)(?:@\w+)?(?:\s+(\S+))?\s*$")
 MAX_REPLY_CHARS = 1000
+LIVE_STATES = ("running", "resting")
 
 
 def parse_command(text: str) -> tuple[str, str | None] | None:
@@ -80,6 +101,16 @@ def _default_live(session: str) -> str | None:
     return (record or {}).get("status")
 
 
+def _default_find(operation: str) -> str | None:
+    """The session whose routing carries this operation nonce, if a start registered one."""
+    from sessions import SessionRegistry
+
+    for record in SessionRegistry().list():
+        if (record.get("routing") or {}).get("operation") == operation:
+            return record.get("name")
+    return None
+
+
 def _default_resolve(wolt: str) -> str | None:
     from sessions import resolve_active_session
 
@@ -93,12 +124,14 @@ class Commands:
         stop: Callable[[str], dict] = _default_stop,
         live: Callable[[str], str | None] = _default_live,
         resolve: Callable[[str], str | None] = _default_resolve,
+        find: Callable[[str], str | None] = _default_find,
     ):
         self.store = store
         self.start = start
         self.stop = stop
         self.live = live
         self.resolve = resolve
+        self.find = find
 
     # ------------------------------------------------------------- answers
 
@@ -123,14 +156,28 @@ class Commands:
             pass
         return {"routed": "command", "command": command, "outcome": outcome, **detail}
 
+    def _done(self, event: AcceptedEvent, command: str, outcome: str, **detail) -> dict:
+        """The operation's last word: answered, and the result kept for a replay."""
+        result = self._audit(event, command, outcome, **detail)
+        try:
+            self.store.settle_operation(event.instance_id, event.dedup_key, "answered", result=result)
+        except ConnectorError:
+            pass
+        return result
+
     # ------------------------------------------------------------ dispatch
 
     def handles(self, event: AcceptedEvent) -> bool:
         return event.callback is not None or parse_command(event.text) is not None
 
     def __call__(self, event: AcceptedEvent) -> dict:
+        key = event.dedup_key
+        previous = self.store.operation(event.instance_id, key)
+        if previous is not None and previous["state"] in ("answered", "failed", "uncertain"):
+            # Already over: the same answer, no second effect.
+            return dict(previous.get("result") or {"routed": "command", "command": previous["command"], "outcome": previous["state"]})
         if event.callback is not None:
-            action = self.store.resolve_callback(event.instance_id, event.binding["binding_id"], event.callback)
+            action = self.store.claim_callback(event.instance_id, event.binding["binding_id"], event.callback, key)
             if action is None:
                 self._tell(event, "🪵 that button has expired or is not yours; ask again")
                 return self._audit(event, "callback", "refused", reason="callback_invalid")
@@ -149,18 +196,20 @@ class Commands:
             "wolt": self._wolt, "new": self._new, "sessions": self._sessions, "kill": self._kill,
             "start": self._help, "help": self._help, "unsupported": self._unsupported,
         }[command]
-        return handler(event, argument)
+        if command in ("new", "kill"):
+            previous = self.store.begin_operation(event.instance_id, key, event.binding["binding_id"], command, argument)
+        return handler(event, argument, previous)
 
     # ------------------------------------------------------------ commands
 
     def _state(self, event: AcceptedEvent) -> dict:
         return self.store.routing_state(event.instance_id, event.binding["binding_id"])
 
-    def _unsupported(self, event: AcceptedEvent, argument: str | None) -> dict:
+    def _unsupported(self, event: AcceptedEvent, argument: str | None, previous: dict | None) -> dict:
         self._tell(event, f"🪵 /{argument} is not supported here")
         return self._audit(event, "unsupported", "refused", reason="unsupported", name=argument)
 
-    def _help(self, event: AcceptedEvent, argument: str | None) -> dict:
+    def _help(self, event: AcceptedEvent, argument: str | None, previous: dict | None) -> dict:
         binding = event.binding
         lines = ["Commands this chat may use:"]
         if binding.get("selectable_wolts"):
@@ -173,7 +222,7 @@ class Commands:
         self._tell(event, "\n".join(lines))
         return self._audit(event, "help", "answered")
 
-    def _wolt(self, event: AcceptedEvent, argument: str | None) -> dict:
+    def _wolt(self, event: AcceptedEvent, argument: str | None, previous: dict | None) -> dict:
         selectable = list(event.binding.get("selectable_wolts") or [])
         if not selectable:
             self._tell(event, "🪵 this chat may not pick a wolt; ask the owner")
@@ -191,41 +240,79 @@ class Commands:
         self._tell(event, f"🐾 talking to {argument}")
         return self._audit(event, "wolt", "selected", wolt=argument)
 
-    def _new(self, event: AcceptedEvent, argument: str | None) -> dict:
-        binding = event.binding
-        if not binding.get("may_create"):
-            self._tell(event, "🪵 this chat may not start sessions; ask the owner")
-            return self._audit(event, "new", "refused", reason="no_grant")
-        selectable = list(binding.get("selectable_wolts") or [])
-        wolt = argument or self._state(event).get("active_wolt") or binding["default_wolt"]
-        if wolt not in selectable:
-            self._tell(event, f"🪵 {wolt} is not a wolt this chat may start")
-            return self._audit(event, "new", "refused", reason="not_selectable", wolt=wolt)
-        binding_id = binding["binding_id"]
-        per_hour = binding.get("create_per_hour", 0)
-        if self.store.creates_in_the_last_hour(event.instance_id, binding_id) >= per_hour:
-            self._tell(event, f"🪵 this chat already started {per_hour} session(s) this hour")
-            return self._audit(event, "new", "refused", reason="rate_limited", wolt=wolt)
-        created = [
-            name for name, record in (self._state(event).get("sessions") or {}).items()
-            if record.get("via") == "created" and self.live(name) in ("running", "resting")
-        ]
-        if len(created) >= binding.get("create_concurrent", 0):
-            self._tell(event, f"🪵 this chat already has {len(created)} live session(s) it started")
-            return self._audit(event, "new", "refused", reason="concurrency_limited", wolt=wolt)
-        routing = {"adapter": event.channel, "chat_id": event.conversation["provider_id"], "binding_id": binding_id}
-        try:
-            result = self.start(wolt, "", routing)
-        except Exception as exc:  # noqa: BLE001 - the session layer's reason, shortened, is the answer
-            self._tell(event, f"🪵 could not start a session for {wolt}: {str(exc)[:200]}")
-            return self._audit(event, "new", "failed", wolt=wolt)
-        name = result.get("name", "")
-        self.store.associate_session(event.instance_id, binding_id, name, via="created")
-        self.store.remember_route(event.instance_id, binding_id, active_wolt=wolt, active_session=name)
-        self._tell(event, f"🐾 new session for {wolt}: {name}")
-        return self._audit(event, "new", "created", wolt=wolt, session=name)
+    def _created_live(self, event: AcceptedEvent) -> int:
+        """How many sessions this binding created are live now (checked outside the lock)."""
+        sessions = self._state(event).get("sessions") or {}
+        return sum(
+            1 for name, record in sessions.items()
+            if record.get("via") == "created" and self.live(name) in LIVE_STATES
+        )
 
-    def _sessions(self, event: AcceptedEvent, argument: str | None) -> dict:
+    def _new(self, event: AcceptedEvent, argument: str | None, previous: dict | None) -> dict:
+        binding = event.binding
+        binding_id = binding["binding_id"]
+        key = event.dedup_key
+        state = previous["state"] if previous else "reserved"
+        wolt = (previous or {}).get("wolt") or argument or self._state(event).get("active_wolt") or binding["default_wolt"]
+        if previous and previous["state"] != "reserved" or (previous and previous.get("wolt")):
+            # A resumption: the grant is checked again, like a first execution.
+            if not binding.get("may_create") or wolt not in (binding.get("selectable_wolts") or []):
+                self.store.settle_operation(event.instance_id, key, "uncertain", note="grant withdrawn during the operation")
+                self._tell(event, f"🪵 this chat may no longer start sessions; the owner has to look at {wolt}")
+                return self._done(event, "new", "uncertain", wolt=wolt, reason="grant_withdrawn")
+        if state == "reserved" and not (previous or {}).get("wolt"):
+            # First time here: reserve against the current grant and both limits, atomically.
+            reserved = self.store.reserve_create(event.instance_id, key, binding_id, wolt, self._created_live(event))
+            if reserved.get("refused"):
+                reason = reserved["refused"]
+                text = {
+                    "no_grant": "🪵 this chat may not start sessions; ask the owner",
+                    "not_selectable": f"🪵 {wolt} is not a wolt this chat may start",
+                    "rate_limited": f"🪵 this chat already started {binding.get('create_per_hour', 0)} session(s) this hour",
+                    "concurrency_limited": "🪵 this chat already has as many live sessions as it may start",
+                }[reason]
+                self._tell(event, text)
+                try:
+                    self.store.settle_operation(event.instance_id, key, "failed")
+                except ConnectorError:
+                    pass
+                return self._done(event, "new", "refused", reason=reason, wolt=wolt)
+            previous = reserved
+            state = "reserved"
+            fresh = True
+        else:
+            fresh = False
+        session = (previous or {}).get("session")
+        if state == "effect_in_progress":
+            # The start may or may not have happened: never run it again. Ask the
+            # session boundary by the nonce; otherwise park it for the owner.
+            session = self.find(key)
+            if session is None:
+                self.store.settle_operation(event.instance_id, key, "uncertain")
+                self._tell(event, f"🪵 a session for {wolt} may or may not have started; the owner has to look")
+                return self._done(event, "new", "uncertain", wolt=wolt)
+            self.store.settle_operation(event.instance_id, key, "started", session=session)
+            state = "started"
+        if state == "reserved":
+            routing = {"adapter": event.channel, "chat_id": event.conversation["provider_id"], "binding_id": binding_id, "operation": key}
+            # Written before the call: a crash from here on is reconciled or parked, never rerun.
+            self.store.settle_operation(event.instance_id, key, "effect_in_progress")
+            try:
+                result = self.start(wolt, "", routing)
+            except Exception as exc:  # noqa: BLE001 - the session layer's reason, shortened, is the answer
+                self.store.settle_operation(event.instance_id, key, "failed")
+                self._tell(event, f"🪵 could not start a session for {wolt}: {str(exc)[:200]}")
+                return self._done(event, "new", "failed", wolt=wolt)
+            session = str(result.get("name", ""))
+            self.store.settle_operation(event.instance_id, key, "started", session=session)
+            state = "started"
+        if state == "started":
+            self.store.settle_operation(event.instance_id, key, "associated")
+            state = "associated"
+        self._tell(event, f"🐾 new session for {wolt}: {session}")
+        return self._done(event, "new", "created", wolt=wolt, session=session)
+
+    def _sessions(self, event: AcceptedEvent, argument: str | None, previous: dict | None) -> dict:
         sessions = self._state(event).get("sessions") or {}
         if not sessions:
             self._tell(event, "no sessions this chat started or talked to")
@@ -236,28 +323,42 @@ class Commands:
         self._tell(event, "\n".join(lines))
         return self._audit(event, "sessions", "answered", count=len(sessions))
 
-    def _kill(self, event: AcceptedEvent, argument: str | None) -> dict:
+    def _kill(self, event: AcceptedEvent, argument: str | None, previous: dict | None) -> dict:
         binding = event.binding
+        key = event.dedup_key
         if not binding.get("may_stop_own_sessions"):
             self._tell(event, "🪵 this chat may not stop sessions; ask the owner")
-            return self._audit(event, "kill", "refused", reason="no_grant")
+            return self._done(event, "kill", "refused", reason="no_grant")
         sessions = self._state(event).get("sessions") or {}
         if argument is None:
-            live = [name for name in sorted(sessions) if self.live(name) in ("running", "resting")]
+            live = [name for name in sorted(sessions) if self.live(name) in LIVE_STATES]
             if not live:
                 self._tell(event, "nothing of this chat's is running")
-                return self._audit(event, "kill", "answered", count=0)
+                return self._done(event, "kill", "answered", count=0)
             buttons = [[{"text": f"stop {name}", "action": {"command": "kill", "argument": name}}] for name in live]
             self._tell(event, "stop which?", buttons)
-            return self._audit(event, "kill", "picker")
+            return self._done(event, "kill", "picker")
         if argument not in sessions:
             # Not this binding's: refused the same way whether it exists or not.
             self._tell(event, f"🪵 {argument} is not a session this chat started or talked to")
-            return self._audit(event, "kill", "refused", reason="not_associated", session=argument)
+            return self._done(event, "kill", "refused", reason="not_associated", session=argument)
+        state = (previous or {}).get("state", "reserved")
+        if state == "started" or self.live(argument) not in LIVE_STATES:
+            # Already stopped (by this operation's earlier attempt, or otherwise): no second stop.
+            self._tell(event, f"🌙 {argument} is stopped")
+            return self._done(event, "kill", "stopped", session=argument)
+        if state == "effect_in_progress":
+            # The stop was sent and the session still runs: not sent again on our own.
+            self.store.settle_operation(event.instance_id, key, "uncertain")
+            self._tell(event, f"🪵 {argument} was asked to stop and still runs; the owner has to look")
+            return self._done(event, "kill", "uncertain", session=argument)
+        self.store.settle_operation(event.instance_id, key, "effect_in_progress", session=argument)
         try:
             self.stop(argument)
         except Exception as exc:  # noqa: BLE001
+            self.store.settle_operation(event.instance_id, key, "failed")
             self._tell(event, f"🪵 could not stop {argument}: {str(exc)[:200]}")
-            return self._audit(event, "kill", "failed", session=argument)
+            return self._done(event, "kill", "failed", session=argument)
+        self.store.settle_operation(event.instance_id, key, "started", session=argument)
         self._tell(event, f"🌙 stopped {argument}")
-        return self._audit(event, "kill", "stopped", session=argument)
+        return self._done(event, "kill", "stopped", session=argument)
