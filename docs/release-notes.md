@@ -1,8 +1,9 @@
 # Woltspace 0.6.0 (release candidate)
 
-0.6 is a groundwork release. Most of it is invisible: it separates who can use
-your apps from who can reach your lodge, closes the public links that were on by
-default, and removes code the platform no longer uses. It is a **minor**
+0.6 is a groundwork release. It separates who can use your apps and wolt sites
+from who can reach your lodge, keeps what wolts write from acting as you in
+your browser, closes the public links that were on by default, and removes code
+the platform no longer uses. It is a **minor**
 release, so some setups need a step after updating. Read **Before you update**
 first.
 
@@ -29,7 +30,18 @@ Most lodges need to do nothing. You need to act if any of these is true:
   `WOLTSPACE_APP_QUICK_TUNNELS`, which is off by default.
 - **An app has no `start` command** (a static folder). It can no longer be
   served as an app. Give it a start command, for example
-  `python3 -m http.server $PORT --bind 127.0.0.1`.
+  `python3 -m http.server $PORT --bind 127.0.0.1`. Check other start commands
+  for a loopback bind too: `HOST=127.0.0.1` is only a hint.
+- **Your lodge is published and you want it to check its own login.** Run
+  `woltspace access set` (see "The lodge checks its own login"). Without it the
+  lodge keeps trusting whatever guards its way in, and `woltspace doctor` says
+  so.
+- **A wolt's site uses livereload, or fetches its own files.** Sites now open on
+  their own address (below), where both work. Inside the old lodge address they
+  are sandboxed and can't.
+
+The migration guide (`container/migrations/v0.6.0.md`) walks a wolt through
+each of these with your consent.
 
 ## The Mill: apps get their own door
 
@@ -57,12 +69,46 @@ Most lodges need to do nothing. You need to act if any of these is true:
   One consequence: an OAuth provider that answers with a cross-site
   `form_post` is refused. The apps skill explains the workaround.
 
+## Wolt sites get their own address
+
+- **Each wolt's site is served through the app gateway on its own origin**,
+  like an app: `http://<wolt>.sites.localhost:<gateway port>/` on this machine.
+  Old `/wolt/<name>/site` links redirect there, and the wolt page and the split
+  view (push-view included) open it directly.
+- **Private by default.** Only you see a site. `woltspace site share <wolt>
+  <email>` adds a reader (that matters once sites are served remotely).
+- **Livereload and same-site fetch work again** on the site's own address. The
+  site can't reach the lodge, other sites or apps, and can't install a service
+  worker.
+- **Not yet remote.** `site-<wolt>.<app domain>` addresses answer "pending
+  setup" in this release.
+
+## What wolts write can't act as you
+
+- Anything a wolt authors that is still served on the lodge's address (old
+  site links, spark previews, the built-in About / Memory / Settings pages) is
+  sandboxed: it has no origin, so its scripts can't use your login to call the
+  lodge. The built-in pages also stop loading a wolt's custom CSS and fonts.
+- Lodge pages can only be framed by the lodge itself.
+- The unused `/tools` routes (an any-method proxy on the lodge's address) are
+  gone.
+
 ## The lodge checks its own login
 
-- When Cloudflare Access is configured, the lodge now verifies the Access
-  token itself, on every request and websocket, and only lets the owner's email
-  in. A request that reaches the lodge without passing Cloudflare is refused.
+- **`woltspace access set`** saves the Cloudflare Access settings (team domain,
+  the lodge app's audience, your email), from this machine, with the lodge
+  running or stopped, over SSH too. Then the lodge verifies the Access token
+  on every remote request and websocket and only lets your email in.
+  `woltspace access show` and `woltspace access clear` do the obvious. The
+  cloudflare skill now saves these right after creating the Access app.
+- **Without them** the lodge keeps trusting whatever guards its way in (a
+  tunnel with Access at the edge, a tailnet). `woltspace doctor` warns that
+  anyone who reaches the address is treated as you.
+- **Other ways in.** `WOLTSPACE_ALLOWED_HOSTS` adds exact host names (a tailnet
+  or LAN name) the lodge answers to; doctor names entries that can never match.
 - Requests from this machine work as before.
+- A broken `woltspace.json` is never overwritten by the lodge anymore (it used
+  to be reset on first-run, dropping its settings).
 
 ## Public links
 
@@ -76,6 +122,9 @@ Most lodges need to do nothing. You need to act if any of these is true:
   time the app starts or the lodge restarts.
 - `woltspace doctor` now says when a tunnel token is set but the tunnel URL is
   missing, which used to leave the lodge silently unpublished.
+- **An app won't start on a port another program already holds** (another
+  user's lodge on the same machine, say). Before, the gateway would serve that
+  program under your app's name.
 
 ## Removed
 
@@ -92,10 +141,16 @@ Most lodges need to do nothing. You need to act if any of these is true:
 
 ## Known limits
 
-- Apps still inherit the lodge's environment, including its tokens. This
-  changes when secrets get a proper home, which is planned work for 0.6.
-- When the lodge is reachable remotely and Access is not configured, the lodge
-  does not yet refuse remote requests the way the app gateway does.
+- Everything runs as your OS user. Wolts and apps can still read the lodge's
+  files and environment (apps no longer get the chat, GitHub-app or Cloudflare
+  tokens since 0.5.16, but other keys still pass). Real containment needs
+  separate OS users and is planned after 0.6.
+- Without lodge-side Access settings, the lodge trusts its way in; that's
+  your choice, and doctor says so.
+- Remote wolt sites are not served yet; sites on `woltspace.app` come later.
+- The app-port check catches a port that's already taken; it doesn't yet prove
+  the process answering later is the one the lodge started.
+- Only Chromium was used for the browser checks.
 
 ## Upgrade notes
 
@@ -110,5 +165,5 @@ woltspace doctor
 woltspace status
 ```
 
-The 0.6 migration guide (`container/migrations/v0.6.0.md`) ships with the first
-release candidate.
+Read the migration guide (`container/migrations/v0.6.0.md`) first, or ask a
+wolt to walk you through it.
