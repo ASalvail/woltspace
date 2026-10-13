@@ -468,7 +468,7 @@ def _allowed_hosts_check(names: list[str]) -> DoctorCheck | None:
         except ValueError:
             pass
         lowered = name.lower().rstrip(".")
-        return (any(ch in name for ch in "/:*[]@ ") or lowered == "localhost"
+        return (not lowered or any(ch in name for ch in "/:*[]@ ") or lowered == "localhost"
                 or lowered.endswith(".localhost"))
 
     bad = [name for name in names if never_matches(name)]
