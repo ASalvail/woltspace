@@ -241,6 +241,18 @@ def stub_harness_model_discovery(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def engines_on_path(monkeypatch):
+    """Every engine counts as installed unless a test says otherwise.
+
+    Native spawns refuse an engine whose program is not on PATH. Tests that
+    create or start sessions must not depend on which CLIs this machine has;
+    the refusal itself is tested by overriding this.
+    """
+    import harnesses
+    monkeypatch.setattr(harnesses, "_engine_on_path", lambda binary: True)
+
+
+@pytest.fixture(autouse=True)
 def claude_trust_home(tmp_path_factory, monkeypatch):
     """Point Claude's trust file at a throwaway home for every test.
 

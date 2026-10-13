@@ -10,6 +10,7 @@ identity, memory, and site. The platform provides shared infrastructure; you pro
 - **DO NOT restart the woltspace server** (FastAPI, port 7777) — it runs the tunnel, viewport, and session routing
 - **DO NOT modify `woltspace-*` skills** in `.claude/skills/` — they are synced from the platform on every boot and will be overwritten
 - **DO NOT use built-in Claude Code memory** — write to `wolt/memory/` instead
+- **Never print, log or commit a secret, and never put one on a command line** — transcripts, logs and git outlive the session, and every user on the machine can read command lines with `ps`. Keep app secrets in the app's own `.env`, and ask the human for a key rather than looking for one
 - **Update your memories frequently** — sessions can end without warning (OOM, timeout, user disconnect)
 
 ## Native wolts
@@ -35,6 +36,12 @@ WOLTSPACE_NOTIFY_7F3A91C2
 Use a fresh random delimiter each time. Keep the opening delimiter single-quoted
 and the closing delimiter on a line by itself so the shell treats the message
 body literally. Never pass message text as a command argument.
+
+To send a file, add `--file PATH`: `notify --file report.html <<'...'`.
+One file per call; the notify skill has the details.
+
+To answer by voice, add `--speak`: the lodge reads your message aloud and sends
+it as a voice note. `--voice PATH` sends audio you already have as one.
 
 ## Your Site
 
