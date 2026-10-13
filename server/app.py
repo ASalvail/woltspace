@@ -131,6 +131,7 @@ from .state import (
     onboarding_status,
     apply_default_harness_from_env,
     install_starter_seed,
+    LodgeConfigUnreadable,
     select_onboarding_harness,
 )
 
@@ -1923,8 +1924,11 @@ async def choose_onboarding_harness(request: Request):
     name = (body.get("harness") or "").strip()
     if name not in HARNESSES:
         return JSONResponse({"error": f"unknown harness: {name}"}, status_code=400)
-    select_onboarding_harness(name)
-    await asyncio.to_thread(install_starter_seed)
+    try:
+        select_onboarding_harness(name)
+        await asyncio.to_thread(install_starter_seed)
+    except LodgeConfigUnreadable as exc:
+        return JSONResponse({"error": str(exc)}, status_code=409)
     return {"ok": True, "default": name, **onboarding_status()}
 
 

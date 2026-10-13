@@ -118,3 +118,23 @@ def test_doctor_reads_broken_settings_the_way_the_lodge_does(block, colony, monk
     assert check.status == "warn"
     assert "refuses every remote request" in check.detail
     assert "restore" in check.remedy and "remove" not in check.remedy
+
+
+def test_doctor_treats_an_allowed_host_as_published(colony, monkeypatch):
+    for key in ("CLOUDFLARE_TUNNEL_TOKEN", "CLOUDFLARE_TUNNEL_URL"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("WOLTSPACE_PUBLIC_TUNNEL", "false")
+    monkeypatch.setenv("WOLTSPACE_ALLOWED_HOSTS", "lodge.tail1234.ts.net")
+    check = {c.name: c for c in run_doctor(_layout(colony), check_port=False)}["remote-access"]
+    assert check.status == "warn"
+    assert "lodge.tail1234.ts.net" in check.detail
+
+
+def test_doctor_names_allowed_host_entries_that_never_match(colony, monkeypatch):
+    monkeypatch.setenv("WOLTSPACE_ALLOWED_HOSTS",
+                       "ok.example, *.ts.net, [fd00::1], host:8080, https://x.example, studio.localhost")
+    check = {c.name: c for c in run_doctor(_layout(colony), check_port=False)}["allowed-hosts"]
+    assert check.status == "warn"
+    for bad in ("*.ts.net", "[fd00::1]", "host:8080", "https://x.example", "studio.localhost"):
+        assert bad in check.detail
+    assert "ok.example" not in check.detail

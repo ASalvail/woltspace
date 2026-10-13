@@ -443,6 +443,38 @@ def _graft_runtime_lib(layout: RuntimeLayout) -> None:
         sys.path.insert(0, lib_dir)
 
 
+def _allowed_hosts_values(layout: RuntimeLayout) -> list[str]:
+    """WOLTSPACE_ALLOWED_HOSTS as the lodge will see it: shell, then the data root .env."""
+    raw = os.environ.get("WOLTSPACE_ALLOWED_HOSTS")
+    if raw is None:
+        env_file = layout.wolts_dir / ".env"
+        try:
+            from dotenv import dotenv_values
+
+            raw = dotenv_values(env_file).get("WOLTSPACE_ALLOWED_HOSTS") if env_file.is_file() else None
+        except (OSError, ImportError):
+            raw = None
+    return [name.strip() for name in (raw or "").split(",") if name.strip()]
+
+
+def _allowed_hosts_check(names: list[str]) -> DoctorCheck | None:
+    """Name WOLTSPACE_ALLOWED_HOSTS entries the lodge can never match."""
+    bad = [
+        name for name in names
+        if any(ch in name for ch in "/:*[]@ ") or name.lower().rstrip(".") == "localhost"
+        or name.lower().rstrip(".").endswith(".localhost")
+    ]
+    if not bad:
+        return None
+    return DoctorCheck(
+        "allowed-hosts", "warn",
+        "WOLTSPACE_ALLOWED_HOSTS has entries the lodge ignores or can never match: "
+        + ", ".join(bad),
+        "Use exact host names only: no scheme, port, path, brackets or wildcards "
+        "(IPv6 as fd00::1). localhost names are reserved.",
+    )
+
+
 def _remote_access_check(layout: RuntimeLayout, tunnel: dict) -> DoctorCheck | None:
     """Say plainly what a published lodge's Access settings mean for it.
 
@@ -450,8 +482,10 @@ def _remote_access_check(layout: RuntimeLayout, tunnel: dict) -> DoctorCheck | N
     still starts, and our own Cloudflare setup turns the check on. Reads the
     settings with the lodge's own loader, so doctor and server always agree.
     """
-    if not tunnel.get("enabled"):
+    hosts = _allowed_hosts_values(layout)
+    if not tunnel.get("enabled") and not hosts:
         return None
+    where = tunnel.get("url") or (", ".join(hosts) if hosts else "its public address")
     root = str(layout.install_root)
     if root not in sys.path:
         sys.path.insert(0, root)
@@ -476,8 +510,8 @@ def _remote_access_check(layout: RuntimeLayout, tunnel: dict) -> DoctorCheck | N
     return DoctorCheck(
         "remote-access", "warn",
         "the lodge is published without its own Access check: anyone who reaches "
-        f"{tunnel.get('url') or 'its public address'} is treated as you, unless "
-        "Cloudflare Access in front of it stops them first",
+        f"{where} is treated as you, unless whatever guards that way in "
+        "(e.g. Cloudflare Access) stops them first",
         "Run `woltspace access set` on this machine (or open Settings > Access) so the "
         "lodge verifies every remote request itself. The cloudflare skill explains "
         "where each value comes from.",
@@ -523,6 +557,9 @@ def run_doctor(
     remote = _remote_access_check(layout, tunnel_settings(layout))
     if remote is not None:
         checks.append(remote)
+    hosts_check = _allowed_hosts_check(_allowed_hosts_values(layout))
+    if hosts_check is not None:
+        checks.append(hosts_check)
     default_harness = _default_harness_check()
     if default_harness is not None:
         checks.append(default_harness)

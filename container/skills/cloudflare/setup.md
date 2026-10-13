@@ -55,6 +55,7 @@ Tell the human:
 > - **Account / Cloudflare Tunnel: Edit**
 > - **Zone / DNS: Edit** (scoped to your domain)
 > - **Account / Access: Apps and Policies: Edit** (for auth — optional but recommended)
+> - **Account / Access: Organizations, Identity Providers, and Groups: Read** (to read the team domain for the lodge's own Access check)
 >
 > Also grab your **Account ID** and **Zone ID** from the Cloudflare dashboard → your domain → Overview page (right sidebar).
 
