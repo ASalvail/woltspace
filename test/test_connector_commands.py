@@ -765,3 +765,112 @@ def test_owner_resolution_refuses_a_new_done_without_its_session(lodge):
     with pytest.raises(ConnectorError):
         lodge.store.resolve_operation("tg", "p9", session="softie-1", abandon=True)
     assert lodge.store.operation("tg", "bot:1\x00p9")["state"] == "uncertain"
+
+
+# ------------------------------------------- round 4: boundaries that hold
+
+
+def test_a_commands_own_reply_cannot_reenter_a_command(lodge):
+    """Astre's probe: start advances the clock past the retry delay; the reply's sweep must not dispatch inside the lock."""
+    who = lodge.store.authenticate(lodge.token)
+
+    def start(wolt, prompt, routing):
+        lodge.clock.now += 31
+        return lodge.sessions.start(wolt, prompt, routing)
+
+    lodge.store.router.commands.start = start
+    done = []
+    worker = _run(lambda: done.append(lodge.store.accept_event(who, _event_payload("e1", "u2", "c2", "/new softie"))))
+    worker.join(5)
+    assert not worker.is_alive(), "a nested dispatch deadlocked on the command lock"
+    assert done[0][1]["outcome"] == "created" and len(lodge.sessions.started) == 1
+
+
+@pytest.mark.parametrize("command", ["new", "kill"])
+def test_a_grant_withdrawn_at_the_effect_boundary_stops_the_effect(lodge, command):
+    who = lodge.store.authenticate(lodge.token)
+    binding = _binding(lodge, "u2")
+    lodge.sessions.states["softie-9"] = "running"
+    lodge.store.associate_session("tg", binding, "softie-9", via="routed", wolt="softie")
+    real = lodge.store.settle_operation
+
+    def settle(instance, key, state, **fields):
+        if state == "effect_in_progress":
+            # The owner withdraws the grant after the reservation, right before the effect.
+            lodge.store.bind("tg", sender="u2", conversation="c2", default_wolt="softie", selectable_wolts=["softie", "otter"])
+        return real(instance, key, state, **fields)
+
+    lodge.store.settle_operation = settle
+    text = "/new softie" if command == "new" else "/kill softie-9"
+    status, body = lodge.store.accept_event(who, _event_payload("e1", "u2", "c2", text))
+    assert body["reason"] == "grant_withdrawn"
+    assert lodge.sessions.started == [] and lodge.sessions.stopped == []
+    record = lodge.store.operation("tg", "bot:1\x00e1")
+    # Settled (or, the narrowed grant being a new binding, swept with the old one); never left mid-effect.
+    assert record is None or record["state"] in ("answered", "failed")
+
+
+def test_a_grant_withdrawn_while_waiting_for_the_lock_is_seen(lodge):
+    who = lodge.store.authenticate(lodge.token)
+    binding = _binding(lodge, "u2")
+    lodge.sessions.states["softie-9"] = "running"
+    lodge.store.associate_session("tg", binding, "softie-9", via="routed", wolt="softie")
+    out = []
+    with lodge.store.command_lock(binding):
+        worker = _run(lambda: out.append(lodge.store.accept_event(who, _event_payload("k", "u2", "c2", "/kill softie-9"))))
+        worker.join(0.3)
+        assert worker.is_alive()
+        lodge.store.bind("tg", sender="u2", conversation="c2", default_wolt="softie", selectable_wolts=["softie"])
+    worker.join(5)
+    assert out[0][1]["reason"] == "no_grant" and lodge.sessions.stopped == []
+
+
+def test_the_real_registry_shape_is_read_without_raising(monkeypatch):
+    import types
+
+    from server import connector_commands
+
+    records = [
+        {"name": "a-1", "routing": [{"adapter": "telegram", "chat_id": "1"}]},
+        {"name": "a-2", "routing": None},
+        {"name": "a-3", "routing": [{"adapter": "telegram", "operation": "bot:1\x00e7"}]},
+    ]
+    fake = types.ModuleType("sessions")
+    fake.SessionRegistry = lambda: types.SimpleNamespace(list=lambda: records)
+    monkeypatch.setitem(sys.modules, "sessions", fake)
+    assert connector_commands._default_find("bot:1\x00nope") is None
+    assert connector_commands._default_find("bot:1\x00e7") == "a-3"
+
+
+def test_a_start_that_spawned_and_then_raised_is_parked_not_released(lodge):
+    """Astre's probe: the session layer spawns, then its bookkeeping fails."""
+    who = lodge.store.authenticate(lodge.token)
+    lodge.store.router.commands.find = lambda key: None
+
+    def start(wolt, prompt, routing):
+        lodge.sessions.start(wolt, prompt, routing)
+        raise RuntimeError("registry update failed after spawn")
+
+    lodge.store.router.commands.start = start
+    status, body = lodge.store.accept_event(who, _event_payload("n1", "u2", "c2", "/new softie"))
+    assert body["outcome"] == "uncertain"
+    assert lodge.store.operation("tg", "bot:1\x00n1")["state"] == "uncertain"
+    status, body = lodge.store.accept_event(who, _event_payload("n2", "u2", "c2", "/new softie"))
+    assert body["reason"] == "concurrency_limited"            # the parked one still holds its slot
+    assert len(lodge.sessions.started) == 1
+
+
+@pytest.mark.parametrize("still_running", [False, True])
+def test_a_stop_that_raised_is_judged_by_the_session_not_the_exception(lodge, still_running):
+    who = lodge.store.authenticate(lodge.token)
+    lodge.sessions.states["softie-9"] = "running"
+    lodge.store.associate_session("tg", _binding(lodge, "u2"), "softie-9", via="routed", wolt="softie")
+
+    def stop(name):
+        if not still_running:
+            lodge.sessions.states[name] = "stopped"
+        raise RuntimeError("stop bookkeeping failed")
+
+    lodge.store.router.commands.stop = stop
+    status, body = lodge.store.accept_event(who, _event_payload("k", "u2", "c2", "/kill softie-9"))
+    assert body["outcome"] == ("uncertain" if still_running else "stopped")

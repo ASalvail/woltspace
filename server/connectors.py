@@ -552,9 +552,11 @@ class ConnectorStore:
         fd = os.open(directory / f"{name}.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
+            self._held.nested = getattr(self._held, "nested", 0) + 1
             try:
                 yield
             finally:
+                self._held.nested -= 1
                 fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
@@ -577,7 +579,11 @@ class ConnectorStore:
         a crash between the write and the dispatch loses that notification.
         """
         tx = _Tx()
-        tx.dispatch = dispatch and self.router is not None
+        # Never claim or run a handoff from inside another one, nor while
+        # this thread holds a command lock: the nested dispatch could need
+        # that same lock (or another binding's, in a cycle). Unclaimed work
+        # stays for the next read made outside.
+        tx.dispatch = dispatch and self.router is not None and not getattr(self._held, "nested", 0)
         try:
             with self._lock():
                 try:
@@ -1539,10 +1545,13 @@ class ConnectorStore:
             record["event"]["binding"] = dict(current)
             self._save_queue(instance_id, queue)
             event = AcceptedEvent.from_record(record["event"])
+        self._held.nested = getattr(self._held, "nested", 0) + 1
         try:
             routed = self.router(event) or {}
         except Exception as exc:
             routed = {"routed": "error", "error": str(exc)[: self.limits.error_max_chars]}
+        finally:
+            self._held.nested -= 1
         with self._lock():
             queue = self._queue(instance_id)
             record = queue.inbound.get(key)
@@ -1854,7 +1863,8 @@ class ConnectorStore:
             return dict(record)
 
     def settle_operation(
-        self, instance_id: str, key: str, state: str, *, expect: tuple[str, ...] | None = None, **fields,
+        self, instance_id: str, key: str, state: str, *, expect: tuple[str, ...] | None = None,
+        grant: str | None = None, **fields,
     ) -> dict:
         """Move an operation on: effect_in_progress, started(session), associated, answered, failed, uncertain.
 
@@ -1872,6 +1882,23 @@ class ConnectorStore:
             if record is None:
                 raise ConnectorError(409, "unknown_operation")
             current = record["state"]
+            if grant is not None and state == "effect_in_progress":
+                # The durable effect boundary: the binding, its instance, the
+                # channel's runtime and the grant are read again here, in the
+                # same locked write that lets the effect happen.
+                registry = self._registry()
+                binding = next((b for b in registry["bindings"] if b["binding_id"] == record["binding_id"]), None)
+                instance = registry["instances"].get(instance_id)
+                allowed = (
+                    binding is not None and instance is not None and instance.get("enabled")
+                    and self.runtime_active(instance.get("channel", ""))
+                )
+                if allowed and grant == "create":
+                    allowed = bool(binding.get("may_create")) and record.get("wolt") in (binding.get("selectable_wolts") or [])
+                elif allowed and grant == "stop":
+                    allowed = bool(binding.get("may_stop_own_sessions"))
+                if not allowed:
+                    raise ConnectorError(409, "grant_withdrawn")
             # Fenced: a transition applies only from the state its caller saw,
             # and nothing moves an operation out of answered, nor out of
             # failed/uncertain (the owner's word) except to record the answer.

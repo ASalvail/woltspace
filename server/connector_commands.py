@@ -35,7 +35,14 @@ and never repeats the effect. An operation found `effect_in_progress` after
 a crash is never run again on its own: a `/new` is reconciled at the
 session boundary by the nonce the start carried in its routing
 (`operation`) and parked as `uncertain` if no session answers to it; a
-`/kill` is done if the session no longer runs and parked otherwise. A
+`/kill` is done if the session no longer runs and parked otherwise. (Today's
+session layer does not carry that nonce through `start_session`, so a real
+start whose outcome is unknown is parked.) A start or stop that raises is
+not proof that nothing happened: it is reconciled or parked the same way,
+and its reservation is kept. The grant, binding, instance and runtime are
+read again in the very write that marks `effect_in_progress`. While a
+command lock is held, the store never dispatches another handoff in the
+same thread, so a command's own replies cannot re-enter a command. A
 parked operation keeps its reservation until the owner resolves it
 (`woltspace connector operations --done/--abandon`); an owner retry of the
 event only replays the parked answer. Resumed work re-checks the current
@@ -103,12 +110,22 @@ def _default_live(session: str) -> str | None:
 
 
 def _default_find(operation: str) -> str | None:
-    """The session whose routing carries this operation nonce, if a start registered one."""
+    """The session whose routing carries this operation nonce, if the session layer kept one.
+
+    Today's `start_session` keeps only adapter/chat_id/user_id/thread_ts
+    from the routing it is given, and the registry stores routing as a list
+    of adapter entries, so a real start does not carry the nonce: this
+    answers None and an unknown outcome is parked for the owner. It reads
+    either shape and never raises.
+    """
     from sessions import SessionRegistry
 
     for record in SessionRegistry().list():
-        if (record.get("routing") or {}).get("operation") == operation:
-            return record.get("name")
+        routing = record.get("routing")
+        entries = routing if isinstance(routing, list) else [routing]
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("operation") == operation:
+                return record.get("name")
     return None
 
 
@@ -245,6 +262,13 @@ class Commands:
                 pass
         return result
 
+    def _found(self, key: str) -> str | None:
+        """Ask the session boundary by nonce; any failure there is 'not known', never a crash."""
+        try:
+            return self.find(key) or None
+        except Exception:  # noqa: BLE001
+            return None
+
     def _target_allowed(self, event: AcceptedEvent, session: str) -> bool:
         """The session's real wolt is one this binding may talk to now; unknown is no."""
         wolt = self.wolt_of(session)
@@ -339,7 +363,7 @@ class Commands:
         if state == "effect_in_progress":
             # The start may or may not have happened: never run it again. Ask the
             # session boundary by the nonce; otherwise park it for the owner.
-            session = self.find(key)
+            session = self._found(key)
             if session is None:
                 self.store.settle_operation(event.instance_id, key, "uncertain", expect=("effect_in_progress",))
                 self._tell(event, f"🪵 a session for {wolt} may or may not have started; the owner has to look")
@@ -349,13 +373,30 @@ class Commands:
         if state == "reserved":
             routing = {"adapter": event.channel, "chat_id": event.conversation["provider_id"], "binding_id": binding_id, "operation": key}
             # Written before the call: a crash from here on is reconciled or parked, never rerun.
-            self.store.settle_operation(event.instance_id, key, "effect_in_progress", expect=("reserved",))
+            try:
+                # The durable effect boundary: the grant, the binding, the
+                # instance and the runtime are checked in this same write.
+                self.store.settle_operation(event.instance_id, key, "effect_in_progress", expect=("reserved",), grant="create")
+            except ConnectorError as exc:
+                if exc.reason != "grant_withdrawn":
+                    raise
+                self.store.settle_operation(event.instance_id, key, "failed", expect=("reserved",))
+                self._tell(event, "🪵 this chat may not start sessions now; ask the owner")
+                return self._done(event, "new", "refused", reason="grant_withdrawn", wolt=wolt)
             try:
                 result = self.start(wolt, "", routing)
-            except Exception as exc:  # noqa: BLE001 - the session layer's reason, shortened, is the answer
-                self.store.settle_operation(event.instance_id, key, "failed", expect=("effect_in_progress",))
-                self._tell(event, f"🪵 could not start a session for {wolt}: {str(exc)[:200]}")
-                return self._done(event, "new", "failed", wolt=wolt)
+            except Exception as exc:  # noqa: BLE001
+                # Not proven to have failed before the effect (the session
+                # layer may spawn and then fail its bookkeeping): reconcile
+                # by nonce or park, keeping the reservation; never release it.
+                session = self._found(key)
+                if session is None:
+                    self.store.settle_operation(
+                        event.instance_id, key, "uncertain", expect=("effect_in_progress",), note=str(exc)[:200],
+                    )
+                    self._tell(event, f"🪵 starting a session for {wolt} went wrong and it may or may not exist; the owner has to look")
+                    return self._done(event, "new", "uncertain", wolt=wolt)
+                result = {"name": session}
             session = str(result.get("name", ""))
             self.store.settle_operation(event.instance_id, key, "started", expect=("effect_in_progress",), session=session)
             state = "started"
@@ -420,13 +461,27 @@ class Commands:
         if self.live(argument) not in LIVE_STATES:
             self._tell(event, f"🌙 {argument} is stopped")
             return self._done(event, "kill", "stopped", session=argument)
-        self.store.settle_operation(event.instance_id, key, "effect_in_progress", expect=("reserved",), session=argument)
+        try:
+            self.store.settle_operation(
+                event.instance_id, key, "effect_in_progress", expect=("reserved",), grant="stop", session=argument,
+            )
+        except ConnectorError as exc:
+            if exc.reason != "grant_withdrawn":
+                raise
+            self.store.settle_operation(event.instance_id, key, "failed", expect=("reserved",))
+            self._tell(event, "🪵 this chat may not stop sessions now; ask the owner")
+            return self._done(event, "kill", "refused", reason="grant_withdrawn", session=argument)
         try:
             self.stop(argument)
         except Exception as exc:  # noqa: BLE001
-            self.store.settle_operation(event.instance_id, key, "failed", expect=("effect_in_progress",))
-            self._tell(event, f"🪵 could not stop {argument}: {str(exc)[:200]}")
-            return self._done(event, "kill", "failed", session=argument)
+            # Done if the session no longer runs; otherwise not proven either
+            # way: parked for the owner, never retried on its own.
+            if self.live(argument) in LIVE_STATES:
+                self.store.settle_operation(
+                    event.instance_id, key, "uncertain", expect=("effect_in_progress",), note=str(exc)[:200],
+                )
+                self._tell(event, f"🪵 stopping {argument} went wrong and it still runs; the owner has to look")
+                return self._done(event, "kill", "uncertain", session=argument)
         self.store.settle_operation(event.instance_id, key, "started", expect=("effect_in_progress",), session=argument)
         self._tell(event, f"🌙 stopped {argument}")
         return self._done(event, "kill", "stopped", session=argument)
