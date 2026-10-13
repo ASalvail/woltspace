@@ -82,6 +82,10 @@ class NotOwner(RuntimeError):
     """The run lock is not held by this process: no provider call is allowed."""
 
 
+class StartRefused(RuntimeError):
+    """The lodge did not admit the connector at start (no state, or no run lock named)."""
+
+
 class OwnershipLost(RuntimeError):
     """The fence tripped between two provider calls of one operation."""
 
@@ -139,6 +143,8 @@ class TelegramConnector:
         self.started = False
         self.run_lock: str | None = None
         self._run_lock_handle = None
+        # Once stopped, nothing starts again on its own: only an explicit start().
+        self._stopped = False
 
     # ----------------------------------------------------------------- lodge
 
@@ -161,36 +167,62 @@ class TelegramConnector:
         provider call always ends before the lock does). Already held means
         another connector runs for this channel: refuse to start.
         """
-        state = (await self._lodge("GET", "/state")).json()
-        self.cursor = state.get("cursor")
-        self.run_lock = state.get("run_lock")
-        if self.run_lock and self._run_lock_handle is None:
+        response = await self._lodge("GET", "/state")
+        if response.status_code != 200:
+            raise StartRefused(f"the lodge answered {response.status_code} to the state request")
+        try:
+            state = response.json()
+        except ValueError:
+            raise StartRefused("the lodge's state answer is not JSON") from None
+        run_lock = state.get("run_lock") if isinstance(state, dict) else None
+        if not isinstance(run_lock, str) or not run_lock:
+            raise StartRefused("the lodge named no run lock; not starting")
+        if self._run_lock_handle is None:
             import fcntl
             from pathlib import Path
 
-            Path(self.run_lock).parent.mkdir(parents=True, exist_ok=True)
-            handle = open(self.run_lock, "a+")
+            try:
+                Path(run_lock).parent.mkdir(parents=True, exist_ok=True)
+                handle = open(run_lock, "a+")
+            except OSError as exc:
+                raise StartRefused(f"cannot open the run lock {run_lock}: {exc}") from None
             try:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 handle.close()
-                raise NotOwner(f"another connector already runs for this channel ({self.run_lock})") from None
+                raise NotOwner(f"another connector already runs for this channel ({run_lock})") from None
+            except OSError as exc:
+                handle.close()
+                raise StartRefused(f"cannot take the run lock {run_lock}: {exc}") from None
             self._run_lock_handle = handle
+        self.run_lock = run_lock
+        self.cursor = state.get("cursor")
         self.started = True
+        self._stopped = False
         return state
 
+    async def _ensure_started(self) -> None:
+        if self._stopped:
+            raise NotOwner("stopped; start() again before any call")
+        if not self.started:
+            await self.start()
+
     def holds_run_lock(self) -> bool:
-        return self._run_lock_handle is not None or not self.run_lock
+        """Only an actually held handle counts; no path, no handle, no exemption."""
+        return self._run_lock_handle is not None
 
     def stop(self) -> None:
         """Give the run lock back. Only once both loops and every call of theirs have ended:
-        the runner calls it last, after `gather` returned; tests call it to run two connectors."""
+        the runner calls it last, after both tasks were cancelled and awaited; tests call
+        it to run two connectors. After it, no provider call is allowed until `start()` again."""
         if self._run_lock_handle is not None:
             import fcntl
 
             fcntl.flock(self._run_lock_handle.fileno(), fcntl.LOCK_UN)
             self._run_lock_handle.close()
             self._run_lock_handle = None
+        self.started = False
+        self._stopped = True
 
     def _require_lock(self) -> None:
         if not self.holds_run_lock():
@@ -345,8 +377,7 @@ class TelegramConnector:
         nothing after it is answered, so the posted cursor never passes an
         unanswered fetched update.
         """
-        if not self.started:
-            await self.start()
+        await self._ensure_started()
         report = Report(cursor=self.cursor)
         if not await self.owns_channel():
             report.fenced = True
@@ -464,8 +495,7 @@ class TelegramConnector:
         return message_ids, None, False
 
     async def lease_batch(self, *, max_items: int = 10, wait: float = 0) -> dict:
-        if not self.started:
-            await self.start()
+        await self._ensure_started()
         self._require_lock()
         return (await self._lodge("POST", "/deliveries/lease", json={"max": max_items, "wait": wait})).json()
 

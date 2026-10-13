@@ -567,7 +567,9 @@ async def test_the_fence_sits_before_every_provider_call_not_every_delivery(tmp_
 
     def lodge(request):
         if request.url.path.endswith("/state"):
-            return httpx.Response(200, json={"runtime_active": active[0], "paused": False, "cursor": 8})
+            return httpx.Response(200, json={
+                "runtime_active": active[0], "paused": False, "cursor": 8, "run_lock": str(tmp_path / "run.lock"),
+            })
         if request.url.path.endswith("/ack"):
             acks.append(json.loads(request.content))
         return httpx.Response(200, json={"ok": True})
@@ -696,3 +698,167 @@ async def test_the_runner_holds_the_lock_through_both_loops_and_their_calls(lodg
     assert is_held()
     connector.stop()
     assert not is_held()
+
+
+# ------------------------------------------- round 4: shutdown and fail-closed start
+
+
+async def test_run_cancels_and_awaits_the_sibling_loop_before_returning():
+    """Astre's probe: inbound refused while outbound is held in a provider operation."""
+    import woltspace_telegram.runner as runner
+    from woltspace_telegram import LodgeRefused
+
+    entered = asyncio.Event()
+    completed = asyncio.Event()
+
+    class Fake:
+        async def start(self):
+            return {}
+
+        async def poll_once(self, **kwargs):
+            await entered.wait()
+            raise LodgeRefused("revoked")
+
+        async def deliver_once(self, **kwargs):
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                completed.set()
+
+    result = await runner.run(Fake(), bot_token="FAKE")
+    assert (result, completed.is_set()) == (1, True)
+    assert [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and t.get_name() in ("inbound", "outbound")] == []
+
+
+async def test_a_competing_run_lock_stays_refused_until_the_held_operation_cleans_up(lodge, api, monkeypatch):
+    import fcntl
+    import woltspace_telegram.runner as runner
+    from woltspace_telegram import LodgeRefused
+
+    lock_path = lodge.store.root / "run-telegram.lock"
+    entered = asyncio.Event()
+    completed = asyncio.Event()
+    connector = _connector(lodge, api)
+
+    async def poll_refused(**kwargs):
+        await entered.wait()
+        raise LodgeRefused("revoked")
+
+    async def deliver_held(**kwargs):
+        entered.set()
+        try:
+            await asyncio.Event().wait()       # a provider operation that never answers
+        finally:
+            await asyncio.sleep(0.05)          # its cleanup takes a moment
+            completed.set()
+
+    monkeypatch.setattr(connector, "poll_once", poll_refused)
+    monkeypatch.setattr(connector, "deliver_once", deliver_held)
+
+    def competing_acquire() -> bool:
+        with open(lock_path, "a+") as probe:
+            try:
+                fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+            return True
+
+    run_task = asyncio.create_task(runner.run(connector, bot_token=BOT_TOKEN))
+    await entered.wait()
+    assert competing_acquire() is False          # the held operation is in flight
+    assert await run_task == 1
+    assert completed.is_set()                    # cleanup finished before run returned
+    assert competing_acquire() is False          # and the lock is still held until stop()
+    connector.stop()
+    assert competing_acquire() is True
+
+
+async def test_cancelling_the_run_cancels_both_loops_before_the_lock_goes(lodge, api, monkeypatch):
+    import woltspace_telegram.runner as runner
+
+    connector = _connector(lodge, api)
+    finished = []
+
+    async def forever(**kwargs):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            finished.append(1)
+
+    monkeypatch.setattr(connector, "poll_once", forever)
+    monkeypatch.setattr(connector, "deliver_once", forever)
+    run_task = asyncio.create_task(runner.run(connector, bot_token=BOT_TOKEN))
+    await asyncio.sleep(0.05)
+    run_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run_task
+    assert finished == [1, 1]
+    assert connector.holds_run_lock()
+    connector.stop()
+
+
+@pytest.mark.parametrize("answer", [
+    ("503", lambda tmp: httpx.Response(503, json={"error": "temporary"})),
+    ("not json", lambda tmp: httpx.Response(200, content=b"<html>")),
+    ("not an object", lambda tmp: httpx.Response(200, json=["x"])),
+    ("no run lock", lambda tmp: httpx.Response(200, json={"runtime_active": True, "paused": False})),
+    ("empty run lock", lambda tmp: httpx.Response(200, json={"runtime_active": True, "run_lock": ""})),
+])
+async def test_start_fails_closed_without_an_admitted_state_and_a_run_lock(tmp_path, answer):
+    """Finding 2: a bad first state answer never becomes a started connector."""
+    from woltspace_telegram import NotOwner, StartRefused
+
+    label, first = answer
+    calls = []
+    n = [0]
+
+    def lodge(request):
+        n[0] += 1
+        if n[0] == 1:
+            return first(tmp_path)
+        return httpx.Response(200, json={"runtime_active": True, "paused": False, "run_lock": str(tmp_path / "run.lock")})
+
+    def bot(request):
+        calls.append(request.url.path)
+        return httpx.Response(200, json={"ok": True, "result": []})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lodge), base_url="http://fixture.invalid") as lc, httpx.AsyncClient(transport=httpx.MockTransport(bot), base_url=BOT_API) as bc:
+        connector = TelegramConnector(lc, bc, bot_token="FAKE", connector_token="FAKE")
+        with pytest.raises(StartRefused):
+            await connector.start()
+        assert connector.started is False and connector.holds_run_lock() is False
+        # A later good state answer does not repair it: nothing reaches the provider.
+        with pytest.raises(NotOwner):
+            await connector._call("getUpdates")
+        with pytest.raises(NotOwner):
+            await connector._confirm() if False else connector._require_lock()
+        assert calls == []
+        # Started properly, it works; stopped, it refuses again.
+        await connector.start()
+        assert connector.holds_run_lock()
+        await connector._call("getUpdates")
+        assert len(calls) == 1
+        connector.stop()
+        with pytest.raises(NotOwner):
+            await connector._call("getUpdates")
+        assert len(calls) == 1 and connector.started is False
+
+
+async def test_provider_calls_before_start_and_after_stop_are_refused(lodge, api):
+    from woltspace_telegram import NotOwner
+
+    connector = _connector(lodge, api)
+    with pytest.raises(NotOwner):
+        await connector._call("getUpdates")
+    with pytest.raises(NotOwner):
+        await connector._upload_call("sendDocument", "document", b"x", "x", {"chat_id": "1"})
+    assert api.calls == []
+    await connector.start()
+    connector.stop()
+    with pytest.raises(NotOwner):
+        await connector.poll_once(timeout=0)
+    with pytest.raises(NotOwner):
+        await connector.deliver_once()
+    assert api.calls == []

@@ -15,7 +15,7 @@ import sys
 
 import httpx
 
-from . import LEASE_WAIT, LodgeRefused, NotOwner, TelegramConnector, redact
+from . import LEASE_WAIT, LodgeRefused, NotOwner, StartRefused, TelegramConnector, redact
 
 logger = logging.getLogger("woltspace_telegram")
 
@@ -69,12 +69,19 @@ def connector_token() -> str:
 
 
 async def run(connector: TelegramConnector, *, bot_token: str) -> int:
+    """Both loops, owned together: neither outlives the other.
+
+    Whatever ends the run (a refusal from the lodge, an unexpected error in
+    one loop, or this task being cancelled), both loop tasks are cancelled
+    and awaited to completion before `run` returns, so every provider call
+    and its cleanup has ended by the time the caller releases the run lock.
+    """
     try:
         state = await connector.start()
     except LodgeRefused:
         logger.error("the lodge refused the connector token; exiting")
         return 1
-    except NotOwner as exc:
+    except (NotOwner, StartRefused) as exc:
         logger.error("%s; exiting", exc)
         return 1
     logger.info("started: cursor=%s paused=%s owned=%s", state.get("cursor"), state.get("paused"), state.get("runtime_active"))
@@ -103,12 +110,27 @@ async def run(connector: TelegramConnector, *, bot_token: str) -> int:
                 logger.warning("deliver failed: %s", redact(exc, bot_token))
                 await asyncio.sleep(2)
 
+    tasks = [asyncio.create_task(inbound(), name="inbound"), asyncio.create_task(outbound(), name="outbound")]
+    code = 0
     try:
-        await asyncio.gather(inbound(), outbound())
-    except LodgeRefused:
-        logger.error("the lodge refused the connector token; exiting")
-        return 1
-    return 0
+        done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+        for task in done:
+            if task.cancelled():
+                continue
+            error = task.exception()
+            if isinstance(error, LodgeRefused):
+                logger.error("the lodge refused the connector token; exiting")
+                code = 1
+            elif error is not None:
+                logger.error("%s loop failed: %s", task.get_name(), redact(error, bot_token))
+                code = 1
+    finally:
+        # On every way out, cancellation of this task included: both loops
+        # are cancelled and awaited, so no provider call is in flight after here.
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    return code
 
 
 async def main() -> int:
