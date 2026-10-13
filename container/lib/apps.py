@@ -380,6 +380,13 @@ def start_app(name: str) -> dict:
     # started here is the one that ends up answering (external races, PID
     # reuse, a wrapper whose server moved ports remain open).
     with _PORT_START_LOCK:
+        # Re-check managed apps inside the lock: another app may have been
+        # spawned on this port since the scan above, and its child may not
+        # have bound yet, so the probe alone would still see a free port. The
+        # state written below, inside the same lock, is the reservation.
+        for r in running_apps():
+            if r["port"] == port and r["name"] != name:
+                raise RuntimeError(f"Port {port} already in use by running app '{r['name']}'")
         holder = _port_answers(port)
         if holder:
             print(f"[apps] refusing to start {name}: port {port} already answers on {holder}")
