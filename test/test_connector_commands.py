@@ -59,6 +59,9 @@ class Sessions:
     def resume(self, session, prompt):
         return {"status": "revived"}
 
+    def wolt_of(self, name):
+        return name.rsplit("-", 1)[0] if name in self.states else None
+
 
 class Clock:
     def __init__(self):
@@ -75,8 +78,9 @@ def lodge(tmp_path, monkeypatch):
     sessions = Sessions()
     router = Router(
         store, uploads_root=tmp_path / "space", deliver=sessions.deliver, resume=sessions.resume,
-        resolve=sessions.resolve, wolts_dir=tmp_path,
-        commands=Commands(store, start=sessions.start, stop=sessions.stop, live=sessions.live, resolve=sessions.resolve),
+        resolve=sessions.resolve, wolts_dir=tmp_path, wolt_of=sessions.wolt_of,
+        commands=Commands(store, start=sessions.start, stop=sessions.stop, live=sessions.live, resolve=sessions.resolve,
+                          wolt_of=sessions.wolt_of),
     )
     store.router = router
     store.add_instance("tg", "telegram", "bot:1")
@@ -480,7 +484,7 @@ def test_an_effect_of_unknown_outcome_is_parked_and_only_the_owner_resolves_it(l
     lodge.clock.now += 31
     lodge.store.lease(who, 1)
     assert lodge.store.operation("tg", "bot:1\x00p3")["state"] == "uncertain"
-    assert lodge.store.resolve_operation("tg", "p3", session=None) is True
+    assert lodge.store.resolve_operation("tg", "p3", abandon=True) is True
     assert lodge.store.operation("tg", "bot:1\x00p3")["state"] == "failed"
     lodge.clock.now += 3601
     assert lodge.store.accept_event(who, _event_payload("p4", "u2", "c2", "/new otter"))[1]["outcome"] == "created"
@@ -606,3 +610,158 @@ async def test_a_revoked_wolt_selection_does_not_persist(lodge):
         listed = await _say(lodge, connector, "u2", "c2", "/sessions")
         assert listed["count"] == 2
     assert [s for s, _ in lodge.sessions.pasted] == ["otter-1", "softie-1"]
+
+
+# --------------------------------------------- round 3: one command at a time
+
+
+def _run(target):
+    import threading
+
+    thread = threading.Thread(target=target)
+    thread.start()
+    return thread
+
+
+def test_a_live_sample_cannot_go_stale_while_another_command_completes(lodge):
+    """Astre's probe: A samples live sessions, B completes a /new, A resumes. One start."""
+    import threading
+
+    lodge.store.bind("tg", sender="u2", conversation="c2", default_wolt="softie", selectable_wolts=["softie"],
+                     may_create=True, create_per_hour=10, create_concurrent=1)
+    who = lodge.store.authenticate(lodge.token)
+    real = lodge.store.reserve_create
+    sampled, proceed = threading.Event(), threading.Event()
+
+    def reserve(instance, key, *args):
+        if key.endswith("slow"):
+            sampled.set()
+            assert proceed.wait(5)
+        return real(instance, key, *args)
+
+    lodge.store.reserve_create = reserve
+    slow = _run(lambda: lodge.store.accept_event(who, _event_payload("slow", "u2", "c2", "/new softie")))
+    assert sampled.wait(5)
+    fast = _run(lambda: lodge.store.accept_event(who, _event_payload("fast", "u2", "c2", "/new softie")))
+    fast.join(0.3)
+    assert fast.is_alive()                     # waits for the binding's command lock
+    proceed.set()
+    slow.join(5)
+    fast.join(5)
+    assert len(lodge.sessions.started) == 1
+
+
+@pytest.mark.parametrize("command", ["new", "kill"])
+def test_a_stale_attempt_cannot_redo_or_overwrite_a_finished_operation(lodge, command):
+    """Astre's probe: A pauses before effect_in_progress, a retry of the same event runs; one effect."""
+    import threading
+
+    who = lodge.store.authenticate(lodge.token)
+    lodge.sessions.states["softie-9"] = "running"
+    if command == "kill":
+        lodge.store.associate_session("tg", _binding(lodge, "u2"), "softie-9", via="routed", wolt="softie")
+    text = "/new softie" if command == "new" else "/kill softie-9"
+    real = lodge.store.settle_operation
+    paused, go = threading.Event(), threading.Event()
+    first = [True]
+
+    def settle(instance, key, state, **fields):
+        if state == "effect_in_progress" and first[0]:
+            first[0] = False
+            paused.set()
+            assert go.wait(5)
+        return real(instance, key, state, **fields)
+
+    lodge.store.settle_operation = settle
+    a = _run(lambda: lodge.store.accept_event(who, _event_payload("same", "u2", "c2", text)))
+    assert paused.wait(5)
+    lodge.clock.now += 31
+    b = _run(lambda: lodge.store.lease(who, 1))          # the sweep's retry of the same event
+    b.join(0.3)
+    assert b.is_alive()                                  # it waits for A's command lock
+    go.set()
+    a.join(5)
+    b.join(5)
+    effects = lodge.sessions.started if command == "new" else lodge.sessions.stopped
+    assert len(effects) == 1
+    record = lodge.store.operation("tg", "bot:1\x00same")
+    assert record["state"] == "answered"
+    # And a stale transition can never move it again.
+    with pytest.raises(ConnectorError):
+        real("tg", "bot:1\x00same", "effect_in_progress", expect=("reserved",))
+    with pytest.raises(ConnectorError):
+        real("tg", "bot:1\x00same", "started")
+
+
+def test_replies_and_kill_check_the_target_sessions_real_wolt(lodge):
+    """Astre's probe: after otter leaves the selectable set, neither a reply nor /kill reaches otter's session."""
+    who = lodge.store.authenticate(lodge.token)
+    lodge.sessions.states.update({"otter-1": "running", "softie-1": "running"})
+    lodge.store.accept_event(who, _event_payload("pick", "u2", "c2", "/wolt otter"))
+    lodge.store.accept_event(who, _event_payload("hi", "u2", "c2", "hello"))
+    assert lodge.sessions.pasted[-1][0] == "otter-1"
+    binding = _binding(lodge, "u2")
+    assert lodge.store.routing_state("tg", binding)["sessions"]["otter-1"]["wolt"] == "otter"
+    delivery = lodge.store.enqueue(channel="telegram", account="bot:1", conversation="c2", text="reply here",
+                                   session="otter-1", binding_id=binding)
+    lodge.store.bind("tg", sender="u2", conversation="c2", default_wolt="softie", selectable_wolts=["softie"],
+                     may_create=True, may_stop_own_sessions=True, create_per_hour=2, create_concurrent=1)
+    pasted = len(lodge.sessions.pasted)
+    status, body = lodge.store.accept_event(who, _event_payload("re", "u2", "c2", "again", reply_to={"delivery_id": delivery}))
+    assert body["reason"] == "reply_target_not_allowed"
+    assert len(lodge.sessions.pasted) == pasted
+    status, body = lodge.store.accept_event(who, _event_payload("k", "u2", "c2", "/kill otter-1"))
+    assert body["outcome"] == "refused" and lodge.sessions.stopped == []
+    # A session whose wolt cannot be verified is refused too, never given the current selection.
+    lodge.store.associate_session("tg", binding, "mystery", via="routed", wolt="softie")
+    lodge.sessions.states["mystery"] = "running"
+    lodge.sessions.wolt_of = lambda name: None if name == "mystery" else name.rsplit("-", 1)[0]
+    lodge.store.router.wolt_of = lodge.sessions.wolt_of
+    lodge.store.router.commands.wolt_of = lodge.sessions.wolt_of
+    status, body = lodge.store.accept_event(who, _event_payload("k2", "u2", "c2", "/kill mystery"))
+    assert body["outcome"] == "refused" and lodge.sessions.stopped == []
+
+
+@pytest.mark.parametrize("found", [True, False])
+def test_a_button_operation_resumes_after_its_button_expired(lodge, found):
+    """Astre's probe: crash after start, before the result; retry past the TTL resumes from the operation."""
+    who = lodge.store.authenticate(lodge.token)
+    binding = _binding(lodge, "u2")
+    lodge.store.enqueue(channel="telegram", account="bot:1", conversation="c2", text="new?", binding_id=binding,
+                        buttons=[[{"text": "new", "action": {"command": "new", "argument": "softie"}}]])
+    callback = next(d for d in lodge.store.list_deliveries("tg") if d.get("buttons"))["buttons"][0][0]["callback_id"]
+    real = lodge.store.settle_operation
+
+    def crash(instance, key, state, **fields):
+        if state == "started":
+            lodge.store.settle_operation = real
+            raise OSError("crash after the effect")
+        return real(instance, key, state, **fields)
+
+    lodge.store.settle_operation = crash
+    lodge.store.router.commands.find = (lambda key: "softie-1") if found else (lambda key: None)
+    lodge.store.accept_event(who, _event_payload("press", "u2", "c2", callback={"id": callback}))
+    assert lodge.store.operation("tg", "bot:1\x00press")["state"] == "effect_in_progress"
+    lodge.clock.now += 3600
+    lodge.store.lease(who, 1)
+    record = lodge.store.operation("tg", "bot:1\x00press")
+    assert len(lodge.sessions.started) == 1
+    if found:
+        assert (record["state"], record["session"]) == ("answered", "softie-1")
+    else:
+        assert record["state"] == "uncertain"
+        assert [o["event_id"] for o in lodge.store.uncertain_operations("tg")] == ["press"]
+    # Another event presenting the same (consumed, expired) button gets nothing.
+    status, body = lodge.store.accept_event(who, _event_payload("again", "u2", "c2", callback={"id": callback}))
+    assert body["reason"] == "callback_invalid" and len(lodge.sessions.started) == 1
+
+
+def test_owner_resolution_refuses_a_new_done_without_its_session(lodge):
+    binding = _binding(lodge, "u2")
+    lodge.store.reserve_create("tg", "bot:1\x00p9", binding, "softie", 0)
+    lodge.store.settle_operation("tg", "bot:1\x00p9", "uncertain")
+    with pytest.raises(ConnectorError):
+        lodge.store.resolve_operation("tg", "p9")                       # done, but no session
+    with pytest.raises(ConnectorError):
+        lodge.store.resolve_operation("tg", "p9", session="softie-1", abandon=True)
+    assert lodge.store.operation("tg", "bot:1\x00p9")["state"] == "uncertain"

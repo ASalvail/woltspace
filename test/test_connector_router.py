@@ -34,6 +34,9 @@ class Sessions:
     def resolve(self, wolt):
         return self.live.get(wolt)
 
+    def wolt_of(self, session):
+        return session.rsplit("-", 1)[0]
+
 
 @pytest.fixture
 def lodge(tmp_path):
@@ -150,7 +153,7 @@ def test_session_text_names_the_event_for_duplicate_detection(lodge):
 
 
 def _boundary(sessions):
-    return {"deliver": sessions.deliver, "resume": sessions.resume, "resolve": sessions.resolve}
+    return {"deliver": sessions.deliver, "resume": sessions.resume, "resolve": sessions.resolve, "wolt_of": sessions.wolt_of}
 
 
 def _claimed_upload(store, event_id="tg:1"):

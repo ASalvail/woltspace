@@ -55,6 +55,7 @@ boundary.
 
 from __future__ import annotations
 
+import dataclasses
 import re
 from typing import Callable
 
@@ -117,6 +118,18 @@ def _default_resolve(wolt: str) -> str | None:
     return resolve_active_session(wolt)
 
 
+def _default_wolt_of(session: str) -> str | None:
+    """The wolt a session really belongs to, from the session registry; None when unknown."""
+    from sessions import SessionRegistry
+
+    return (SessionRegistry().get(session) or {}).get("wolt")
+
+
+def allowed_wolts(binding: dict) -> set[str]:
+    """The wolts this binding may talk to now: its selectable set and its default wolt."""
+    return set(binding.get("selectable_wolts") or ()) | {binding["default_wolt"]}
+
+
 class Commands:
     def __init__(
         self, store: ConnectorStore, *,
@@ -125,8 +138,10 @@ class Commands:
         live: Callable[[str], str | None] = _default_live,
         resolve: Callable[[str], str | None] = _default_resolve,
         find: Callable[[str], str | None] = _default_find,
+        wolt_of: Callable[[str], str | None] = _default_wolt_of,
     ):
         self.store = store
+        self.wolt_of = wolt_of
         self.start = start
         self.stop = stop
         self.live = live
@@ -160,7 +175,8 @@ class Commands:
         """The operation's last word: answered, and the result kept for a replay."""
         result = self._audit(event, command, outcome, **detail)
         try:
-            self.store.settle_operation(event.instance_id, event.dedup_key, "answered", result=result)
+            if self.store.operation(event.instance_id, event.dedup_key) is not None:
+                self.store.settle_operation(event.instance_id, event.dedup_key, "answered", result=result)
         except ConnectorError:
             pass
         return result
@@ -171,19 +187,40 @@ class Commands:
         return event.callback is not None or parse_command(event.text) is not None
 
     def __call__(self, event: AcceptedEvent) -> dict:
+        """One command, serialized with every other command of its binding.
+
+        The binding's command lock is taken before the operation is read,
+        live sessions are sampled or a resumption is decided, and held
+        through the session call to the settlement; under it the binding is
+        read again, so every check below uses the grants as they are now.
+        """
+        binding_id = event.binding["binding_id"]
+        with self.store.command_lock(binding_id):
+            binding = self.store.binding_now(binding_id)
+            if binding is None:
+                return self._audit(event, "command", "refused", reason="binding_removed")
+            return self._dispatch(dataclasses.replace(event, binding=binding))
+
+    def _dispatch(self, event: AcceptedEvent) -> dict:
         key = event.dedup_key
         previous = self.store.operation(event.instance_id, key)
         if previous is not None and previous["state"] in ("answered", "failed", "uncertain"):
             # Already over: the same answer, no second effect.
             return dict(previous.get("result") or {"routed": "command", "command": previous["command"], "outcome": previous["state"]})
         if event.callback is not None:
-            action = self.store.claim_callback(event.instance_id, event.binding["binding_id"], event.callback, key)
-            if action is None:
-                self._tell(event, "🪵 that button has expired or is not yours; ask again")
-                return self._audit(event, "callback", "refused", reason="callback_invalid")
-            command, argument = str(action.get("command", "")), action.get("argument")
+            if previous is not None and previous.get("command"):
+                # This event already consumed its button: resume from the
+                # operation's durable action, whatever the button's TTL. The
+                # grants are checked again below, like a first execution.
+                command, argument = str(previous["command"]), previous.get("argument")
+            else:
+                action = self.store.claim_callback(event.instance_id, event.binding["binding_id"], event.callback, key)
+                if action is None:
+                    self._tell(event, "🪵 that button has expired or is not yours; ask again")
+                    return self._audit(event, "callback", "refused", reason="callback_invalid")
+                command, argument = str(action.get("command", "")), action.get("argument")
             if command not in COMMANDS:
-                return self._audit(event, "callback", "refused", reason="callback_unknown_command")
+                return self._done(event, "callback", "refused", reason="callback_unknown_command")
         else:
             parsed = parse_command(event.text)
             if parsed is None:
@@ -191,14 +228,27 @@ class Commands:
             command, argument = parsed
         if argument is not None and not valid_id(str(argument), 64):
             self._tell(event, "🪵 that is not a name I can use")
-            return self._audit(event, command, "refused", reason="invalid_argument")
+            return self._done(event, command, "refused", reason="invalid_argument")
         handler = {
             "wolt": self._wolt, "new": self._new, "sessions": self._sessions, "kill": self._kill,
             "start": self._help, "help": self._help, "unsupported": self._unsupported,
         }[command]
         if command in ("new", "kill"):
             previous = self.store.begin_operation(event.instance_id, key, event.binding["binding_id"], command, argument)
-        return handler(event, argument, previous)
+            return handler(event, argument, previous)
+        result = handler(event, argument, previous)
+        if self.store.operation(event.instance_id, key) is not None:
+            # A button press for a command without effect: its operation ends answered.
+            try:
+                self.store.settle_operation(event.instance_id, key, "answered", result=result)
+            except ConnectorError:
+                pass
+        return result
+
+    def _target_allowed(self, event: AcceptedEvent, session: str) -> bool:
+        """The session's real wolt is one this binding may talk to now; unknown is no."""
+        wolt = self.wolt_of(session)
+        return wolt is not None and wolt in allowed_wolts(event.binding)
 
     # ------------------------------------------------------------ commands
 
@@ -257,7 +307,10 @@ class Commands:
         if previous and previous["state"] != "reserved" or (previous and previous.get("wolt")):
             # A resumption: the grant is checked again, like a first execution.
             if not binding.get("may_create") or wolt not in (binding.get("selectable_wolts") or []):
-                self.store.settle_operation(event.instance_id, key, "uncertain", note="grant withdrawn during the operation")
+                self.store.settle_operation(
+                    event.instance_id, key, "uncertain", expect=("reserved", "effect_in_progress", "started", "associated"),
+                    note="grant withdrawn during the operation",
+                )
                 self._tell(event, f"🪵 this chat may no longer start sessions; the owner has to look at {wolt}")
                 return self._done(event, "new", "uncertain", wolt=wolt, reason="grant_withdrawn")
         if state == "reserved" and not (previous or {}).get("wolt"):
@@ -273,7 +326,7 @@ class Commands:
                 }[reason]
                 self._tell(event, text)
                 try:
-                    self.store.settle_operation(event.instance_id, key, "failed")
+                    self.store.settle_operation(event.instance_id, key, "failed", expect=("reserved",))
                 except ConnectorError:
                     pass
                 return self._done(event, "new", "refused", reason=reason, wolt=wolt)
@@ -288,26 +341,26 @@ class Commands:
             # session boundary by the nonce; otherwise park it for the owner.
             session = self.find(key)
             if session is None:
-                self.store.settle_operation(event.instance_id, key, "uncertain")
+                self.store.settle_operation(event.instance_id, key, "uncertain", expect=("effect_in_progress",))
                 self._tell(event, f"🪵 a session for {wolt} may or may not have started; the owner has to look")
                 return self._done(event, "new", "uncertain", wolt=wolt)
-            self.store.settle_operation(event.instance_id, key, "started", session=session)
+            self.store.settle_operation(event.instance_id, key, "started", expect=("effect_in_progress",), session=session)
             state = "started"
         if state == "reserved":
             routing = {"adapter": event.channel, "chat_id": event.conversation["provider_id"], "binding_id": binding_id, "operation": key}
             # Written before the call: a crash from here on is reconciled or parked, never rerun.
-            self.store.settle_operation(event.instance_id, key, "effect_in_progress")
+            self.store.settle_operation(event.instance_id, key, "effect_in_progress", expect=("reserved",))
             try:
                 result = self.start(wolt, "", routing)
             except Exception as exc:  # noqa: BLE001 - the session layer's reason, shortened, is the answer
-                self.store.settle_operation(event.instance_id, key, "failed")
+                self.store.settle_operation(event.instance_id, key, "failed", expect=("effect_in_progress",))
                 self._tell(event, f"🪵 could not start a session for {wolt}: {str(exc)[:200]}")
                 return self._done(event, "new", "failed", wolt=wolt)
             session = str(result.get("name", ""))
-            self.store.settle_operation(event.instance_id, key, "started", session=session)
+            self.store.settle_operation(event.instance_id, key, "started", expect=("effect_in_progress",), session=session)
             state = "started"
         if state == "started":
-            self.store.settle_operation(event.instance_id, key, "associated")
+            self.store.settle_operation(event.instance_id, key, "associated", expect=("started",))
             state = "associated"
         self._tell(event, f"🐾 new session for {wolt}: {session}")
         return self._done(event, "new", "created", wolt=wolt, session=session)
@@ -326,39 +379,54 @@ class Commands:
     def _kill(self, event: AcceptedEvent, argument: str | None, previous: dict | None) -> dict:
         binding = event.binding
         key = event.dedup_key
+        state = (previous or {}).get("state", "reserved")
+        # An effect already asked for is settled first, whatever the grants
+        # say now: it happened or it did not, and it is never asked twice.
+        if state == "effect_in_progress":
+            target = (previous or {}).get("session") or argument
+            if self.live(target) in LIVE_STATES:
+                self.store.settle_operation(event.instance_id, key, "uncertain", expect=("effect_in_progress",))
+                self._tell(event, f"🪵 {target} was asked to stop and still runs; the owner has to look")
+                return self._done(event, "kill", "uncertain", session=target)
+            self.store.settle_operation(event.instance_id, key, "started", expect=("effect_in_progress",), session=target)
+            state = "started"
+        if state in ("started", "associated"):
+            target = (previous or {}).get("session") or argument
+            self._tell(event, f"🌙 {target} is stopped")
+            return self._done(event, "kill", "stopped", session=target)
+        # A fresh stop: the grant, the association and the session's real
+        # wolt are all checked now.
         if not binding.get("may_stop_own_sessions"):
             self._tell(event, "🪵 this chat may not stop sessions; ask the owner")
             return self._done(event, "kill", "refused", reason="no_grant")
         sessions = self._state(event).get("sessions") or {}
         if argument is None:
-            live = [name for name in sorted(sessions) if self.live(name) in LIVE_STATES]
+            live = [
+                name for name in sorted(sessions)
+                if self.live(name) in LIVE_STATES and self._target_allowed(event, name)
+            ]
             if not live:
                 self._tell(event, "nothing of this chat's is running")
                 return self._done(event, "kill", "answered", count=0)
             buttons = [[{"text": f"stop {name}", "action": {"command": "kill", "argument": name}}] for name in live]
             self._tell(event, "stop which?", buttons)
             return self._done(event, "kill", "picker")
-        if argument not in sessions:
-            # Not this binding's: refused the same way whether it exists or not.
-            self._tell(event, f"🪵 {argument} is not a session this chat started or talked to")
+        if argument not in sessions or not self._target_allowed(event, argument):
+            # Not this binding's, or of a wolt it may no longer talk to (or
+            # whose wolt cannot be verified): refused the same way whether it
+            # exists or not.
+            self._tell(event, f"🪵 {argument} is not a session this chat may stop")
             return self._done(event, "kill", "refused", reason="not_associated", session=argument)
-        state = (previous or {}).get("state", "reserved")
-        if state == "started" or self.live(argument) not in LIVE_STATES:
-            # Already stopped (by this operation's earlier attempt, or otherwise): no second stop.
+        if self.live(argument) not in LIVE_STATES:
             self._tell(event, f"🌙 {argument} is stopped")
             return self._done(event, "kill", "stopped", session=argument)
-        if state == "effect_in_progress":
-            # The stop was sent and the session still runs: not sent again on our own.
-            self.store.settle_operation(event.instance_id, key, "uncertain")
-            self._tell(event, f"🪵 {argument} was asked to stop and still runs; the owner has to look")
-            return self._done(event, "kill", "uncertain", session=argument)
-        self.store.settle_operation(event.instance_id, key, "effect_in_progress", session=argument)
+        self.store.settle_operation(event.instance_id, key, "effect_in_progress", expect=("reserved",), session=argument)
         try:
             self.stop(argument)
         except Exception as exc:  # noqa: BLE001
-            self.store.settle_operation(event.instance_id, key, "failed")
+            self.store.settle_operation(event.instance_id, key, "failed", expect=("effect_in_progress",))
             self._tell(event, f"🪵 could not stop {argument}: {str(exc)[:200]}")
             return self._done(event, "kill", "failed", session=argument)
-        self.store.settle_operation(event.instance_id, key, "started", session=argument)
+        self.store.settle_operation(event.instance_id, key, "started", expect=("effect_in_progress",), session=argument)
         self._tell(event, f"🌙 stopped {argument}")
         return self._done(event, "kill", "stopped", session=argument)

@@ -218,3 +218,9 @@ def test_parked_operations_are_listed_and_resolved_by_the_owner(colony, capsys):
     assert store.operation("tg", "acct\x00tg:10")["state"] == "failed"
     assert cli_main(["connector", "operations", "tg", "--abandon", "tg:99"]) == 0
     assert "no such parked operation" in capsys.readouterr().out
+    store.reserve_create("tg", "acct\x00tg:11", binding, "softie", 0)
+    store.settle_operation("tg", "acct\x00tg:11", "uncertain")
+    assert cli_main(["connector", "operations", "tg", "--done", "tg:11"]) == 1          # a /new names its session
+    assert "session_required" in capsys.readouterr().err
+    assert cli_main(["connector", "operations", "tg", "--done", "tg:11", "--abandon", "tg:11"]) == 1
+    assert store.operation("tg", "acct\x00tg:11")["state"] == "uncertain"

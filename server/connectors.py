@@ -535,6 +535,38 @@ class ConnectorStore:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     @contextlib.contextmanager
+    def command_lock(self, binding_id: str):
+        """Serialize one binding's chat commands, across threads and processes.
+
+        Taken before a command reads its operation, samples live sessions or
+        decides how to resume, and held through the session call to the
+        settlement; the owner's resolution takes it too. Lock order is
+        always this lock, then the store lock briefly inside it: never wait
+        for this one while holding the store lock.
+        """
+        if getattr(self._held, "depth", 0):
+            raise RuntimeError("command lock requested under the store lock")
+        directory = self.root / "commands"
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        name = hashlib.sha256(str(binding_id).encode()).hexdigest()[:32]
+        fd = os.open(directory / f"{name}.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def binding_now(self, binding_id: str) -> dict | None:
+        """The binding as the registry has it now (its current grants), or None when it is gone."""
+        with self._lock():
+            registry = self._registry()
+            binding = next((b for b in registry["bindings"] if b["binding_id"] == binding_id), None)
+            return dict(binding) if binding is not None else None
+
+    @contextlib.contextmanager
     def _transaction(self, *, dispatch: bool = True):
         """A locked operation whose callbacks run after the lock is released.
 
@@ -1732,10 +1764,19 @@ class ConnectorStore:
                 or record.get("consumed_by") not in (None, key)
             ):
                 return None
-            if record.get("consumed_by") != key:
+            action = dict(record["action"])
+            if record.get("consumed_by") != key or key not in queue.operations:
+                # Consumption and the operation's durable action in one write:
+                # a crash between them cannot lose the press, and a retry of
+                # this event resumes from the operation whatever the TTL.
                 record["consumed_by"] = key
+                queue.operations.setdefault(key, {
+                    "command": str(action.get("command", "")), "argument": action.get("argument"),
+                    "binding_id": binding_id, "state": "reserved", "at": self.clock(),
+                    "session": None, "wolt": None, "callback": callback_id,
+                })
                 self._save_queue(instance_id, queue)
-            return dict(record["action"])
+            return action
 
     # ------------------------------------------------------------ operations
 
@@ -1812,7 +1853,9 @@ class ConnectorStore:
             self._save_queue(instance_id, queue)
             return dict(record)
 
-    def settle_operation(self, instance_id: str, key: str, state: str, **fields) -> dict:
+    def settle_operation(
+        self, instance_id: str, key: str, state: str, *, expect: tuple[str, ...] | None = None, **fields,
+    ) -> dict:
         """Move an operation on: effect_in_progress, started(session), associated, answered, failed, uncertain.
 
         `effect_in_progress` is written before the external call; found
@@ -1828,6 +1871,16 @@ class ConnectorStore:
             record = queue.operations.get(key)
             if record is None:
                 raise ConnectorError(409, "unknown_operation")
+            current = record["state"]
+            # Fenced: a transition applies only from the state its caller saw,
+            # and nothing moves an operation out of answered, nor out of
+            # failed/uncertain (the owner's word) except to record the answer.
+            if expect is not None and current not in expect:
+                raise ConnectorError(409, "stale_operation")
+            if current == "answered" and state != "answered":
+                raise ConnectorError(409, "stale_operation")
+            if current in ("failed", "uncertain") and state not in ("answered", current):
+                raise ConnectorError(409, "stale_operation")
             record.update(fields)
             if state == "answered" and record["state"] in ("uncertain", "failed"):
                 # The answer is kept; a parked or released operation stays what it is.
@@ -1853,33 +1906,52 @@ class ConnectorStore:
                 if record["state"] == "uncertain"
             ]
 
-    def resolve_operation(self, instance_id: str, event_id: str, *, session: str | None) -> bool:
-        """Owner recovery for a parked operation: done with `session`, or abandoned (reservation released).
+    def resolve_operation(
+        self, instance_id: str, event_id: str, *, session: str | None = None, abandon: bool = False,
+    ) -> bool:
+        """Owner recovery for a parked operation: done (a `/new` names its session), or abandoned.
 
-        The owner says what happened; nothing is rerun. A `/new` resolved
-        with a session gets its association; abandoned, its slot and hourly
-        charge are released.
+        The owner says what happened; nothing is rerun. A `/new` marked done
+        must name the session it made (it gets its association); a `/kill`
+        marked done names none. Abandoned, a `/new` releases its slot and
+        hourly charge. Done and abandoned together, or a `/new` done without
+        a session, is refused, never read as the other. Takes the binding's
+        command lock first, like a command, so it cannot interleave with a
+        resumed attempt.
         """
+        if abandon and session is not None:
+            raise ConnectorError(400, "done_or_abandon")
         key = self.handoff_key(instance_id, event_id)
-        with self._lock():
-            queue = self._queue(instance_id)
-            record = queue.operations.get(key)
-            if record is None or record["state"] != "uncertain":
-                return False
-            if session is None:
-                record["state"] = "failed"
-                record["at"] = 0.0
-                record["result"] = {"routed": "command", "command": record["command"], "outcome": "abandoned"}
-            else:
-                if not valid_id(session, 128):
-                    raise ConnectorError(400, "invalid_session")
-                record["session"] = session
-                record["state"] = "answered"
-                record["result"] = {"routed": "command", "command": record["command"], "outcome": "resolved", "session": session}
-                if record["command"] == "new":
+        first = self.operation(instance_id, key)
+        if first is None:
+            return False
+        with self.command_lock(first["binding_id"]):
+            with self._lock():
+                queue = self._queue(instance_id)
+                record = queue.operations.get(key)
+                if record is None or record["state"] != "uncertain":
+                    return False
+                if abandon:
+                    record["state"] = "failed"
+                    record["at"] = 0.0
+                    record["result"] = {"routed": "command", "command": record["command"], "outcome": "abandoned"}
+                elif record["command"] == "new":
+                    if session is None:
+                        raise ConnectorError(400, "session_required")
+                    if not valid_id(session, 128):
+                        raise ConnectorError(400, "invalid_session")
+                    record["session"] = session
+                    record["state"] = "answered"
+                    record["result"] = {"routed": "command", "command": "new", "outcome": "resolved", "session": session}
                     self._associate(queue, record["binding_id"], session, "created", record.get("wolt") or "")
-            self._save_queue(instance_id, queue)
-            return True
+                else:
+                    if session is not None and session != record.get("session"):
+                        raise ConnectorError(400, "session_mismatch")
+                    record["state"] = "answered"
+                    record["result"] = {"routed": "command", "command": record["command"], "outcome": "resolved",
+                                        "session": record.get("session")}
+                self._save_queue(instance_id, queue)
+                return True
 
     def record_command(self, instance_id: str, record: dict) -> None:
         """Audit: one line per command executed or refused, never the token or a body."""

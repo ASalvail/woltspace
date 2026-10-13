@@ -1327,11 +1327,15 @@ def _connector_cursor(args) -> int:
 def _connector_operations(args) -> int:
     """Parked chat commands (effect uncertain after a crash): say what happened, nothing is rerun."""
     def action(_connectors, store):
+        if args.done and args.abandon:
+            raise _connectors.ConnectorError(400, "--done and --abandon are exclusive")
+        if args.abandon and args.session:
+            raise _connectors.ConnectorError(400, "--session goes with --done, not --abandon")
         if args.done:
             ok = store.resolve_operation(args.instance_id, args.done, session=args.session)
             return {"resolved": ok, "lines": ["resolved" if ok else "no such parked operation"]}
         if args.abandon:
-            ok = store.resolve_operation(args.instance_id, args.abandon, session=None)
+            ok = store.resolve_operation(args.instance_id, args.abandon, abandon=True)
             return {"abandoned": ok, "lines": ["abandoned; its reservation is released" if ok else "no such parked operation"]}
         records = store.uncertain_operations(args.instance_id)
         lines = [
