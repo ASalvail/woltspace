@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "container" / "lib"))
 
+import server.content_origins as content_origins
 import server.gateway as gateway
 import server.site_livereload as livereload
 import server.site_server as site_server
@@ -99,6 +100,7 @@ def _colony(tmp_path, monkeypatch, *, apps_aud="apps-aud"):
     key, verifier = _key_and_config(tmp_path, apps_aud)
     monkeypatch.setattr(gateway, "WOLTS_DIR", tmp_path)
     monkeypatch.setattr(gateway, "access_token_verifier", verifier)
+    content_origins._SEEN.clear()
     monkeypatch.delenv("WOLTSPACE_ISOLATION", raising=False)
     monkeypatch.delenv("CLOUDFLARE_TUNNEL_URL", raising=False)
     monkeypatch.setenv("WOLTSPACE_PORT", "7777")
@@ -116,6 +118,16 @@ def _colony(tmp_path, monkeypatch, *, apps_aud="apps-aud"):
         "name": "notes", "keeper": "astre", "port": 4321,
     }))
     return key
+
+
+def _enable_remote(monkeypatch):
+    """Exercise the remote path the gate hides today (see gateway docstring)."""
+    monkeypatch.setattr(gateway, "REMOTE_SITES_ENABLED", True)
+
+
+def _origins(root: Path) -> dict:
+    path = root / ".space" / "platform" / "content-origins.json"
+    return json.loads(path.read_text()) if path.exists() else {}
 
 
 def _site_shares(root: Path, data):
@@ -254,11 +266,24 @@ def test_site_root_is_anchored_to_the_wolt(tmp_path):
     (selfish / "wolt" / "site").symlink_to(selfish / "wolt", target_is_directory=True)
     assert anchored_site_root(selfish) is None
 
+    # Inside the wolt is not enough either: the root is the real directory
+    # at wolt/site, or nothing.
     inner = _make_wolt(tmp_path, "inner")
     shutil.rmtree(inner / "wolt" / "site")
     (inner / "wolt" / "pages").mkdir()
     (inner / "wolt" / "site").symlink_to(inner / "wolt" / "pages", target_is_directory=True)
-    assert anchored_site_root(inner) == (inner / "wolt" / "pages").resolve()
+    assert anchored_site_root(inner) is None
+
+    leaky = _make_wolt(tmp_path, "leaky")
+    shutil.rmtree(leaky / "wolt" / "site")
+    (leaky / "wolt" / "site").symlink_to("memory", target_is_directory=True)
+    assert anchored_site_root(leaky) is None
+
+    plain = _make_wolt(tmp_path, "plain")
+    (plain / "wolt" / "site" / "index.html").unlink()
+    (plain / "wolt" / "site").rmdir()
+    (plain / "wolt" / "site").write_text("not a directory")
+    assert anchored_site_root(plain) is None
 
 
 # ---------------------------------------------------------------------------
@@ -344,8 +369,40 @@ def test_local_owner_needs_a_loopback_peer_and_no_forwarding(tmp_path, monkeypat
     assert _get("/", host=LOCAL_HOST, client=("192.168.65.1", 123)).status_code == 200
 
 
+def test_remote_site_hosts_are_gated_for_every_request(tmp_path, monkeypatch):
+    key = _colony(tmp_path, monkeypatch)
+    _site_shares(tmp_path, {"astre": [FRIEND]})
+    assert gateway.REMOTE_SITES_ENABLED is False
+    token = _token(key, "apps-aud")
+    # The local site host is served as built; the gate is remote-only.
+    assert _get("/", host=LOCAL_HOST).status_code == 200
+
+    def never(*_args, **_kwargs):
+        raise AssertionError("identity or serving ran behind the remote gate")
+
+    # Nothing past the gate runs: no identity check, no file, no socket.
+    monkeypatch.setattr(gateway, "request_identity", never)
+    monkeypatch.setattr(gateway, "serve_site", never)
+    monkeypatch.setattr(gateway, "serve_site_livereload", never)
+    for method, path in (("GET", "/"), ("HEAD", "/"), ("GET", "/data.json"), ("POST", "/"),
+                         ("GET", "/_woltspace/assets/shell.js"), ("GET", "/_woltspace/livereload")):
+        response = asyncio.run(_request(method, path, host=REMOTE_HOST, token=token))
+        assert response.status_code == 503, (method, path)
+        assert method == "HEAD" or "not served yet" in response.text
+        _assert_site_headers(response)
+    assert asyncio.run(_request("GET", "/", host=REMOTE_HOST, token=_token(key, "apps-aud", FRIEND))).status_code == 503
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with _ws_client().websocket_connect(
+            site_server.LIVERELOAD_PATH, headers=_ws_headers(REMOTE_HOST, f"https://{REMOTE_HOST}", token),
+        ):
+            pass
+    assert exc.value.code == 1008
+    assert _origins(tmp_path).get(REMOTE_HOST) is None
+
+
 def test_remote_identity_matrix(tmp_path, monkeypatch):
     key = _colony(tmp_path, monkeypatch)
+    _enable_remote(monkeypatch)
     _site_shares(tmp_path, {"astre": [FRIEND]})
     owner = _get("/", host=REMOTE_HOST, token=_token(key, "apps-aud"))
     friend = _get("/", host=REMOTE_HOST, token=_token(key, "apps-aud", FRIEND))
@@ -368,6 +425,7 @@ def test_remote_identity_matrix(tmp_path, monkeypatch):
 
 def test_empty_apps_audience_refuses_every_remote_visitor(tmp_path, monkeypatch):
     key = _colony(tmp_path, monkeypatch, apps_aud="")
+    _enable_remote(monkeypatch)
     _site_shares(tmp_path, {"astre": [FRIEND]})
     assert _get("/", host=REMOTE_HOST, token=_token(key, "apps-aud")).status_code == 403
     assert _get("/", host=REMOTE_HOST, token=_token(key, "lodge-aud")).status_code == 403
@@ -375,12 +433,21 @@ def test_empty_apps_audience_refuses_every_remote_visitor(tmp_path, monkeypatch)
     assert _get("/", host=LOCAL_HOST).status_code == 200
 
 
-def test_malformed_share_state_fails_closed_remotely(tmp_path, monkeypatch):
+def test_malformed_share_state_fails_closed_for_readers_not_the_owner(tmp_path, monkeypatch):
     key = _colony(tmp_path, monkeypatch)
+    _enable_remote(monkeypatch)
+    monkeypatch.setattr(lodge, "WOLTS_DIR", tmp_path)
     for broken in ("{not json", json.dumps(["list"]), json.dumps({"astre": "friend@example.com"})):
         _site_shares(tmp_path, broken)
         friend = _get("/", host=REMOTE_HOST, token=_token(key, "apps-aud", FRIEND))
         assert friend.status_code == 403
+        # The share list adds readers; the owner's authority never came from it.
+        owner = _get("/", host=REMOTE_HOST, token=_token(key, "apps-aud"))
+        assert owner.status_code == 200 and "astre home" in owner.text
+        assert _get("/", host=LOCAL_HOST).status_code == 200
+        # The management route says the state is corrupt instead of hiding it.
+        state = asyncio.run(_lodge("GET", "/sites/astre/sharing"))
+        assert state.status_code == 500 and "unreadable" in state.json()["error"]
     (tmp_path / "woltspace.json").write_text(json.dumps({
         "apps_domain": APPS_DOMAIN, "access": {"broken": True},
     }))
@@ -389,6 +456,7 @@ def test_malformed_share_state_fails_closed_remotely(tmp_path, monkeypatch):
 
 def test_acl_is_applied_before_any_file_is_touched(tmp_path, monkeypatch):
     key = _colony(tmp_path, monkeypatch)
+    _enable_remote(monkeypatch)
     stranger = _token(key, "apps-aud", STRANGER)
 
     def never(*_args, **_kwargs):
@@ -432,6 +500,9 @@ def test_traversal_symlink_and_special_files_are_not_found(tmp_path, monkeypatch
         b"/%2e%2e/%2e%2e/astre/wolt/memory/identity.md",
         b"/nested/..%2f..%2f..%2fsecret.txt",
         b"/nested%2F..%2F..%2Fsecret.txt",
+        b"/nested%2Fpage.html",
+        b"/nested%2fpage.html",
+        b"/nested%5Cpage.html",
         b"/escape-link",
         b"/escape-dir/identity.md",
         b"/fifo",
@@ -459,6 +530,13 @@ def test_root_symlink_escape_is_refused_for_the_whole_site(tmp_path, monkeypatch
     response = _get("/", host="linky.sites.localhost:7117")
     assert response.status_code == 404 and "LEAKED" not in response.text
     assert _get("/index.html", host="linky.sites.localhost:7117").status_code == 404
+    leaky = _make_wolt(tmp_path, "leaky")
+    (leaky / "wolt" / "memory" / "context.md").write_text("PRIVATE CONTEXT")
+    shutil.rmtree(leaky / "wolt" / "site")
+    (leaky / "wolt" / "site").symlink_to("memory", target_is_directory=True)
+    for path in ("/", "/context.md", "/identity.md"):
+        response = _get(path, host="leaky.sites.localhost:7117")
+        assert response.status_code == 404 and "PRIVATE" not in response.text, path
 
 
 def test_case_ambiguous_wolt_directories_share_no_host(tmp_path, monkeypatch):
@@ -522,6 +600,7 @@ def test_writes_are_refused_regardless_of_filename(tmp_path, monkeypatch, method
     ))
     assert response.status_code == 405
     assert response.headers["allow"] == "GET, HEAD"
+    _assert_site_headers(response)
 
 
 # ---------------------------------------------------------------------------
@@ -586,6 +665,7 @@ def test_owner_page_gets_public_manifest_reload_client_and_lodge_links(tmp_path,
 
 def test_shared_viewer_gets_content_navigation_only(tmp_path, monkeypatch):
     key = _colony(tmp_path, monkeypatch)
+    _enable_remote(monkeypatch)
     _site_shares(tmp_path, {"astre": [FRIEND]})
     monkeypatch.setenv("CLOUDFLARE_TUNNEL_URL", "https://owner.woltspace.com")
     friend = _get("/", host=REMOTE_HOST, token=_token(key, "apps-aud", FRIEND)).text
@@ -600,6 +680,7 @@ def test_shared_viewer_gets_content_navigation_only(tmp_path, monkeypatch):
 
 def test_remote_owner_without_a_tunnel_address_gets_no_lodge_links(tmp_path, monkeypatch):
     key = _colony(tmp_path, monkeypatch)
+    _enable_remote(monkeypatch)
     owner = _get("/", host=REMOTE_HOST, token=_token(key, "apps-aud")).text
     assert "builtin" not in _manifest(owner)
     assert site_server.LIVERELOAD_PATH in owner
@@ -641,6 +722,7 @@ def test_service_worker_scripts_are_refused_on_every_path(tmp_path, monkeypatch,
     assert plain.status_code == 200
     refused = _get(path, host=LOCAL_HOST, headers={"service-worker": "script"})
     assert refused.status_code == 403
+    _assert_site_headers(refused)
     assert "service-worker-allowed" not in {k.lower() for k in plain.headers}
 
 
@@ -648,20 +730,74 @@ def test_service_worker_scripts_are_refused_on_every_path(tmp_path, monkeypatch,
 # Collisions with reserved app names
 # ---------------------------------------------------------------------------
 
-def test_site_prefixed_app_collision_is_refused_not_reused(tmp_path, monkeypatch):
+def test_used_origin_is_never_reused_for_a_site(tmp_path, monkeypatch):
     key = _colony(tmp_path, monkeypatch)
+    _enable_remote(monkeypatch)
     _make_wolt(tmp_path, "notes")
-    monkeypatch.setattr(gateway, "get_app", lambda name: object() if name == "site-notes" else None)
-    monkeypatch.setattr(gateway, "proxy_app_http", lambda *_a, **_k: PlainTextResponse("APP"))
-    collision = _get("/", host=f"site-notes.{APPS_DOMAIN}", token=_token(key, "apps-aud"))
+    host = f"site-notes.{APPS_DOMAIN}"
+    apps = {"site-notes": object()}
+    monkeypatch.setattr(gateway, "get_app", lambda name: apps.get(name))
+    token = _token(key, "apps-aud")
+
+    collision = _get("/", host=host, token=token)
     assert collision.status_code == 409
-    assert "site-notes" in collision.text and "Rename the app" in collision.text
-    assert "notes home" not in collision.text and "APP" != collision.text
+    assert "never reused" in collision.text and "notes home" not in collision.text
+    assert "Rename" not in collision.text
+    _assert_site_headers(collision)
+    # Renaming or removing the app changes nothing once the host has history.
+    apps.clear()
+    (tmp_path / ".space" / "platform").mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".space" / "platform" / "content-origins.json").write_text(json.dumps({
+        host: {"app": "2026-10-01T00:00:00+00:00"},
+    }))
+    assert _get("/", host=host, token=token).status_code == 409
+    content_origins._SEEN.clear()  # a gateway restart reads the same record
+    assert _get("/", host=host, token=token).status_code == 409
+    # A history that cannot be read is not a clean history.
+    (tmp_path / ".space" / "platform" / "content-origins.json").write_text("{broken")
+    assert _get("/", host=host, token=token).status_code == 409
+    # Only a host with no app history at all is served.
+    (tmp_path / ".space" / "platform" / "content-origins.json").write_text(json.dumps({
+        host: {"site": "2026-10-01T00:00:00+00:00"},
+    }))
+    served = _get("/", host=host, token=token)
+    assert served.status_code == 200 and "notes home" in served.text
     # The reserved name is never an app locally either, and says why.
     local = _get("/", host="site-notes.localhost:7117")
     assert local.status_code == 404 and "reserved" in local.text
-    # The wolt whose site it is still has its local host.
     assert _get("/", host="notes.sites.localhost:7117").status_code == 200
+
+
+def test_every_served_host_is_recorded_once(tmp_path, monkeypatch):
+    key = _colony(tmp_path, monkeypatch)
+
+    async def proxy(_request, name):
+        return PlainTextResponse(f"{name}:APP")
+
+    monkeypatch.setattr(gateway, "proxy_app_http", proxy)
+    record = tmp_path / ".space" / "platform" / "content-origins.json"
+    assert _get("/", host=LOCAL_HOST).status_code == 200
+    assert _get("/", host="notes.localhost:7117").status_code == 200
+    assert _get("/", host=f"notes.{APPS_DOMAIN}", token=_token(key, "apps-aud")).status_code == 200
+    assert _get("/", host="nobody.sites.localhost:7117").status_code == 404
+    assert _get("/", host=f"notes.{APPS_DOMAIN}", token=_token(key, "apps-aud", STRANGER)).status_code == 403
+    data = _origins(tmp_path)
+    assert set(data) == {"astre.sites.localhost", "notes.localhost", f"notes.{APPS_DOMAIN}"}
+    assert set(data["astre.sites.localhost"]) == {"site"}
+    assert set(data["notes.localhost"]) == set(data[f"notes.{APPS_DOMAIN}"]) == {"app"}
+    first = record.stat().st_mtime_ns
+    assert _get("/data.json", host=LOCAL_HOST).status_code == 200
+    assert record.stat().st_mtime_ns == first
+    assert content_origins.host_kinds(tmp_path, "ASTRE.sites.localhost.") == {"site"}
+    assert content_origins.host_kinds(tmp_path, "other.localhost") == set()
+    # A broken record is never overwritten, and serving goes on.
+    record.write_text("{broken")
+    content_origins._SEEN.clear()
+    assert _get("/", host="pine.sites.localhost:7117").status_code == 200
+    assert record.read_text() == "{broken"
+    with pytest.raises(RuntimeError):
+        content_origins.host_kinds(tmp_path, LOCAL_HOST)
+    assert not list(record.parent.glob("*.tmp"))
 
 
 def test_doctor_warns_about_site_prefixed_apps(tmp_path):
@@ -679,7 +815,7 @@ def test_doctor_warns_about_site_prefixed_apps(tmp_path):
     checks = {check.name: check for check in run_doctor(layout, check_port=False)}
     assert checks["app-names"].status == "warn"
     assert "site-notes" in checks["app-names"].detail
-    assert "Rename" in checks["app-names"].remedy
+    assert "reserved" in checks["app-names"].remedy and "Rename" not in checks["app-names"].remedy
     shutil.rmtree(app_dir)
     assert "app-names" not in {check.name for check in run_doctor(layout, check_port=False)}
 
@@ -724,6 +860,7 @@ def test_owner_receives_a_reload_after_a_file_change(tmp_path, monkeypatch):
 
 def test_remote_owner_gets_livereload_and_shared_viewer_is_denied(tmp_path, monkeypatch):
     key = _colony(tmp_path, monkeypatch)
+    _enable_remote(monkeypatch)
     _fast_watch(monkeypatch)
     _site_shares(tmp_path, {"astre": [FRIEND]})
     origin = f"https://{REMOTE_HOST}"
@@ -777,6 +914,7 @@ def test_livereload_rejects_every_origin_but_the_sites_own(tmp_path, monkeypatch
 
 def test_remote_livereload_origin_must_be_https_on_the_default_port(tmp_path, monkeypatch):
     key = _colony(tmp_path, monkeypatch)
+    _enable_remote(monkeypatch)
     _fast_watch(monkeypatch)
     token = _token(key, "apps-aud")
     for bad in (f"http://{REMOTE_HOST}", f"https://{REMOTE_HOST}:8443", f"https://notes.{APPS_DOMAIN}"):
@@ -794,6 +932,7 @@ def test_remote_livereload_origin_must_be_https_on_the_default_port(tmp_path, mo
 
 def test_livereload_closes_when_the_token_expires(tmp_path, monkeypatch):
     key = _colony(tmp_path, monkeypatch)
+    _enable_remote(monkeypatch)
     _fast_watch(monkeypatch)
     with _ws_client().websocket_connect(
         site_server.LIVERELOAD_PATH,
@@ -861,6 +1000,60 @@ def test_livereload_subscribers_are_bounded(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_reload_traffic_does_not_postpone_the_authorization_recheck(monkeypatch):
+    monkeypatch.setattr(livereload, "RECHECK_SECONDS", 0.03)
+
+    async def scenario(auth_answers):
+        queue: asyncio.Queue = asyncio.Queue()
+        calls, sent, closed = [], [], []
+
+        class Hub:
+            def subscribe(self, _root):
+                return queue
+
+            def unsubscribe(self, _root, _queue):
+                pass
+
+        class WS:
+            async def accept(self):
+                pass
+
+            async def receive(self):
+                await asyncio.sleep(0.25)
+                return {"type": "websocket.disconnect"}
+
+            async def send_text(self, text):
+                sent.append(text)
+
+            async def close(self, code=1000):
+                closed.append(code)
+
+        async def auth():
+            calls.append(time.monotonic())
+            return auth_answers(len(calls))
+
+        async def feed():
+            for index in range(60):
+                queue.put_nowait({"type": "reload", "revision": index})
+                await asyncio.sleep(0.005)
+
+        monkeypatch.setattr(livereload, "hub", Hub())
+        feeder = asyncio.create_task(feed())
+        started = time.monotonic()
+        await livereload.serve_site_livereload(WS(), "unused", still_authorized=auth)
+        feeder.cancel()
+        return calls, sent, closed, time.monotonic() - started
+
+    calls, sent, closed, _elapsed = asyncio.run(scenario(lambda _n: True))
+    assert len(calls) >= 5, len(calls)          # about every 0.03 s over 0.25 s
+    assert len(sent) >= 30 and closed == []
+    # Authorization lost under steady traffic: closed within one interval.
+    calls, sent, closed, elapsed = asyncio.run(scenario(lambda n: n < 2))
+    assert closed == [1008] and len(calls) == 2
+    assert elapsed < 0.15, elapsed
+    assert all(json.loads(text)["type"] == "reload" for text in sent)
+
+
 def test_watcher_caps_the_files_it_tracks(tmp_path, monkeypatch):
     monkeypatch.setattr(livereload, "MAX_FILES", 5)
     for index in range(20):
@@ -882,6 +1075,7 @@ async def _lodge(method, path, **kwargs):
 
 def test_lodge_site_sharing_routes_mirror_app_sharing(tmp_path, monkeypatch):
     key = _colony(tmp_path, monkeypatch)
+    _enable_remote(monkeypatch)
     monkeypatch.setattr(lodge, "WOLTS_DIR", tmp_path)
     _make_wolt(tmp_path, "my_wolt")
 

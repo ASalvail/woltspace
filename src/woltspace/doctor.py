@@ -506,8 +506,9 @@ def _reserved_app_names_check(layout: RuntimeLayout) -> DoctorCheck | None:
     return DoctorCheck(
         "app-names", "warn",
         f"app name(s) reserved for wolt sites, not served: {', '.join(dict.fromkeys(found))}",
-        f"Rename the app directory and its woltspace.json name without the "
-        f"{SITE_HOST_PREFIX} prefix; the wolt's site keeps that host.",
+        f"Give the app a name without the {SITE_HOST_PREFIX} prefix (directory and "
+        f"woltspace.json). Its old host stays reserved: browsers may still hold its "
+        f"storage and workers, so no site will ever be served there.",
     )
 
 

@@ -10,6 +10,15 @@ model, and in container `external` mode it rests on the launcher publishing
 the gateway port on host loopback only (see local_request.owner_local_request).
 Remotely, a verified Access token for the apps audience names an email; the
 lodge audience never opens content, and an empty apps audience refuses.
+
+Sites are served locally only, on the new `<wolt>.sites.localhost` suffix that
+nothing used before. Remote site hosts (`site-<wolt>.<apps domain>`) are gated
+for every request, HTTP and websocket, whatever credentials come with it: a
+browser origin keeps its storage and any installed service worker after the
+app that lived there is renamed or removed, refusing new workers evicts
+nothing, and there is no record of which `site-*` labels apps used before this
+release. `content_origins` now records every host served, so a later remote
+policy can tell a clean host from a used one; a used origin is never reused.
 """
 
 from __future__ import annotations
@@ -27,6 +36,7 @@ from .app_proxy import get_app, proxy_app_http, proxy_app_websocket
 from .app_sharing import email_is_shared, read_app_shares, read_site_shares
 from .config import WOLTS_DIR
 from .content_hosts import SITE_PREFIX, ContentHost, find_wolt_dir, anchored_site_root, parse_content_host
+from .content_origins import host_kinds, record_served
 from .gateway_settings import load_gateway_settings, lodge_origin
 from .local_request import owner_local_request
 from .site_livereload import hub as livereload_hub, serve_site_livereload
@@ -89,6 +99,10 @@ def _log_request(scope, headers, status: int, reason: str) -> None:
 
 _READ_ONLY_METHODS = {"GET", "HEAD", "OPTIONS"}
 _SITE_METHODS = {"GET", "HEAD"}
+# Remote site hosts stay gated until the used-origin policy ships (module
+# docstring). Not a setting: nothing in woltspace.json or the environment
+# turns it on.
+REMOTE_SITES_ENABLED = False
 
 
 def _origin_matches_host(headers: dict[str, str]) -> bool:
@@ -214,6 +228,7 @@ class AppGateway:
             _log_request(scope, headers, 403, "not-shared")
             return await _reject(scope, receive, send, 403, "This app is not shared with you")
         scope.setdefault("state", {})["access_email"] = email
+        record_served(Path(WOLTS_DIR), _host_name(headers.get("host", "")) or "", "app")
         if scope["type"] == "http":
             response = await proxy_app_http(Request(scope, receive), app_name)
             reason = identity_reason if response.status_code < 400 else (
@@ -235,27 +250,38 @@ class AppGateway:
         """
         label, local_host = content.name, content.local
         wolts_dir = Path(WOLTS_DIR)
+        host = _host_name(headers.get("host", "")) or ""
+
+        async def refuse(status, reason, message, **extra):
+            _log_request(scope, headers, status, reason)
+            return await _reject(
+                scope, receive, send, status, message, headers=dict(SITE_HEADERS, **extra),
+            )
+
+        # Unconditional: before method, origin or identity. No credential and
+        # no setting opens a remote site host today (module docstring).
+        if not local_host and not REMOTE_SITES_ENABLED:
+            return await refuse(
+                503, "remote-sites-pending",
+                "Sites on the app domain are not served yet (pending setup); "
+                "a wolt's site is at &lt;wolt&gt;.sites.localhost on the gateway port",
+            )
         if scope["type"] == "http":
             method = scope.get("method", "GET").upper()
             if method not in _SITE_METHODS:
-                _log_request(scope, headers, 405, "method")
-                return await _reject(
-                    scope, receive, send, 405, "Sites are read-only", headers={"allow": "GET, HEAD"},
-                )
+                return await refuse(405, "method", "Sites are read-only", allow="GET, HEAD")
         else:
             # The reserved socket is the only one, and only from this site's
             # own pages. Everything else closes before the handshake.
             if scope.get("path", "") != LIVERELOAD_PATH:
-                _log_request(scope, headers, 404, "no-such-socket")
-                return await _reject(scope, receive, send, 404, "Not found")
+                return await refuse(404, "no-such-socket", "Not found")
             if not _site_origin_ok(headers, local=local_host):
-                _log_request(scope, headers, 403, "bad-origin")
-                return await _reject(scope, receive, send, 403, "Invalid websocket origin")
+                return await refuse(403, "bad-origin", "Invalid websocket origin")
         # A service worker would outlive the content and its share. Refused on
         # every path, whatever the script is called (decision 4 of the spec).
+        # This stops new registrations only; it evicts nothing already installed.
         if "service-worker" in headers:
-            _log_request(scope, headers, 403, "service-worker")
-            return await _reject(scope, receive, send, 403, "Service workers are not allowed on sites")
+            return await refuse(403, "service-worker", "Service workers are not allowed on sites")
         try:
             access = load_access_settings(wolts_dir)
         except RuntimeError:
@@ -264,35 +290,39 @@ class AppGateway:
             scope, headers, local_host=local_host, access=access,
         )
         if email is None:
-            _log_request(scope, headers, 403, identity_reason)
-            return await _reject(scope, receive, send, 403, "Site identity verification required")
+            return await refuse(403, identity_reason, "Site identity verification required")
         owner_email = access.owner_email if access is not None else email
         is_owner = email == owner_email
+        # The share list adds readers; it never grants or removes the owner's
+        # own authority, so the owner passes without reading it.
         if not is_owner:
             try:
                 shares = read_site_shares(wolts_dir, label)
             except RuntimeError:
-                _log_request(scope, headers, 403, "sharing-unavailable")
-                return await _reject(scope, receive, send, 403, "Site access unavailable")
+                return await refuse(403, "sharing-unavailable", "Site access unavailable")
             if not email_is_shared(email, shares):
-                _log_request(scope, headers, 403, "not-shared")
-                return await _reject(scope, receive, send, 403, "This site is not shared with you")
-        # An app that took the reserved name once owned this host in browsers
-        # (storage, workers). That origin is not reused: nothing is served
-        # until the app is renamed.
-        if not local_host and get_app(f"{SITE_PREFIX}{label}") is not None:
-            _log_request(scope, headers, 409, "reserved-app-collision")
-            return await _reject(
-                scope, receive, send, 409,
-                f"An app named {SITE_PREFIX}{label} exists; the {SITE_PREFIX} prefix is "
-                f"reserved for wolt sites. Rename the app before this site can be served.",
-            )
+                return await refuse(403, "not-shared", "This site is not shared with you")
+        if not local_host:
+            # A host that ever answered as an app, or whose history cannot be
+            # read, is never reused for a site: its browsers may still hold
+            # that app's storage and workers. The site gets a fresh host.
+            try:
+                used = "app" in host_kinds(wolts_dir, host)
+            except RuntimeError:
+                used = True
+            if used or get_app(f"{SITE_PREFIX}{label}") is not None:
+                return await refuse(
+                    409, "used-origin",
+                    f"{host} was an app's origin; a used origin is never reused for a "
+                    f"site, so this site needs a different host",
+                )
         wolt_dir = find_wolt_dir(wolts_dir, label)
         root = anchored_site_root(wolt_dir) if wolt_dir is not None else None
         if root is None:
             _log_request(scope, headers, 404, "unknown-site")
             response = PlainTextResponse("Not found", status_code=404, headers=SITE_HEADERS)
             return await response(scope, receive, send)
+        record_served(wolts_dir, host, "site")
         if scope["type"] == "http":
             ctx = SiteContext(
                 wolt_name=wolt_dir.name, wolt_dir=wolt_dir, root=root, owner=is_owner,
@@ -302,8 +332,7 @@ class AppGateway:
             _log_request(scope, headers, response.status_code, identity_reason)
             return await response(scope, receive, send)
         if not is_owner:
-            _log_request(scope, headers, 403, "owner-only")
-            return await _reject(scope, receive, send, 403, "Livereload is for the owner")
+            return await refuse(403, "owner-only", "Livereload is for the owner")
 
         async def still_authorized() -> bool:
             try:

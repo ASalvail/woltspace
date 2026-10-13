@@ -92,7 +92,8 @@ def test_gateway_valid_owner_and_shared_email_reach_http_app(tmp_path, monkeypat
     owner = asyncio.run(_get(
         "/hello", host="notes.owner.woltspace.app", token=_token(key, "apps-aud"),
     ))
-    (tmp_path / ".space" / "platform").mkdir(parents=True)
+    # The gateway may already have created it for the content-origin record.
+    (tmp_path / ".space" / "platform").mkdir(parents=True, exist_ok=True)
     (tmp_path / ".space" / "platform" / "app-sharing.json").write_text(json.dumps({
         "notes": ["friend@example.com"],
     }))

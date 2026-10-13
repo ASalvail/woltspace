@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import mimetypes
 import os
+import re
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,14 +74,20 @@ class SiteContext:
     lodge_origin: str | None
 
 
+_ENCODED_SEPARATOR = re.compile(rb"%(?:2f|5c)", re.I)
+
+
 def split_site_path(raw_path: bytes) -> tuple[list[str], bool] | None:
     """Percent-decode a request target into path segments.
 
     Returns (segments, trailing_slash), or None when the target cannot name a
-    file: an encoded slash, NUL or backslash in a segment, `.` or `..`, an
-    empty segment in the middle, or bytes that are not UTF-8.
+    file: a percent-encoded slash or backslash anywhere, NUL or backslash in
+    a segment, `.` or `..`, an empty segment in the middle, or bytes that are
+    not UTF-8. Separators are only ever the literal `/` the visitor sent.
     """
     if not raw_path.startswith(b"/"):
+        return None
+    if _ENCODED_SEPARATOR.search(raw_path):
         return None
     try:
         decoded = unquote_to_bytes(raw_path).decode("utf-8")
@@ -124,7 +131,13 @@ def _media_type(path: str) -> str:
 
 
 def _open_regular(realpath: str) -> tuple[int, os.stat_result] | None:
-    """Open exactly the validated path; only a regular file comes back."""
+    """Open exactly the validated path; only a regular file comes back.
+
+    O_NOFOLLOW guards the final component and fstat confirms what was opened.
+    Intermediate components are the same user's own directories and are not
+    re-walked by descriptor; this is a serving policy, not a race-proof
+    boundary against that user.
+    """
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
         fd = os.open(realpath, flags)

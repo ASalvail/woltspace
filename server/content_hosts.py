@@ -145,11 +145,11 @@ def find_wolt_dir(wolts_dir: Path, label: str) -> Path | None:
 def site_root(wolts_dir: Path, label: str) -> Path | None:
     """The canonical site directory of the wolt with this host label, or None.
 
-    The root is anchored to the wolt: `<wolt>/wolt/site` must resolve to a
-    directory strictly inside `realpath(<wolt>/wolt)`. A site directory that
-    is a symlink elsewhere (or to the wolt directory itself, which holds the
-    memory files) is refused rather than served, so the realpath children are
-    later checked against can never be an arbitrary external tree.
+    The root is anchored to the wolt: it is the real directory at
+    `<wolt>/wolt/site`, nothing else. A site directory that is a symlink is
+    refused rather than followed, wherever it points (outside the wolt, at the
+    wolt directory, at `memory/`, or at a sibling folder), so the realpath
+    children are later checked against is always the intended tree.
     """
     wolt_dir = find_wolt_dir(wolts_dir, label)
     if wolt_dir is None:
@@ -158,8 +158,10 @@ def site_root(wolts_dir: Path, label: str) -> Path | None:
 
 
 def anchored_site_root(wolt_dir: Path) -> Path | None:
-    anchor = os.path.realpath(wolt_dir / "wolt")
-    root = os.path.realpath(wolt_dir / "wolt" / "site")
-    if not root.startswith(anchor + os.sep) or not os.path.isdir(root):
+    site = wolt_dir / "wolt" / "site"
+    if os.path.islink(site) or not os.path.isdir(site):
+        return None
+    root = os.path.realpath(site)
+    if root != os.path.join(os.path.realpath(wolt_dir / "wolt"), "site"):
         return None
     return Path(root)

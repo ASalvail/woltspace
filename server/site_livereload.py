@@ -12,7 +12,9 @@ A socket closes when the site goes away, when the gateway shuts down, when the
 owner's identity no longer checks out, and at the access token's expiry: the
 gateway re-runs its admission check every RECHECK_SECONDS with the credentials
 the socket was opened with, so an Access session that has ended cannot keep a
-reload stream alive just because it was authorized once.
+reload stream alive just because it was authorized once. The recheck runs on a
+monotonic deadline that reload traffic does not move, and before any event is
+sent once that deadline has passed, so a stream of edits cannot postpone it.
 """
 
 from __future__ import annotations
@@ -164,9 +166,21 @@ async def serve_site_livereload(
     disconnect = asyncio.create_task(await_disconnect())
     event = asyncio.create_task(queue.get())
     code = 1000
+    next_check = time.monotonic() + RECHECK_SECONDS
+
+    async def revalidate() -> bool:
+        # The deadline moves only after a real check, never on traffic.
+        nonlocal next_check
+        if expires_at is not None and time.time() >= expires_at:
+            return False
+        if not await still_authorized():
+            return False
+        next_check = time.monotonic() + RECHECK_SECONDS
+        return True
+
     try:
         while True:
-            timeout = RECHECK_SECONDS
+            timeout = max(0.0, next_check - time.monotonic())
             if expires_at is not None:
                 timeout = max(0.0, min(timeout, expires_at - time.time()))
             done, _pending = await asyncio.wait(
@@ -174,6 +188,12 @@ async def serve_site_livereload(
             )
             if disconnect in done:
                 return
+            due = time.monotonic() >= next_check or (
+                expires_at is not None and time.time() >= expires_at
+            )
+            if due and not await revalidate():
+                code = 1008
+                break
             if event in done:
                 message = event.result()
                 if message is _CLOSE:
@@ -181,15 +201,6 @@ async def serve_site_livereload(
                     break
                 await ws.send_text(json.dumps(message, separators=(",", ":")))
                 event = asyncio.create_task(queue.get())
-                continue
-            # Recheck: the token has run out, the site has moved, or the owner
-            # is no longer who opened this.
-            if expires_at is not None and time.time() >= expires_at:
-                code = 1008
-                break
-            if not await still_authorized():
-                code = 1008
-                break
         try:
             await ws.close(code=code)
         except Exception:
