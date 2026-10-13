@@ -184,14 +184,13 @@ class TelegramConnector:
         if telegram_runtime(layout) == "connector":
             # The owner moved Telegram to the connector protocol: exactly one
             # poller per bot, and it is not this adapter. Launching the
-            # connector process from here is the next slice's seam; until
-            # then it runs by hand with a token from `woltspace connector token`.
+            # connector process from here is the next slice's seam.
             return ConnectorPlan(
                 self.name, False, "telegram.runtime is connector: the adapter does not poll",
                 remedy=(
-                    "Run the Telegram connector (python -m woltspace_telegram with "
-                    "WOLTSPACE_API, TELEGRAM_BOT_TOKEN and a connector token), or set "
-                    "telegram.runtime back to adapter with `woltspace connector runtime telegram adapter`."
+                    "The lodge does not launch the Telegram connector yet (next slice). "
+                    "To use the adapter again: stop the lodge, then "
+                    "`woltspace connector runtime telegram adapter`."
                 ),
             )
 

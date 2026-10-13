@@ -177,7 +177,7 @@ def test_the_planner_does_not_start_the_adapter_under_the_connector_runtime(colo
     plan = TelegramConnector().plan(layout, env)
     assert plan.enabled is False
     assert "does not poll" in plan.detail
-    assert "woltspace_telegram" in plan.remedy
+    assert "next slice" in plan.remedy and "stop the lodge" in plan.remedy
     set_channel_runtime(colony / "woltspace.json", "telegram", "adapter")
     assert TelegramConnector().plan(layout, env).enabled is True
 
@@ -187,7 +187,7 @@ def test_cli_runtime_and_cursor_verbs(colony, capsys):
     assert json.loads(capsys.readouterr().out)["runtime"] == "adapter"
     assert cli_main(["connector", "runtime", "telegram", "connector"]) == 0
     out = capsys.readouterr().out
-    assert "telegram.runtime = connector" in out and "woltspace connector token" in out
+    assert "telegram.runtime = connector" in out and "next `woltspace start`" in out
     assert channel_runtime(colony / "woltspace.json", "telegram") == "connector"
     assert cli_main(["connector", "add", "tg", "--channel", "telegram", "--account", "bot:1"]) == 0
     capsys.readouterr()
@@ -200,3 +200,39 @@ def test_cli_runtime_and_cursor_verbs(colony, capsys):
     assert store._queue("tg").cursor is None
     assert cli_main(["connector", "runtime", "telegram", "adapter"]) == 0
     assert channel_runtime(colony / "woltspace.json", "telegram") == "adapter"
+
+
+def test_a_live_switch_is_refused_under_the_lodges_own_lock_and_a_start_cannot_race_it(colony, capsys, monkeypatch):
+    """Finding 1: the switch takes the control-plane lock `woltspace start` holds for life."""
+    from woltspace.instance import DataRootLock, InstanceConflict
+    from server import connectors as connectors_module
+
+    layout = RuntimeLayout.from_env()
+    running = DataRootLock(layout, "the-lodge")
+    running.acquire()
+    try:
+        assert cli_main(["connector", "runtime", "telegram", "connector"]) == 1
+        err = capsys.readouterr().err
+        assert "lodge is running" in err and "stop it" in err
+        assert channel_runtime(colony / "woltspace.json", "telegram") == "adapter"
+        # Reading is always fine.
+        assert cli_main(["connector", "runtime", "telegram"]) == 0
+    finally:
+        running.release()
+    # While the switch writes, a start that races it is refused by the same lock.
+    raced = []
+    real = connectors_module.set_channel_runtime
+
+    def write_while_starting(path, channel, runtime):
+        try:
+            DataRootLock(layout, "racing-start").acquire()
+        except InstanceConflict:
+            raced.append("refused")
+        return real(path, channel, runtime)
+
+    monkeypatch.setattr(connectors_module, "set_channel_runtime", write_while_starting)
+    assert cli_main(["connector", "runtime", "telegram", "connector"]) == 0
+    assert raced == ["refused"]
+    assert channel_runtime(colony / "woltspace.json", "telegram") == "connector"
+    # The lock is given back: a start can take it now.
+    DataRootLock(layout, "later-start").acquire()

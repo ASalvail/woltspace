@@ -36,25 +36,42 @@ committed transitions only, at most once: a crash between the write and the
 dispatch loses one.
 
 Inbound events have their own durable state. An accepted event is written
-as `accepted` together with its dedup record, and only then is the router
-run, outside the lock; its receipt turns the record into `handed_off`. Any
-event still `accepted` when the queue is next read (after a crash, a router
-error or a restart) is handed off again. The guarantee at each boundary:
+as `accepted` together with its dedup record, and only then is it handed to
+the dispatcher (the lodge's router), outside the lock; the receipt turns the
+record into `handed_off`. A store with no dispatcher configured (the CLI, a
+diagnostic read) never hands anything off and never writes a receipt. Each
+handoff is a committed, numbered attempt claimed by a connector-driven
+operation (lease, ack, upload, event, file): an owner read claims nothing,
+an uncommitted transaction dispatches nothing, and a receipt from an older
+attempt than the current claim is ignored. Before every attempt the current
+registry is read again: a binding that is gone cancels the record, a
+disabled instance or a channel the connector no longer owns leaves it
+waiting. Attempts are bounded (`handoff_max_attempts`); a record that used
+them up is parked as `handoff_failed`, kept with its files until the owner
+retries or cancels it (`woltspace connector handoffs`), never aged out. The
+guarantee at each boundary:
 
     provider -> core      at least once from the provider; core answers
                           exactly once per (account, event_id) for 7 days
-    core -> session       at least once: a crash after the router pasted
-                          but before the receipt was written repeats the
-                          paste. The session text carries the event id, so
-                          a reader can tell; the session itself cannot.
+    core -> session       bounded at-least-once attempts: a crash after the
+                          router pasted but before the receipt was written
+                          repeats the paste. The session text carries the
+                          event id, so a reader can tell; the session itself
+                          cannot. Attachments are moved to event-owned,
+                          persisted destinations before the paste, so every
+                          attempt names the same files.
     receipt -> cursor     the connector advances its cursor only past
-                          updates core has answered; a crash before the
-                          advance re-fetches them and core answers from
-                          dedup without a second handoff.
+                          positions core has answered, and only in the order
+                          it fetched them (see `set_cursor`); a crash before
+                          the advance re-fetches them and core answers from
+                          dedup without a second handoff. The position is
+                          part of the event's identity: a replay with another
+                          cursor is a conflict, never a relabel.
 
 The provider cursor and the map from provider message ids (every part of a
-split delivery) to deliveries live here too, scoped to the instance and its
-account, so reply routing survives a connector restart.
+split delivery, sent parts of a failed one included) to deliveries live
+here too, scoped to the instance's account and conversation, so reply
+routing survives a connector restart.
 
 Which runtime owns a channel (`telegram.runtime` in the lodge's
 woltspace.json: the in-process adapter by default, or the connector) is read
@@ -270,6 +287,7 @@ _SENDER_KEYS = frozenset({"provider_id", "display"})
 _CONVERSATION_KEYS = frozenset({"provider_id", "thread"})
 _ACK_KEYS = frozenset({"attempt_id", "ok", "provider_message_id", "provider_message_ids", "error", "retry"})
 _REPLY_TO_KEYS = frozenset({"delivery_id", "provider_message_id"})
+_IGNORE_KEYS = frozenset({"event_id", "cursor", "ignore"})
 RUNTIMES = ("adapter", "connector")
 
 
@@ -379,16 +397,25 @@ class _Tx:
         self.committed: list[tuple[str, dict]] = []
         self.queues: dict[str, _Queue] = {}
         self.dirty: set[str] = set()
-        # Accepted events to hand off once the lock is gone: (instance_id, dedup key).
-        self.handoffs: list[tuple[str, str]] = []
+        # Handoff claims: (instance_id, dedup key, attempt). Pending until the
+        # queue holding the claim is written, then committed; only committed
+        # claims are dispatched once the lock is gone.
+        self.pending_handoffs: list[tuple[str, str, int]] = []
+        self.committed_handoffs: list[tuple[str, str, int]] = []
+        # Owner and diagnostic reads never claim a handoff.
+        self.dispatch: bool = True
 
     def settle(self, instance_id: str) -> None:
-        """The queue is on disk (or gone): its transitions are committed."""
+        """The queue is on disk (or gone): its transitions and claims are committed."""
         self.dirty.discard(instance_id)
         kept = []
         for entry in self.pending:
             (self.committed if entry[0] == instance_id else kept).append(entry)
         self.pending = kept
+        kept_claims = []
+        for claim in self.pending_handoffs:
+            (self.committed_handoffs if claim[0] == instance_id else kept_claims).append(claim)
+        self.pending_handoffs = kept_claims
 
 
 class ConnectorStore:
@@ -407,7 +434,9 @@ class ConnectorStore:
         if runtime_config is None and self.root.parent.name == ".space":
             runtime_config = self.root.parent.parent / "woltspace.json"
         self.runtime_config = runtime_config
-        self.router: Callable[[AcceptedEvent], dict] = self.record_inbound
+        # The dispatcher. None (the CLI, tests of the store alone) means
+        # accepted events wait; the lodge installs its router.
+        self.router: Callable[[AcceptedEvent], dict] | None = None
         self._failure_listeners: list[Callable[[str, dict], None]] = [self.record_failure]
         self._held = threading.local()
 
@@ -456,7 +485,7 @@ class ConnectorStore:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     @contextlib.contextmanager
-    def _transaction(self):
+    def _transaction(self, *, dispatch: bool = True):
         """A locked operation whose callbacks run after the lock is released.
 
         Whatever the sweep changed is written on every way out that the
@@ -466,6 +495,7 @@ class ConnectorStore:
         a crash between the write and the dispatch loses that notification.
         """
         tx = _Tx()
+        tx.dispatch = dispatch and self.router is not None
         try:
             with self._lock():
                 try:
@@ -481,8 +511,8 @@ class ConnectorStore:
                         listener(instance_id, dict(delivery))
                     except Exception:
                         pass
-            for instance_id, key in tx.handoffs:
-                self._hand_off(instance_id, key)
+            for instance_id, key, attempt in tx.committed_handoffs:
+                self._hand_off(instance_id, key, attempt)
 
     def _load(self, tx: _Tx, instance_id: str) -> _Queue:
         queue = self._queue(instance_id)
@@ -653,7 +683,7 @@ class ConnectorStore:
         cancelled, here or by `recover()` after a crash. Either way it is
         cancelled exactly once.
         """
-        with self._transaction() as tx:
+        with self._transaction(dispatch=False) as tx:
             registry = self._registry()
             self._recover_orphans(registry, tx)
             self._instance(registry, instance_id)
@@ -670,7 +700,7 @@ class ConnectorStore:
 
     def recover(self) -> int:
         """Finish interrupted removals: cancel every queue whose instance is gone."""
-        with self._transaction() as tx:
+        with self._transaction(dispatch=False) as tx:
             return self._recover_orphans(self._registry(), tx)
 
     def _recover_orphans(self, registry: dict, tx: _Tx) -> int:
@@ -944,7 +974,14 @@ class ConnectorStore:
             d for d in queue.deliveries
             if not (d["status"] in _TERMINAL and now - d.get("finished", now) > limits.dedup_retention_seconds)
         ]
+        unresolved = {
+            a["upload_id"] for r in queue.inbound.values() if r["state"] in ("accepted", "handoff_failed")
+            for a in r["event"].get("attachments", ())
+        }
         for upload_id, handle in list(queue.uploads.items()):
+            if upload_id in unresolved:
+                # Claimed by an event still waiting for its handoff: kept, whatever the clock says.
+                continue
             if handle.get("state") == "in_flight":
                 stale = now - handle.get("started", now) > limits.upload_ttl_seconds
                 if stale or not _pid_alive(handle.get("pid")):
@@ -970,16 +1007,28 @@ class ConnectorStore:
             entry for entry in queue.counters["uploads"] if now - entry[0] < 3600
         ]
         for key, record in list(queue.inbound.items()):
-            if now - record["at"] >= limits.dedup_retention_seconds:
+            if record["state"] in ("handed_off", "cancelled") and now - record["at"] >= limits.dedup_retention_seconds:
                 del queue.inbound[key]
-            elif record["state"] == "accepted" and record.get("attempts", 0) < limits.handoff_max_attempts and (
+            elif record["state"] == "accepted" and tx.dispatch and (
                 record.get("tried") is None or now - record["tried"] >= limits.handoff_retry_seconds
             ):
-                # Still waiting for its receipt: hand it off again once the lock is gone.
+                # Still waiting for its receipt. Claim another attempt only
+                # under the current policy: the binding must still exist and
+                # the instance must be enabled and owned by the connector.
+                binding_id = record["event"]["binding"].get("binding_id")
+                if binding_id not in bindings:
+                    record["state"] = "cancelled"
+                    record["result"] = {"routed": "cancelled", "reason": "binding_removed"}
+                    record["finished"] = now
+                    continue
+                if not (instance["enabled"] and self.runtime_active(instance.get("channel", ""))):
+                    continue
+                if record.get("attempts", 0) >= limits.handoff_max_attempts:
+                    record["state"] = "handoff_failed"
+                    continue
                 record["tried"] = now
                 record["attempts"] = record.get("attempts", 0) + 1
-                if (instance_id, key) not in tx.handoffs:
-                    tx.handoffs.append((instance_id, key))
+                tx.pending_handoffs.append((instance_id, key, record["attempts"]))
         queue.provider_messages = {
             key: record for key, record in queue.provider_messages.items()
             if now - record["at"] < limits.dedup_retention_seconds
@@ -995,6 +1044,23 @@ class ConnectorStore:
         limits = self.limits
         if not isinstance(payload, dict):
             raise ConnectorError(400, "malformed_event", "event must be an object")
+        if "ignore" in payload:
+            # A terminal-ignore disposition: the connector saw an update it
+            # cannot carry (a service message, an unsupported kind) and wants
+            # the position answered so its cursor can pass it.
+            if not set(payload) <= _IGNORE_KEYS:
+                raise ConnectorError(400, "malformed_event", "unknown field in ignore")
+            event_id = _provider_id(payload.get("event_id"), limits.id_max_chars)
+            reason = payload.get("ignore")
+            if event_id is None or not valid_id(reason, 64):
+                raise ConnectorError(400, "malformed_event", "ignore needs an event_id and a reason id")
+            cursor = payload.get("cursor")
+            if cursor is not None and (
+                isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0
+                or len(str(cursor)) > limits.cursor_max_chars
+            ):
+                raise ConnectorError(400, "malformed_event", "cursor must be a non-negative integer")
+            return {"event_id": event_id, "ignore": reason, "cursor": cursor, "attachments": []}
         if not set(payload) <= _EVENT_KEYS:
             raise ConnectorError(400, "malformed_event", "unknown field in event")
         event_id = _provider_id(payload.get("event_id"), limits.id_max_chars)
@@ -1080,9 +1146,10 @@ class ConnectorStore:
         docstring names.
         """
         event = self._parse_event(payload)
-        # The digest leaves out the display name and the cursor: shown and
-        # confirmed respectively, never routed on.
-        digest = _canonical({k: v for k, v in event.items() if k not in ("display", "cursor")})
+        # The digest leaves out the display name (shown, never routed on) and
+        # keeps the cursor: the position is part of the event's identity, so a
+        # replay cannot relabel it.
+        digest = _canonical({k: v for k, v in event.items() if k != "display"})
         key = f"{who.account}\x00{event['event_id']}"
         with self._transaction() as tx:
             registry = self._registry()
@@ -1123,6 +1190,8 @@ class ConnectorStore:
                 self._commit(tx, who.instance_id)
                 return 200, body
 
+            if event.get("ignore"):
+                return drop(f"ignored_{event['ignore']}")
             if not who.enabled:
                 return drop("instance_disabled")
             binding, reason = self._binding_for(
@@ -1139,9 +1208,9 @@ class ConnectorStore:
                     )
                     target = {"binding_id": target.get("binding_id"), "session": target.get("session")} if target else None
                 else:
-                    # The map is keyed by this instance's account: another
-                    # account's message ids never resolve here.
-                    target = queue.provider_messages.get(f"{who.account}\x00{value}")
+                    # Keyed by account and conversation: a message id is only
+                    # unique inside its chat, and another account's never resolve here.
+                    target = queue.provider_messages.get(f"{who.account}\x00{event['conversation']}\x00{value}")
                 # The exact binding, not a conversation that looks the same.
                 if target is None or target.get("binding_id") != binding["binding_id"]:
                     return drop("reply_to_out_of_binding")
@@ -1175,29 +1244,59 @@ class ConnectorStore:
                 reply_session, event["cursor"],
             )
             queue.dedup[key] = {"digest": digest, "status": 200, "body": body, "at": now}
-            queue.inbound[key] = {
-                "state": "accepted", "event": accepted.to_record(), "at": now, "tried": now, "attempts": 1,
-            }
+            queue.inbound[key] = {"state": "accepted", "event": accepted.to_record(), "at": now}
+            if tx.dispatch:
+                queue.inbound[key].update({"tried": now, "attempts": 1})
+                tx.pending_handoffs.append((who.instance_id, key, 1))
             answered()
             self._commit(tx, who.instance_id)
-        # Durable first, then the router, outside the lock. The handoff
-        # receipt is written by _hand_off; a crash before it is retried.
-        routed = self._hand_off(who.instance_id, key)
-        return 200, {**body, **routed}
-
-    def _hand_off(self, instance_id: str, key: str) -> dict:
-        """Run the router for one accepted event and write its receipt.
-
-        Idempotent on the router's side by contract: the router keys on
-        `AcceptedEvent.dedup_key`. Core's side is a state flip, so two
-        handoffs racing (a retry after a slow first run) write the same
-        receipt and the second router result is kept.
-        """
+        # Durable first; the dispatcher ran after the lock (see _transaction)
+        # and its result, if any, is in the record by now.
         with self._lock():
+            record = self._queue(who.instance_id).inbound.get(key) or {}
+        return 200, {**body, **(record.get("result") or {"routed": "pending"})}
+
+    def _hand_off(self, instance_id: str, key: str, attempt: int) -> dict:
+        """Run the dispatcher for one committed attempt and write its receipt.
+
+        The current policy is read again first: a binding that is gone
+        cancels the record; a disabled instance or a channel the connector
+        does not own leaves it waiting (the claim is given back). The
+        event's binding snapshot is refreshed, so a changed grant
+        (default wolt, may_wake) is what the router sees. The receipt is
+        written only while this attempt is still the current one: a late
+        receipt from a slower, older attempt is ignored.
+        """
+        if self.router is None:
+            return {}
+        with self._lock():
+            registry = self._registry()
             queue = self._queue(instance_id)
             record = queue.inbound.get(key)
-            if record is None or record["state"] != "accepted":
-                return dict((record or {}).get("result") or {})
+            if record is None or record["state"] != "accepted" or record.get("attempts") != attempt:
+                return {}
+            instance = registry["instances"].get(instance_id)
+            current = next(
+                (b for b in registry["bindings"]
+                 if b["instance_id"] == instance_id
+                 and b["binding_id"] == record["event"]["binding"].get("binding_id")),
+                None,
+            )
+            if instance is None or current is None:
+                record.update({
+                    "state": "cancelled", "finished": self.clock(),
+                    "result": {"routed": "cancelled", "reason": "binding_removed"},
+                })
+                self._save_queue(instance_id, queue)
+                return {}
+            if not (instance["enabled"] and self.runtime_active(instance["channel"])):
+                # Give the claim back: not an attempt, just not now.
+                record["attempts"] = attempt - 1
+                record["tried"] = None
+                self._save_queue(instance_id, queue)
+                return {}
+            record["event"]["binding"] = dict(current)
+            self._save_queue(instance_id, queue)
             event = AcceptedEvent.from_record(record["event"])
         try:
             routed = self.router(event) or {}
@@ -1206,20 +1305,77 @@ class ConnectorStore:
         with self._lock():
             queue = self._queue(instance_id)
             record = queue.inbound.get(key)
-            if record is not None:
-                if routed.get("routed") == "error":
-                    # No receipt: the next read tries again, up to the cap.
-                    record["last_error"] = routed.get("error", "")
-                    if record.get("attempts", 0) >= self.limits.handoff_max_attempts:
-                        record["state"] = "handoff_failed"
-                else:
-                    record["state"] = "handed_off"
-                record["result"] = routed
-                dedup = queue.dedup.get(key)
-                if dedup is not None:
-                    dedup["body"] = {**dedup["body"], **routed}
-                self._save_queue(instance_id, queue)
+            if record is None or record["state"] != "accepted" or record.get("attempts") != attempt:
+                # Resolved, cancelled or re-claimed meanwhile: this receipt is late.
+                return {}
+            if routed.get("routed") == "error":
+                # No receipt: the next connector-driven read claims another
+                # attempt, up to the cap; then the record is parked.
+                record["last_error"] = routed.get("error", "")
+                if attempt >= self.limits.handoff_max_attempts:
+                    record["state"] = "handoff_failed"
+            else:
+                record["state"] = "handed_off"
+                record["finished"] = self.clock()
+            record["result"] = routed
+            dedup = queue.dedup.get(key)
+            if dedup is not None:
+                dedup["body"] = {**dedup["body"], **routed}
+            self._save_queue(instance_id, queue)
         return routed
+
+    def record_attachment_destinations(self, instance_id: str, key: str, destinations: dict) -> None:
+        """Persist where each of an event's files is going before it moves.
+
+        Event-owned and stable: every later attempt names the same paths.
+        """
+        with self._lock():
+            queue = self._queue(instance_id)
+            record = queue.inbound.get(key)
+            if record is None:
+                return
+            for attachment in record["event"].get("attachments", ()):
+                dest = destinations.get(attachment["upload_id"])
+                if dest is not None:
+                    attachment["dest"] = str(dest)
+            self._save_queue(instance_id, queue)
+
+    def handoffs(self, instance_id: str) -> list[dict]:
+        """Owner view: every accepted event not yet handed off, parked ones included."""
+        with self._lock():
+            return [
+                {"key": key, **record} for key, record in self._queue(instance_id).inbound.items()
+                if record["state"] in ("accepted", "handoff_failed")
+            ]
+
+    def retry_handoff(self, instance_id: str, key: str) -> bool:
+        """Owner recovery: a parked record gets its attempts back; the lodge dispatches it next."""
+        with self._lock():
+            queue = self._queue(instance_id)
+            record = queue.inbound.get(key)
+            if record is None or record["state"] not in ("accepted", "handoff_failed"):
+                return False
+            record.update({"state": "accepted", "attempts": 0, "tried": None})
+            self._save_queue(instance_id, queue)
+            return True
+
+    def cancel_handoff(self, instance_id: str, key: str) -> bool:
+        """Owner recovery: give the event up; its files are released."""
+        with self._transaction(dispatch=False) as tx:
+            queue = self._load(tx, instance_id)
+            record = queue.inbound.get(key)
+            if record is None or record["state"] not in ("accepted", "handoff_failed"):
+                return False
+            record.update({
+                "state": "cancelled", "finished": self.clock(),
+                "result": {"routed": "cancelled", "reason": "owner"},
+            })
+            self._release_unclaimed(instance_id, queue, [])
+            for attachment in record["event"].get("attachments", ()):
+                queue.uploads.pop(attachment["upload_id"], None)
+                (self._upload_dir(instance_id) / attachment["upload_id"]).unlink(missing_ok=True)
+            self._commit(tx, instance_id)
+            return True
 
     def pending_handoffs(self, instance_id: str) -> list[dict]:
         """Accepted events whose receipt is not written yet (owner/diagnostic view)."""
@@ -1232,8 +1388,8 @@ class ConnectorStore:
     # ---------------------------------------------------------------- cursor
 
     def state(self, who: Principal) -> dict:
-        """What a connector needs at start: its cursor and whether it may run."""
-        with self._transaction() as tx:
+        """What a connector needs at start: its cursor and whether it may run. Claims nothing."""
+        with self._transaction(dispatch=False) as tx:
             registry = self._registry()
             who = self._live(registry, who)
             queue = self._load(tx, who.instance_id)
@@ -1251,6 +1407,14 @@ class ConnectorStore:
         offset: the last answered update_id plus one). It may equal the
         current cursor, move forward to at most answered + 1, and never move
         back; a channel whose runtime is not the connector keeps its cursor.
+
+        What core can check is that the position just below the cursor got
+        a final answer. That every earlier fetched update did too is the
+        connector's ordered-batch responsibility: it answers a fetched batch
+        in order, stops at the first answer that is not final, and posts
+        only then. Provider ids may have gaps (positions that were never
+        fetched are nobody's to answer); a position that was fetched is
+        answered as an event or as an ignore before anything past it.
         """
         if (
             isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0
@@ -1523,8 +1687,8 @@ class ConnectorStore:
             return delivery_id
 
     def list_deliveries(self, instance_id: str) -> list[dict]:
-        """Owner view of a queue, with the registry and the clocks applied first."""
-        with self._transaction() as tx:
+        """Owner view of a queue, with the registry and the clocks applied first. Claims nothing."""
+        with self._transaction(dispatch=False) as tx:
             registry = self._registry()
             self._instance(registry, instance_id)
             queue = self._load(tx, instance_id)
@@ -1626,18 +1790,22 @@ class ConnectorStore:
                 # a connector learns nothing about queues that are not its own.
                 self._commit(tx, who.instance_id)
                 raise ConnectorError(409, "stale_attempt", "no active lease for that attempt")
+            # Every part the provider accepted, this attempt or an earlier
+            # one, sent or not the whole message: a reply to any of them
+            # finds the delivery, inside its conversation.
+            known = [p for p in delivery.get("provider_message_ids", [])]
+            known.extend(p for p in parts if p not in known)
+            delivery["provider_message_ids"] = known
+            for part in parts:
+                queue.provider_messages[f"{who.account}\x00{delivery['conversation']}\x00{part}"] = {
+                    "delivery_id": delivery["delivery_id"], "binding_id": delivery.get("binding_id"),
+                    "session": delivery.get("session"), "at": self.clock(),
+                }
             if body["ok"]:
                 delivery.update({
                     "status": "delivered", "lease": None, "finished": self.clock(),
-                    "provider_message_id": parts[0] if parts else None,
-                    "provider_message_ids": parts,
+                    "provider_message_id": known[0] if known else None,
                 })
-                for part in parts:
-                    # Every part of a split send: a reply to any of them finds the delivery.
-                    queue.provider_messages[f"{who.account}\x00{part}"] = {
-                        "delivery_id": delivery["delivery_id"], "binding_id": delivery.get("binding_id"),
-                        "session": delivery.get("session"), "at": self.clock(),
-                    }
                 self._drop_files(delivery)
             elif retry:
                 self._attempt_failed(

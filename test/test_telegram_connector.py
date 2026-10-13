@@ -37,6 +37,7 @@ class FakeBotApi:
         self.sent: list[dict] = []
         self.files: dict[str, bytes] = {}
         self.fail: dict[str, dict] = {}     # method -> error body for the next call
+        self.file_status: dict[str, int] = {}   # file name -> HTTP status for the next download
         self.next_message_id = 100
         self.polled_offsets: list[int | None] = []
 
@@ -48,6 +49,8 @@ class FakeBotApi:
         assert request.url.host == BOT_API.removeprefix("https://")
         if path.startswith(f"/file/bot{BOT_TOKEN}/"):
             name = path.split("/")[-1]
+            if name in self.file_status:
+                return httpx.Response(self.file_status.pop(name), content=b"")
             if name in self.files:
                 return httpx.Response(200, content=self.files[name])
             return httpx.Response(404, json={"ok": False})
@@ -72,8 +75,10 @@ class FakeBotApi:
         if method == "getUpdates":
             self.polled_offsets.append(params.get("offset"))
             offset = params.get("offset")
-            result = [u for u in self.updates if offset is None or u["update_id"] >= offset]
-            return httpx.Response(200, json={"ok": True, "result": result})
+            if offset is not None:
+                # Telegram confirms on offset: everything below it is gone for good.
+                self.updates = [u for u in self.updates if u["update_id"] >= offset]
+            return httpx.Response(200, json={"ok": True, "result": list(self.updates)})
         if method == "getFile":
             file_id = params["file_id"]
             return httpx.Response(200, json={"ok": True, "result": {"file_id": file_id, "file_path": f"files/{file_id}"}})
@@ -146,7 +151,8 @@ async def test_text_updates_become_accepted_events_and_the_cursor_follows(lodge,
     state = await connector.start()
     assert state["cursor"] is None
     report = await connector.poll_once(timeout=0)
-    assert api.polled_offsets == [None]
+    # One fetch, then the confirming ask with the new offset.
+    assert api.polled_offsets == [None, 44]
     assert [e["body"].get("accepted") for e in report.events] == [True, True, False]
     assert report.events[2]["body"]["reason"] == "sender_not_allowed"
     assert report.cursor == 44
@@ -183,7 +189,8 @@ async def test_the_cursor_never_moves_past_an_update_the_lodge_did_not_answer(lo
     # The next poll re-fetches from 42; the lodge answers it and 43, and 41 is
     # not asked for again.
     report = await connector.poll_once(timeout=0)
-    assert api.polled_offsets[-1] == 42
+    # Fetched from 42 (41 confirmed by the earlier short ask), then confirmed at 44.
+    assert api.polled_offsets == [None, 42, 42, 44]
     assert [e["status"] for e in report.events] == [200, 200]
     assert report.cursor == 44
     assert [e.event_id for e in lodge.routed] == ["tg:41", "tg:42", "tg:43"]
@@ -221,7 +228,7 @@ async def test_a_file_the_api_cannot_serve_still_delivers_the_text(lodge, api):
     report = await connector.poll_once(timeout=0)
     assert report.events[0]["body"]["accepted"] is True
     assert lodge.routed[0].attachments == ()
-    assert "could not be fetched" in lodge.routed[0].text
+    assert "could not be carried: file download answered 404" in lodge.routed[0].text
 
 
 async def test_replies_to_the_bots_messages_route_through_the_message_map(lodge, api):
@@ -305,13 +312,16 @@ async def test_a_partial_send_is_a_failed_attempt_and_may_repeat_the_sent_parts(
     connector.bot = httpx.AsyncClient(transport=httpx.MockTransport(second_part_times_out), base_url=BOT_API)
     report = await connector.deliver_once()
     assert report.acks[0]["body"]["status"] == "queued"
-    assert len([m for m in api.sent if m["method"] == "sendMessage"]) == 1
+    sent_first = [m for m in api.sent if m["method"] == "sendMessage"]
+    assert len(sent_first) == 1
+    # The part that went out is mapped even though the attempt failed.
+    assert lodge.deliveries()[delivery_id]["provider_message_ids"] == [str(sent_first[0]["message_id"])]
     # Documented duplicate: the retry resends part one.
     lodge.store.clock = lambda: __import__("time").time() + 10
     report = await connector.deliver_once()
     assert report.acks[0]["body"]["status"] == "delivered"
     assert len([m for m in api.sent if m["method"] == "sendMessage"]) == 3
-    assert len(lodge.deliveries()[delivery_id]["provider_message_ids"]) == 2
+    assert len(lodge.deliveries()[delivery_id]["provider_message_ids"]) == 3
 
 
 async def test_a_paused_or_revoked_lodge_stops_the_connector(lodge, api):
@@ -324,8 +334,9 @@ async def test_a_paused_or_revoked_lodge_stops_the_connector(lodge, api):
     api.updates = [_update(91, "anyone there?")]
     with pytest.raises(LodgeRefused):
         await connector.poll_once(timeout=0)
-    # Nothing was confirmed on the losing side: the update is still Telegram's to hand out.
-    assert api.polled_offsets[-1] is None
+    # The fence comes before getUpdates: nothing was polled, nothing confirmed.
+    assert api.polled_offsets == []
+    assert [u["update_id"] for u in api.updates] == [91]
 
 
 async def test_the_bot_token_never_reaches_a_log_line(lodge, api, caplog):
@@ -345,3 +356,198 @@ async def test_the_bot_token_never_reaches_a_log_line(lodge, api, caplog):
         report = await connector.deliver_once()
     assert BOT_TOKEN not in json.dumps(report.acks)
     assert BOT_TOKEN not in json.dumps(lodge.deliveries())
+
+
+# ------------------------------------------------- round 2: fence, media, logging
+
+
+def _switched_lodge(tmp_path, monkeypatch, runtime="connector"):
+    """A lodge whose store reads the switch from a woltspace.json of its own."""
+    from server.connectors import set_channel_runtime
+
+    config = tmp_path / "woltspace.json"
+    lodge = Lodge(tmp_path)
+    lodge.store.runtime_config = config
+    set_channel_runtime(config, "telegram", runtime)
+    monkeypatch.setattr(connector_api, "CONNECTORS_DIR", lodge.store.root)
+    monkeypatch.setattr(connector_api, "_store", lodge.store)
+    monkeypatch.setattr(connector_api, "_POLL_INTERVAL", 0.01)
+    return lodge, config
+
+
+async def test_the_fence_stops_polling_and_sending_when_ownership_is_lost_and_resumes_after(tmp_path, monkeypatch):
+    """Finding 1, both directions, with a Telegram that confirms on offset."""
+    from server.connectors import set_channel_runtime
+
+    lodge, config = _switched_lodge(tmp_path, monkeypatch)
+    api = FakeBotApi()
+    api.updates = [_update(41, "one"), _update(42, "two")]
+    connector = _connector(lodge, api)
+    report = await connector.poll_once(timeout=0)
+    assert report.cursor == 43 and [e.event_id for e in lodge.routed] == ["tg:41", "tg:42"]
+    # connector -> adapter: the file says adapter. The next poll is fenced
+    # before getUpdates, so Telegram keeps 43 unconfirmed for the adapter.
+    api.updates.append(_update(43, "three"))
+    set_channel_runtime(config, "telegram", "adapter")
+    report = await connector.poll_once(timeout=0)
+    assert report.fenced is True and report.events == []
+    # 41 and 42 were confirmed right after the lodge answered them; 43 was
+    # never asked for, so Telegram still holds it for the adapter.
+    assert api.polled_offsets[-1] == 43 and len(api.polled_offsets) == 2
+    assert [u["update_id"] for u in api.updates] == [43]
+    # A send already leased is fenced too: nothing goes to Telegram, no ack.
+    set_channel_runtime(config, "telegram", "connector")
+    delivery_id = lodge.enqueue("hello")
+    leased = await connector.lease_batch()
+    assert [d["delivery_id"] for d in leased["deliveries"]] == [delivery_id]
+    set_channel_runtime(config, "telegram", "adapter")
+    from woltspace_telegram import Report
+    report = await connector.send_leased(leased["deliveries"], Report())
+    assert report.fenced is True and report.acks == [] and api.sent == []
+    assert lodge.deliveries()[delivery_id]["status"] == "leased"
+    # A held long poll loses too: it ends paused with nothing.
+    assert (await connector.lease_batch(wait=0.2)) == {"deliveries": [], "paused": True}
+    # adapter -> connector: the backlog Telegram kept is what the connector gets.
+    set_channel_runtime(config, "telegram", "connector")
+    lodge.store.clock = lambda: __import__("time").time() + 120   # the lease expired
+    report = await connector.poll_once(timeout=0)
+    assert [e["body"]["event_id"] for e in report.events] == ["tg:43"]
+    assert report.cursor == 44
+    report = await connector.deliver_once()
+    assert report.acks[0]["body"]["status"] == "delivered"
+
+
+async def test_transient_media_failures_hold_the_cursor_and_permanent_ones_become_a_note(lodge, api):
+    api.updates = [
+        _update(51, document={"file_id": "d1", "file_unique_id": "ud1", "file_name": "a.pdf"}),
+        _update(52, "after"),
+    ]
+    api.files["d1"] = b"%PDF"
+    connector = _connector(lodge, api)
+    # getFile 429: the batch stops at 51, nothing after it is answered.
+    api.fail["getFile"] = {"error_code": 429, "description": "Too Many Requests"}
+    report = await connector.poll_once(timeout=0)
+    assert (report.events, report.stopped_at, report.cursor) == ([], 51, None)
+    assert lodge.routed == []
+    # Download 503: same.
+    api.file_status["d1"] = 503
+    report = await connector.poll_once(timeout=0)
+    assert (report.events, report.stopped_at) == ([], 51)
+    # Lodge upload 429 (quota): same, and the update is still unconfirmed.
+    from server.connectors import Limits as _Limits
+    lodge.store.limits = _Limits(outbound_file_max_bytes=1_000_000, upload_disk_cap_bytes=1)
+    report = await connector.poll_once(timeout=0)
+    assert (report.events, report.stopped_at) == ([], 51)
+    assert [u["update_id"] for u in api.updates] == [51, 52]
+    # Pressure gone: both are carried, in order, with the file.
+    lodge.store.limits = LIMITS
+    report = await connector.poll_once(timeout=0)
+    assert [e["body"]["event_id"] for e in report.events] == ["tg:51", "tg:52"]
+    assert lodge.routed[0].attachments[0]["name"] == "a.pdf"
+    assert report.cursor == 53
+    # Permanent (404): a note, the event goes on.
+    api.updates = [_update(53, document={"file_id": "gone", "file_unique_id": "ug"})]
+    report = await connector.poll_once(timeout=0)
+    assert report.events[0]["body"]["accepted"] is True
+    assert "could not be carried" in lodge.routed[-1].text and report.cursor == 54
+
+
+async def test_an_oversized_download_is_cut_while_streaming(lodge, api, monkeypatch):
+    import woltspace_telegram as module
+
+    monkeypatch.setattr(module, "DOWNLOAD_CAP", 100)
+    served = []
+
+    class Chunks(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            for _ in range(50):
+                served.append(1)
+                yield b"x" * 10
+
+    def handle(request):
+        if request.url.path.startswith(f"/file/bot{BOT_TOKEN}/"):
+            return httpx.Response(200, stream=Chunks())
+        return api.handle(request)
+
+    api.updates = [_update(61, document={"file_id": "big", "file_unique_id": "ub", "file_name": "big.bin"}, caption="see")]
+    connector = _connector(lodge, api)
+    connector.bot = httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url=BOT_API)
+    report = await connector.poll_once(timeout=0)
+    assert report.events[0]["body"]["accepted"] is True
+    assert "over 100 bytes" in lodge.routed[0].text and lodge.routed[0].attachments == ()
+    assert len(served) < 50
+
+
+async def test_unsupported_updates_are_ignored_durably_and_the_frontier_follows_fetch_order(lodge, api, monkeypatch):
+    """Finding 6: ignores, gaps, an unanswered earlier item, a replay with another cursor."""
+    api.updates = [
+        _update(41, "one"),
+        {"update_id": 42, "my_chat_member": {"chat": {"id": 101}}},        # a service update
+        _update(50, "after a gap"),
+    ]
+    connector = _connector(lodge, api)
+    report = await connector.poll_once(timeout=0)
+    assert [(e["body"].get("accepted"), e["body"].get("reason")) for e in report.events] == [
+        (True, None), (False, "ignored_unsupported_update"), (True, None),
+    ]
+    assert report.cursor == 51
+    assert api.updates == []
+    # An unanswered earlier item: the lodge cannot take 61 (503), 62 is fine.
+    api.updates = [_update(61, "stuck"), _update(62, "later")]
+    original = lodge.store.accept_event
+    calls = []
+
+    def flaky(who, payload):
+        calls.append(payload["event_id"])
+        if payload["event_id"] == "tg:61" and len(calls) == 1:
+            from server.connectors import ConnectorStateUnreadable
+            raise ConnectorStateUnreadable("hiccup")
+        return original(who, payload)
+
+    monkeypatch.setattr(lodge.store, "accept_event", flaky)
+    report = await connector.poll_once(timeout=0)
+    assert (report.stopped_at, report.cursor, calls) == (61, 51, ["tg:61"])
+    assert [u["update_id"] for u in api.updates] == [61, 62]
+    report = await connector.poll_once(timeout=0)
+    assert (report.cursor, calls) == (63, ["tg:61", "tg:61", "tg:62"])
+    # The same text at a new position is a different event; the recorded
+    # position of an old one cannot be relabelled (the store-level test
+    # `test_a_replay_with_another_cursor_is_a_conflict_not_a_relabel` covers
+    # the conflict itself: here the connector's cursor comes from core).
+    monkeypatch.setattr(lodge.store, "accept_event", original)
+    api.updates = [_update(99, "one")]
+    report = await connector.poll_once(timeout=0)
+    assert report.cursor == 100
+    assert (await connector._lodge("GET", "/state")).json()["cursor"] == 100
+
+
+async def test_the_runners_logging_never_shows_the_token_even_at_debug(lodge, api, caplog, tmp_path, monkeypatch):
+    """Finding 4: successful requests, downloads, sends and failures, at DEBUG."""
+    import woltspace_telegram.runner as runner
+
+    runner.configure_logging(BOT_TOKEN, level=logging.DEBUG)
+    try:
+        api.files["d1"] = b"%PDF"
+        api.updates = [_update(41, document={"file_id": "d1", "file_unique_id": "ud1", "file_name": "a.pdf"})]
+        api.fail["sendMessage"] = {"error_code": 400, "description": f"Bad Request: see https://x/bot{BOT_TOKEN}/sendMessage"}
+        lodge.enqueue("hello")
+        connector = _connector(lodge, api)
+        with caplog.at_level(logging.DEBUG):
+            await connector.poll_once(timeout=0)
+            report = await connector.deliver_once()
+            logging.getLogger("httpx").info("HTTP Request: POST https://host/bot%s/getUpdates", BOT_TOKEN)
+            logging.getLogger("woltspace_telegram").warning("failed: %s", f"url=/bot{BOT_TOKEN}/x")
+            try:
+                raise RuntimeError(f"boom /bot{BOT_TOKEN}/")
+            except RuntimeError:
+                logging.getLogger("woltspace_telegram").exception("with traceback")
+        assert BOT_TOKEN not in caplog.text
+        assert "<token>" in caplog.text
+        assert not [r for r in caplog.records if r.name.startswith("httpx") and r.levelno < logging.WARNING]
+        # Provider descriptions and nack errors are redacted too.
+        error = lodge.deliveries()[report.acks[0]["delivery_id"]]["error"]
+        assert BOT_TOKEN not in error and "<token>" in error
+        assert BOT_TOKEN not in json.dumps(report.acks)
+    finally:
+        logging.setLogRecordFactory(logging.LogRecord)
+        logging.getLogger().setLevel(logging.WARNING)

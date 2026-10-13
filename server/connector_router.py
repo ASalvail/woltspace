@@ -1,16 +1,20 @@
 """The real inbound router: an accepted connector event becomes a session message.
 
-Runs outside the store lock, after core has written the event as accepted,
-and is idempotent on `event.dedup_key` as far as core can be: the receipt
-core writes afterwards is what stops a second handoff. The paste into a
-session is not idempotent, so a crash between the paste and the receipt
-repeats the paste; the pasted header names the event id so a reader can tell.
+Runs outside the store lock as the store's dispatcher, after core has written
+the event as accepted, under a committed attempt claim; the receipt core
+writes afterwards is what stops another attempt. The paste into a session is
+not idempotent, so a crash between the paste and the receipt repeats the
+paste; the pasted header names the event id so a reader can tell.
 
-What it does, in order:
+What it does, in order, every attempt the same way:
 
-1. Moves the event's claimed uploads into the channel's uploads folder
-   (`.space/<channel>/uploads/`, where the old adapter saved files) with the
-   adapter's timestamped names, and releases their handles.
+1. Decides where each of the event's files goes (an event-owned, stable
+   name under `.space/<channel>/uploads/`, where the old adapter saved
+   files), writes those destinations into the durable event, then moves the
+   files there without ever overwriting: a file already at its destination
+   is left alone, a source that is gone is fine if its destination exists.
+   Only then are the upload handles released. A crash anywhere in here
+   leaves the next attempt the same destinations and the same files.
 2. Picks the session: the one the replied-to delivery came from, else the
    binding's remembered active session, else the default wolt's live
    session. Delivers there; a stopped session is resumed only when the
@@ -26,10 +30,10 @@ default to the lodge's own `sessions` module, so tests mock the boundary.
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
-import shutil
-from datetime import datetime, timezone
+import re
 from pathlib import Path
 from typing import Callable
 
@@ -40,6 +44,11 @@ logger = logging.getLogger(__name__)
 
 _CREATURE_EMOJIS = {"raccoon": "🦝", "beaver": "🦫", "otter": "🦦", "dog": "🐶", "wolf": "🐺"}
 MAX_REPLY_CHARS = 1000
+_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+class AttachmentUnavailable(RuntimeError):
+    """A file is neither at its source nor at its destination: nothing to paste."""
 
 
 def _default_deliver(session: str, text: str) -> dict:
@@ -69,27 +78,49 @@ def _reply_instruction(channel: str, conversation: str) -> str:
         return ""
 
 
-def move_uploads(event: AcceptedEvent, uploads_dir: Path) -> list[Path]:
-    """Put the event's files where the adapter put them, timestamped, never overwriting."""
-    saved = []
-    uploads_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    for attachment in event.attachments:
-        source = Path(attachment["path"])
-        if not source.is_file():
-            continue
-        dest = uploads_dir / f"{stamp}_{attachment['name']}"
-        counter = 1
-        while dest.exists():
-            dest = uploads_dir / f"{stamp}_{counter}_{attachment['name']}"
-            counter += 1
-        try:
-            os.replace(source, dest)
-        except OSError:
-            shutil.copy2(source, dest)
+def destinations_for(event: AcceptedEvent, uploads_dir: Path) -> dict[str, Path]:
+    """Event-owned names: the same event always maps to the same paths."""
+    stamp = _UNSAFE.sub("_", event.event_id)[:64]
+    return {
+        a["upload_id"]: uploads_dir / f"{stamp}_{a['upload_id'][:8]}_{a['name']}"
+        for a in event.attachments
+    }
+
+
+def place_file(source: Path, dest: Path) -> Path:
+    """Move `source` to `dest` without ever overwriting; idempotent across attempts.
+
+    Linking first means a crash between the link and the unlink leaves both
+    names on one file, which the next attempt tidies. An existing
+    destination is never replaced: if the source is still there it is
+    simply removed, since the destination is this event's own file.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        if source.exists():
             source.unlink(missing_ok=True)
-        saved.append(dest)
-    return saved
+        return dest
+    if not source.exists():
+        raise AttachmentUnavailable(f"{source.name} is gone and {dest.name} was never written")
+    try:
+        os.link(source, dest)
+    except OSError as exc:
+        if exc.errno == errno.EEXIST:
+            source.unlink(missing_ok=True)
+            return dest
+        if exc.errno not in (errno.EXDEV, errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP):
+            raise
+        # No hard links across here: copy to a private name, then publish it.
+        tmp = dest.with_name(f".{dest.name}.part")
+        tmp.write_bytes(source.read_bytes())
+        try:
+            os.link(tmp, dest)
+        except FileExistsError:
+            pass
+        finally:
+            tmp.unlink(missing_ok=True)
+    source.unlink(missing_ok=True)
+    return dest
 
 
 def session_text(event: AcceptedEvent, files: list[Path]) -> str:
@@ -144,10 +175,24 @@ class Router:
         except (OSError, ValueError):
             return "🐾"
 
+    def place_files(self, event: AcceptedEvent) -> list[Path]:
+        """Step 1: destinations persisted, files moved idempotently, handles released."""
+        if not event.attachments:
+            return []
+        uploads_dir = self.uploads_root / event.channel / "uploads"
+        planned = destinations_for(event, uploads_dir)
+        # A destination already written by an earlier attempt wins over the plan.
+        destinations = {
+            a["upload_id"]: Path(a["dest"]) if a.get("dest") else planned[a["upload_id"]]
+            for a in event.attachments
+        }
+        self.store.record_attachment_destinations(event.instance_id, event.dedup_key, destinations)
+        files = [place_file(Path(a["path"]), destinations[a["upload_id"]]) for a in event.attachments]
+        self.store.release_uploads(event.instance_id, list(destinations))
+        return files
+
     def __call__(self, event: AcceptedEvent) -> dict:
-        files = move_uploads(event, self.uploads_root / event.channel / "uploads")
-        if event.attachments:
-            self.store.release_uploads(event.instance_id, [a["upload_id"] for a in event.attachments])
+        files = self.place_files(event)
         text = session_text(event, files)
         binding_id = event.binding["binding_id"]
         wolt = event.binding["default_wolt"]

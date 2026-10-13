@@ -5,32 +5,51 @@ and advances the cursor core keeps; `deliver_once` leases deliveries and
 sends them. The connector decides nothing about who may talk to whom or
 where a message goes; it carries bytes between the two APIs.
 
-Inbound, per update: text or caption becomes the event text; a photo (its
-largest size), document, voice note, audio or video is downloaded through
-`getFile` and uploaded to the lodge first, then named in the event. Slash
-commands are passed through as text in this slice: the chat command set
-(`/wolt`, `/new`, `/kill`, `/sessions`, inline buttons) is core-mediated and
-comes with slice 2b. A reply to one of the bot's messages carries that
-message's id, and core resolves it to the delivery and session inside the
-exact binding; footer text is never routing.
+Ownership fence: before every getUpdates and before every send the
+connector asks the lodge (`GET state`) whether it still owns the channel
+and is enabled. If not, it polls nothing (so Telegram confirms nothing),
+sends nothing, and acks nothing; a lease it already holds expires on its
+own. The lodge refuses a live switch, so in practice the fence trips when
+the lodge is stopped (every call fails) or an instance is disabled.
 
-The cursor: core hands it over at start (`GET state`); after every update
-the lodge has answered (accepted, dropped, or 409 conflict) the connector
-posts `update_id + 1`. Core refuses a cursor past what it answered, so a
-crash before the post re-fetches the update and core answers from dedup. No
-cursor at all (first start after the adapter) means asking Telegram for its
-unconfirmed backlog, which is exactly what the adapter had not processed.
+Inbound, per update, in the order fetched: text or caption becomes the
+event text; a photo (its largest size), document, voice note, audio or
+video is downloaded through `getFile` (streamed, capped) and uploaded to
+the lodge first, then named in the event. A transient failure anywhere in
+that (Telegram 429/5xx, network, a lodge 429/503) stops the batch at that
+update: nothing after it is answered, the cursor stays, the next poll
+fetches it again. Only a permanent failure (too big, 400/404) makes the
+event text-only, with a note. An update the connector cannot carry (a
+service message, nothing to say) is answered as an ignore so the cursor
+can pass it. Slash commands are passed through as text in this slice: the
+chat command set is core-mediated and comes with slice 2b. A reply to one
+of the bot's messages carries that message's id, and core resolves it to
+the delivery and session inside the exact binding and conversation.
+
+The cursor: core hands it over at start (`GET state`); after each update
+the lodge has answered with a final answer (accepted, dropped, ignored, or
+409 conflict) the connector posts `update_id + 1`, in fetch order, and
+stops at the first answer that is not final. Core refuses a cursor past
+what it answered. Telegram itself confirms updates only when asked with a
+higher offset, so as soon as a batch moved the cursor the connector asks
+once more with the new offset (short, one item, result discarded): what
+core holds durably is then confirmed at the provider too, and a runtime
+that takes over later is not handed it again. No cursor at all (first
+start) means asking Telegram for its unconfirmed backlog.
 
 Outbound: text goes as `sendMessage` in parts of at most 4096 characters,
 the reply footer on the last one; a `voice` attachment as `sendVoice`, an
 .mp3/.m4a as `sendAudio`, anything else (and anything Telegram refuses as
-voice or audio) as `sendDocument`. The ack lists every part's message id.
+voice or audio) as `sendDocument`. The ack lists every part's message id,
+on a failed attempt too, so a reply to a part that did go out still routes.
 Telegram 429 and 5xx, and network trouble, are nacked as retryable; 400
 and 403 are terminal.
 
-The bot token lives in `TELEGRAM_BOT_TOKEN` and the file download URL that
-embeds it is never logged. httpx only; the two clients take any transport,
-which is how tests run it against a fake Bot API and the real lodge app.
+The bot token lives in `TELEGRAM_BOT_TOKEN`; it is redacted from every
+error the connector reports or logs, and the runner silences the HTTP
+client's own request logging (see `runner.py`). httpx only; the two
+clients take any transport, which is how tests run it against a fake Bot
+API and the real lodge app.
 """
 
 from __future__ import annotations
@@ -42,18 +61,26 @@ import httpx
 
 PREFIX = "/connector/v1"
 TELEGRAM_MAX_TEXT = 4096
-TELEGRAM_CAPTION_LIMIT = 1024
 VOICE_SUFFIXES = (".ogg", ".oga", ".opus")
 AUDIO_SUFFIXES = (".mp3", ".m4a")
 POLL_TIMEOUT = 25
 LEASE_WAIT = 20
 DOWNLOAD_CAP = 50 * 1024 * 1024
+MAX_EVENT_TEXT = 16 * 1024
 
 logger = logging.getLogger(__name__)
 
 
 class LodgeRefused(RuntimeError):
     """The lodge answered 401 or 403: this process must stop."""
+
+
+class Transient(RuntimeError):
+    """A failure to try again later; the update stays unanswered."""
+
+
+class Permanent(RuntimeError):
+    """A failure that will not change; the update goes on without its file."""
 
 
 @dataclass
@@ -64,6 +91,8 @@ class Report:
     acks: list[dict] = field(default_factory=list)
     cursor: int | None = None
     paused: bool = False
+    fenced: bool = False
+    stopped_at: int | None = None
 
 
 def split_text(text: str, limit: int = TELEGRAM_MAX_TEXT) -> list[str]:
@@ -81,9 +110,10 @@ def split_text(text: str, limit: int = TELEGRAM_MAX_TEXT) -> list[str]:
     return parts
 
 
-def _redact(error: Exception, token: str) -> str:
-    text = str(error)
-    return text.replace(token, "<token>") if token else text
+def redact(text: object, token: str) -> str:
+    """`text` with the bot token replaced, wherever it appears."""
+    value = str(text)
+    return value.replace(token, "<token>") if token else value
 
 
 class TelegramConnector:
@@ -117,6 +147,16 @@ class TelegramConnector:
         self.started = True
         return state
 
+    async def owns_channel(self) -> bool:
+        """The fence: the lodge says this instance is enabled and the connector owns the channel."""
+        try:
+            state = (await self._lodge("GET", "/state")).json()
+        except (httpx.HTTPError, ValueError):
+            return False
+        if state.get("cursor") is not None:
+            self.cursor = state["cursor"]
+        return bool(state.get("runtime_active")) and not state.get("paused")
+
     # --------------------------------------------------------------- telegram
 
     async def _call(self, method: str, **params) -> httpx.Response:
@@ -127,16 +167,40 @@ class TelegramConnector:
             f"/bot{self._bot_token}/{method}", data=params, files={field_name: (name, data)},
         )
 
-    async def _download(self, file_id: str) -> bytes | None:
-        info = await self._call("getFile", file_id=file_id)
-        body = info.json() if info.headers.get("content-type", "").startswith("application/json") else {}
-        path = (body.get("result") or {}).get("file_path") if body.get("ok") else None
+    def _error(self, body: dict) -> tuple[str, bool]:
+        """(redacted description, retryable) from a not-ok Bot API answer."""
+        code = body.get("error_code", 500)
+        description = redact(body.get("description", "telegram error"), self._bot_token)[:500]
+        return description, code == 429 or code >= 500
+
+    async def _download(self, file_id: str) -> bytes:
+        """The file's bytes, streamed under the cap; Transient or Permanent otherwise."""
+        try:
+            info = await self._call("getFile", file_id=file_id)
+            body = info.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise Transient(redact(exc, self._bot_token)) from None
+        if not body.get("ok"):
+            description, retryable = self._error(body)
+            raise (Transient if retryable else Permanent)(description)
+        path = (body.get("result") or {}).get("file_path")
         if not path:
-            return None
-        response = await self.bot.get(f"/file/bot{self._bot_token}/{path}")
-        if response.status_code != 200 or len(response.content) > DOWNLOAD_CAP:
-            return None
-        return response.content
+            raise Permanent("telegram gave no file path")
+        received = bytearray()
+        try:
+            async with self.bot.stream("GET", f"/file/bot{self._bot_token}/{path}") as response:
+                if response.status_code == 429 or response.status_code >= 500:
+                    raise Transient(f"file download answered {response.status_code}")
+                if response.status_code != 200:
+                    raise Permanent(f"file download answered {response.status_code}")
+                async for chunk in response.aiter_bytes():
+                    received.extend(chunk)
+                    if len(received) > DOWNLOAD_CAP:
+                        # Enforced while reading: the rest is never pulled.
+                        raise Permanent(f"file is over {DOWNLOAD_CAP} bytes")
+        except httpx.HTTPError as exc:
+            raise Transient(redact(exc, self._bot_token)) from None
+        return bytes(received)
 
     # ---------------------------------------------------------------- inbound
 
@@ -159,27 +223,43 @@ class TelegramConnector:
             return document["file_id"], document.get("file_name") or f"document_{document['file_unique_id']}", "file"
         return None
 
-    async def _event_for(self, update: dict) -> dict | None:
+    async def _upload(self, data: bytes, name: str) -> str:
+        """The lodge's upload id; Transient on 429/503, Permanent on anything else refused."""
+        response = await self._lodge(
+            "POST", "/uploads", params={"name": name}, content=data,
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        if response.status_code == 200:
+            return response.json()["upload_id"]
+        try:
+            reason = response.json().get("reason", str(response.status_code))
+        except ValueError:
+            reason = str(response.status_code)
+        if response.status_code in (429, 503):
+            raise Transient(f"lodge refused the upload: {reason}")
+        raise Permanent(f"lodge refused the upload: {reason}")
+
+    async def _event_for(self, update: dict) -> dict:
+        """The lodge payload for one update: an event, or an ignore disposition.
+
+        Raises Transient when a file could not be fetched or uploaded for a
+        reason that may clear; the caller then stops the batch here.
+        """
         message = update.get("message") or update.get("edited_message")
         if not isinstance(message, dict) or not message.get("from") or not message.get("chat"):
-            return None
+            return {"event_id": f"tg:{update['update_id']}", "cursor": update["update_id"], "ignore": "unsupported_update"}
         text = message.get("text") or message.get("caption") or ""
         attachments = []
         found = self._attachment_of(message)
         if found is not None:
             file_id, name, _kind = found
-            data = await self._download(file_id)
-            if data is None:
-                text = f"{text}\n[a file came with this message and could not be fetched]".strip()
-            else:
-                upload = await self._lodge(
-                    "POST", "/uploads", params={"name": name}, content=data,
-                    headers={**self._headers, "Content-Type": "application/octet-stream"},
-                )
-                if upload.status_code == 200:
-                    attachments.append({"upload_id": upload.json()["upload_id"]})
-                else:
-                    text = f"{text}\n[a file came with this message and the lodge refused it: {upload.json().get('reason', upload.status_code)}]".strip()
+            try:
+                data = await self._download(file_id)
+                attachments.append({"upload_id": await self._upload(data, name)})
+            except Permanent as exc:
+                text = f"{text}\n[a file came with this message and could not be carried: {exc}]".strip()
+        if not text and not attachments:
+            return {"event_id": f"tg:{update['update_id']}", "cursor": update["update_id"], "ignore": "empty_message"}
         event = {
             "event_id": f"tg:{update['update_id']}",
             "sender": {
@@ -190,7 +270,7 @@ class TelegramConnector:
                 "provider_id": str(message["chat"]["id"]),
                 "thread": str(message["message_thread_id"]) if message.get("message_thread_id") else None,
             },
-            "text": text[:16 * 1024],
+            "text": text[:MAX_EVENT_TEXT],
             "attachments": attachments,
             "cursor": update["update_id"],
         }
@@ -200,10 +280,19 @@ class TelegramConnector:
         return event
 
     async def poll_once(self, *, timeout: int = POLL_TIMEOUT) -> Report:
-        """One getUpdates; every update is answered by the lodge before the cursor moves past it."""
+        """One getUpdates, fenced; updates are answered in order and the cursor follows.
+
+        The batch stops at the first update without a final answer (a
+        transient file failure, a lodge 429/503/5xx, a refused cursor):
+        nothing after it is answered, so the posted cursor never passes an
+        unanswered fetched update.
+        """
         if not self.started:
             await self.start()
         report = Report(cursor=self.cursor)
+        if not await self.owns_channel():
+            report.fenced = True
+            return report
         params = {"timeout": timeout, "allowed_updates": ["message", "edited_message"]}
         if self.cursor is not None:
             params["offset"] = self.cursor
@@ -211,38 +300,53 @@ class TelegramConnector:
             response = await self._call("getUpdates", **params)
             body = response.json()
         except (httpx.HTTPError, ValueError) as exc:
-            logger.warning("getUpdates failed: %s", _redact(exc, self._bot_token))
+            logger.warning("getUpdates failed: %s", redact(exc, self._bot_token))
             return report
         if not body.get("ok"):
-            logger.warning("getUpdates not ok: %s", body.get("description", "")[:200])
+            logger.warning("getUpdates not ok: %s", redact(body.get("description", ""), self._bot_token)[:200])
             return report
-        for update in body.get("result", []):
-            event = await self._event_for(update)
-            answered = True
-            if event is not None:
-                response = await self._lodge("POST", "/events", json=event)
-                report.events.append({"status": response.status_code, "body": response.json()})
-                # 200 (accepted or dropped) and 409 (conflict) are final. 429
-                # and 5xx are not: stop here, the next poll re-fetches it.
-                answered = response.status_code in (200, 409)
-            if not answered:
+        for update in sorted(body.get("result", []), key=lambda u: u["update_id"]):
+            try:
+                payload = await self._event_for(update)
+            except Transient as exc:
+                logger.warning("update %s not carried yet: %s", update["update_id"], exc)
+                report.stopped_at = update["update_id"]
+                break
+            response = await self._lodge("POST", "/events", json=payload)
+            try:
+                answer = response.json()
+            except ValueError:
+                answer = {}
+            report.events.append({"status": response.status_code, "body": answer})
+            # 200 (accepted, dropped or ignored) and 409 (conflict) are final.
+            # 429 and 5xx are not: stop here, the next poll re-fetches it.
+            if response.status_code not in (200, 409):
+                report.stopped_at = update["update_id"]
                 break
             cursor = await self._lodge("POST", "/cursor", json={"cursor": update["update_id"] + 1})
             if cursor.status_code != 200:
                 logger.warning("cursor refused: %s", cursor.json().get("reason"))
+                report.stopped_at = update["update_id"]
                 break
             self.cursor = cursor.json()["cursor"]
             report.cursor = self.cursor
+        if report.cursor is not None and report.cursor != params.get("offset"):
+            await self._confirm()
         return report
+
+    async def _confirm(self) -> None:
+        """Tell Telegram the cursor: everything below it is answered and held by core."""
+        if self.cursor is None:
+            return
+        try:
+            await self._call("getUpdates", offset=self.cursor, limit=1, timeout=0)
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.warning("could not confirm the cursor: %s", redact(exc, self._bot_token))
 
     # --------------------------------------------------------------- outbound
 
-    def _classify(self, reason: str, status: int) -> bool:
-        """Retryable? Telegram 429 and 5xx, yes; 400 and 403, no."""
-        return status == 429 or status >= 500
-
     async def _send_delivery(self, delivery: dict) -> tuple[list[str], str | None, bool]:
-        """Send one delivery; returns (message ids, error, retryable)."""
+        """Send one delivery; returns (message ids that went out, error, retryable)."""
         chat_id = delivery["conversation"]["provider_id"]
         extra = {}
         if delivery["conversation"].get("thread"):
@@ -250,19 +354,15 @@ class TelegramConnector:
         message_ids: list[str] = []
         footer = delivery.get("reply_footer") or ""
         text = delivery["text"] or ""
-        parts = split_text(text + footer) if footer else split_text(text)
-        if not text and not footer:
-            parts = []
+        parts = split_text(text + footer) if (text or footer) else []
         for part in parts:
             try:
                 response = await self._call("sendMessage", chat_id=chat_id, text=part, **extra)
                 body = response.json()
             except (httpx.HTTPError, ValueError) as exc:
-                return message_ids, _redact(exc, self._bot_token), True
+                return message_ids, redact(exc, self._bot_token), True
             if not body.get("ok"):
-                return message_ids, body.get("description", "telegram error")[:500], self._classify(
-                    body.get("description", ""), body.get("error_code", 500),
-                )
+                return message_ids, *self._error(body)
             message_ids.append(str(body["result"]["message_id"]))
         for attachment in delivery.get("attachments", []):
             fetched = await self._lodge(
@@ -279,38 +379,47 @@ class TelegramConnector:
                 order = (("sendAudio", "audio"), ("sendDocument", "document"))
             else:
                 order = (("sendDocument", "document"),)
-            sent = False
             for method, field_name in order:
                 try:
                     response = await self._upload_call(method, field_name, data, name, {"chat_id": chat_id, **extra})
                     body = response.json()
                 except (httpx.HTTPError, ValueError) as exc:
-                    return message_ids, _redact(exc, self._bot_token), True
+                    return message_ids, redact(exc, self._bot_token), True
                 if body.get("ok"):
                     message_ids.append(str(body["result"]["message_id"]))
-                    sent = True
                     break
                 if method == order[-1][0]:
-                    return message_ids, body.get("description", "telegram error")[:500], self._classify(
-                        body.get("description", ""), body.get("error_code", 500),
-                    )
-            if not sent:
-                return message_ids, "telegram refused the file", False
+                    return message_ids, *self._error(body)
         return message_ids, None, False
+
+    async def lease_batch(self, *, max_items: int = 10, wait: float = 0) -> dict:
+        if not self.started:
+            await self.start()
+        return (await self._lodge("POST", "/deliveries/lease", json={"max": max_items, "wait": wait})).json()
+
+    async def send_leased(self, deliveries: list[dict], report: Report) -> Report:
+        """Send what was leased, fencing before every delivery; acks carry every id that went out."""
+        for delivery in deliveries:
+            if not await self.owns_channel():
+                # Nothing more is sent or acked; the leases expire on their own.
+                report.fenced = True
+                return report
+            message_ids, error, retryable = await self._send_delivery(delivery)
+            body = {"attempt_id": delivery["attempt_id"], "provider_message_ids": message_ids}
+            if error is None:
+                body["ok"] = True
+            else:
+                body.update({"ok": False, "error": redact(error, self._bot_token)[:1000], "retry": retryable})
+            ack = await self._lodge("POST", f"/deliveries/{delivery['delivery_id']}/ack", json=body)
+            try:
+                answer = ack.json()
+            except ValueError:
+                answer = {}
+            report.acks.append({"delivery_id": delivery["delivery_id"], "status": ack.status_code, "body": answer})
+        return report
 
     async def deliver_once(self, *, max_items: int = 10, wait: float = 0) -> Report:
         """Lease, send, ack: one turn. Partial sends are acked as failures and may repeat."""
-        if not self.started:
-            await self.start()
-        report = Report(cursor=self.cursor)
-        leased = (await self._lodge("POST", "/deliveries/lease", json={"max": max_items, "wait": wait})).json()
-        report.paused = bool(leased.get("paused"))
-        for delivery in leased.get("deliveries", []):
-            message_ids, error, retryable = await self._send_delivery(delivery)
-            if error is None:
-                body = {"attempt_id": delivery["attempt_id"], "ok": True, "provider_message_ids": message_ids}
-            else:
-                body = {"attempt_id": delivery["attempt_id"], "ok": False, "error": error[:1000], "retry": retryable}
-            ack = await self._lodge("POST", f"/deliveries/{delivery['delivery_id']}/ack", json=body)
-            report.acks.append({"delivery_id": delivery["delivery_id"], "status": ack.status_code, "body": ack.json()})
-        return report
+        leased = await self.lease_batch(max_items=max_items, wait=wait)
+        report = Report(cursor=self.cursor, paused=bool(leased.get("paused")))
+        return await self.send_leased(leased.get("deliveries", []), report)

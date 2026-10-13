@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "container" / "lib"))
 
-from server.connector_router import Router, session_text  # noqa: E402
+from server.connector_router import AttachmentUnavailable, Router, destinations_for, place_file, session_text  # noqa: E402
 from server.connectors import AcceptedEvent, ConnectorStore, Limits  # noqa: E402
 
 
@@ -151,3 +151,95 @@ def test_session_text_names_the_event_for_duplicate_detection(lodge):
 
 def _boundary(sessions):
     return {"deliver": sessions.deliver, "resume": sessions.resume, "resolve": sessions.resolve}
+
+
+def _claimed_upload(store, event_id="tg:1"):
+    who = store.authenticate(store.issue_token("tg-main"))
+    upload_id, part = store.begin_upload(who)
+    part.write_bytes(b"opus bytes")
+    store.commit_upload(who, upload_id, part, "note.ogg")
+    queue = store._queue("tg-main")
+    queue.uploads[upload_id]["claimed_by"] = event_id
+    store._save_queue("tg-main", queue)
+    return upload_id, store.root / "uploads" / "tg-main" / upload_id
+
+
+def _accepted_with_file(store, binding, upload_id, path):
+    """An inbound record the way accept_event writes it, without a dispatcher run."""
+    attachment = {"upload_id": upload_id, "path": str(path), "name": "note.ogg", "size": 10}
+    event = _event(store, binding, "listen", attachments=[attachment])
+    queue = store._queue("tg-main")
+    queue.inbound[event.dedup_key] = {"state": "accepted", "event": event.to_record(), "at": 0}
+    store._save_queue("tg-main", queue)
+    return event
+
+
+def test_file_destinations_are_persisted_before_the_move_and_survive_every_crash(lodge, tmp_path, monkeypatch):
+    """Finding 3: crash before the move, after it, after release, before the paste."""
+    store, binding, _ = lodge
+    upload_id, source = _claimed_upload(store)
+    event = _accepted_with_file(store, binding, upload_id, source)
+    sessions = Sessions(live={"softie": "softie-7"})
+    router = Router(store, uploads_root=tmp_path / "space", **_boundary(sessions), wolts_dir=tmp_path)
+    uploads_dir = tmp_path / "space" / "telegram" / "uploads"
+    planned = destinations_for(event, uploads_dir)[upload_id]
+
+    def record():
+        return store._queue("tg-main").inbound[event.dedup_key]["event"]["attachments"][0]
+
+    def current_event():
+        from server.connectors import AcceptedEvent
+        return AcceptedEvent.from_record(store._queue("tg-main").inbound[event.dedup_key]["event"])
+
+    # 1. Crash before the move: the destination is already on record.
+    with monkeypatch.context() as patched:
+        patched.setattr("server.connector_router.place_file", lambda s, d: (_ for _ in ()).throw(OSError("crash before move")))
+        with pytest.raises(OSError):
+            router(current_event())
+    assert record()["dest"] == str(planned) and source.exists() and not planned.exists()
+    # 2. Crash after the move, before release: source gone, destination there, handle still claimed.
+    with monkeypatch.context() as patched:
+        patched.setattr(store, "release_uploads", lambda i, ids: (_ for _ in ()).throw(OSError("crash after move")))
+        with pytest.raises(OSError):
+            router(current_event())
+    assert planned.read_bytes() == b"opus bytes" and not source.exists()
+    assert upload_id in store._queue("tg-main").uploads
+    # 3. Crash after release, before the paste: the next attempt still names the file.
+    with monkeypatch.context() as patched:
+        patched.setattr(router, "deliver", lambda s, t: (_ for _ in ()).throw(OSError("crash before paste")))
+        with pytest.raises(OSError):
+            router(current_event())
+    assert upload_id not in store._queue("tg-main").uploads and planned.exists()
+    # 4. The attempt that goes through pastes the same path; a fifth attempt (crash before the receipt) too.
+    for _ in range(2):
+        result = router(current_event())
+        assert result["routed"] == "delivered"
+    assert [f"[file saved: {planned}]" in text for _s, text in sessions.pasted] == [True, True]
+    assert planned.read_bytes() == b"opus bytes" and list(uploads_dir.iterdir()) == [planned]
+
+
+def test_place_file_never_overwrites_and_is_idempotent(tmp_path):
+    source = tmp_path / "src"
+    dest = tmp_path / "dest" / "file"
+    source.write_bytes(b"new")
+    assert place_file(source, dest) == dest and dest.read_bytes() == b"new" and not source.exists()
+    # Again, with the source gone: fine, the destination exists.
+    assert place_file(source, dest) == dest
+    # A destination that already exists is never replaced, even by a different source.
+    other = tmp_path / "other"
+    other.write_bytes(b"other")
+    assert place_file(other, dest) == dest and dest.read_bytes() == b"new" and not other.exists()
+    # Neither side present: nothing to paste.
+    with pytest.raises(AttachmentUnavailable):
+        place_file(tmp_path / "missing", tmp_path / "dest" / "never")
+    # Two events never share a destination: the name is the event's own.
+    assert len({str(p) for p in (dest,)}) == 1
+
+
+def test_claimed_uploads_of_a_waiting_event_outlive_the_upload_ttl(lodge):
+    store, binding, _ = lodge
+    upload_id, source = _claimed_upload(store)
+    _accepted_with_file(store, binding, upload_id, source)
+    store.clock = lambda: 10 ** 9   # far past any TTL
+    store.list_deliveries("tg-main")
+    assert upload_id in store._queue("tg-main").uploads and source.exists()

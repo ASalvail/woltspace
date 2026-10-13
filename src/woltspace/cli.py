@@ -1200,26 +1200,64 @@ def _connector_token(args) -> int:
 def _connector_runtime(args) -> int:
     """Show or set which runtime owns a channel: its adapter or its connector.
 
-    Takes effect for outbound routing at once and for polling at the next
-    `woltspace start`. Switching to the connector with no cursor stored makes
-    it start from Telegram's unconfirmed backlog, which is what the adapter
-    had not processed; switching back lets the adapter do the same.
+    A switch is refused while the lodge runs, or might: it is made under
+    the lodge's own control-plane lock, the one `woltspace start` holds for
+    the lodge's whole life, so no adapter child or connector API can be
+    live when the file changes and no start can slip in between the check
+    and the write. Unknown state refuses too. Nothing is polled by either
+    runtime until the next start, which reads the new setting.
     """
     def action(connectors, store):
-        path = RuntimeLayout.from_env().wolts_dir / "woltspace.json"
+        layout = RuntimeLayout.from_env()
+        path = layout.wolts_dir / "woltspace.json"
         if args.runtime:
-            connectors.set_channel_runtime(path, args.channel, args.runtime)
+            from .instance import DataRootLock, InstanceConflict
+
+            lock = DataRootLock(layout, f"switch-{os.getpid()}")
+            try:
+                lock.acquire()
+            except InstanceConflict as exc:
+                raise connectors.ConnectorError(
+                    409, "lodge_running",
+                    f"the lodge is running or starting ({exc}); stop it, then switch",
+                ) from None
+            except OSError as exc:
+                raise connectors.ConnectorError(
+                    409, "lodge_state_unknown", f"cannot tell whether the lodge runs: {exc}",
+                ) from None
+            try:
+                connectors.set_channel_runtime(path, args.channel, args.runtime)
+            finally:
+                lock.release()
         runtime = connectors.channel_runtime(path, args.channel)
         lines = [f"{args.channel}.runtime = {runtime}"]
-        if args.runtime == "connector":
-            lines.append("the adapter stops polling at the next `woltspace start`; "
-                         "run the connector with a token from `woltspace connector token`")
+        if args.runtime:
+            lines.append("takes effect at the next `woltspace start`")
         return {"channel": args.channel, "runtime": runtime, "lines": lines}
     return _connector_run(args, action)
 
 
+def _connector_handoffs(args) -> int:
+    """Accepted events still waiting for a session, parked ones included; retry or cancel one."""
+    def action(_connectors, store):
+        if args.retry:
+            done = store.retry_handoff(args.instance_id, args.retry)
+            return {"retried": done, "lines": ["queued for another attempt" if done else "no such pending event"]}
+        if args.cancel:
+            done = store.cancel_handoff(args.instance_id, args.cancel)
+            return {"cancelled": done, "lines": ["cancelled; its files are released" if done else "no such pending event"]}
+        records = store.handoffs(args.instance_id)
+        lines = [
+            f"{r['key'].split(chr(0))[-1]}  {r['state']}  attempts={r.get('attempts', 0)}"
+            + (f"  {r['last_error']}" if r.get("last_error") else "")
+            for r in records
+        ] or ["nothing waiting"]
+        return {"handoffs": records, "lines": lines}
+    return _connector_run(args, action)
+
+
 def _connector_cursor(args) -> int:
-    """Seed or clear an instance's provider cursor by hand (a handover)."""
+    """Owner-side: seed or clear an instance's provider cursor (a handover)."""
     def action(_connectors, store):
         cursor = None if args.clear else args.cursor
         store.seed_cursor(args.instance_id, cursor)
@@ -1560,6 +1598,14 @@ def build_parser() -> argparse.ArgumentParser:
     connector_runtime.add_argument("runtime", nargs="?", choices=("adapter", "connector"), default=None)
     connector_runtime.add_argument("--json", action="store_true")
     connector_runtime.set_defaults(func=_connector_runtime)
+    connector_handoffs = connector_sub.add_parser(
+        "handoffs", help="accepted events not yet handed to a session; --retry or --cancel one by event id"
+    )
+    connector_handoffs.add_argument("instance_id")
+    connector_handoffs.add_argument("--retry", metavar="KEY", default=None, help="the record key (account NUL event id)")
+    connector_handoffs.add_argument("--cancel", metavar="KEY", default=None)
+    connector_handoffs.add_argument("--json", action="store_true")
+    connector_handoffs.set_defaults(func=_connector_handoffs)
     connector_cursor = connector_sub.add_parser(
         "cursor", help="seed an instance's provider cursor (a handover), or clear it"
     )
