@@ -57,7 +57,9 @@ from .access import (
 from .notify import AttachmentError, NoNotificationTarget, send_notification
 from .speech import SpeechError
 from .app_sharing import read_app_shares, read_site_shares, write_app_shares, write_site_shares
-from .content_hosts import UnsupportedWoltName, site_host_label
+from .content_hosts import (
+    LOCAL_SITES_SUFFIX, UnsupportedWoltName, find_wolt_dir, parse_content_host, site_host_label, site_root,
+)
 from .sparks import get_spark_with_chain, list_sparks
 from .pty_bridge import (
     PtyBridgeError,
@@ -527,6 +529,90 @@ def _gateway_target(app_name: str, request: Request, path: str = "/") -> str | N
     return f"https://{app_name}.{apps_domain}{clean_path}" if apps_domain else None
 
 
+# --- Wolt sites: the one lodge-side resolver ---
+# A wolt's site is served by the app gateway on its own origin,
+# `<label>.sites.localhost:<gateway port>` (server/content_hosts.py has the
+# label rules). The lodge keeps the legacy `/wolt/{name}/site/...` paths only
+# to send navigations there and to serve subresources opaque-sandboxed. Every
+# place that needs the canonical address - the redirect, /sites, the viewport
+# redirect, the split view's resolve call - asks here, so the frame flags the
+# UI picks (allow-same-origin only for a site's own origin) always follow a
+# resolved, registered host rather than the shape of a string. Remote site
+# hosts are gated by the gateway in this slice, so a non-local request
+# resolves nothing and keeps the opaque lodge copy.
+_LEGACY_SITE_PATH_RE = re.compile(r"/wolt/([^/?#]+)/site(?:/([^?#]*))?")
+
+
+def _local_owner_request(request: Request) -> bool:
+    hostname = (request.url.hostname or "").lower().rstrip(".")
+    return owner_local_request(request.scope, hostname)
+
+
+def canonical_site_url(path: str, *, local: bool) -> str | None:
+    """`/wolt/{name}/site[/rest]` as `http://<label>.sites.localhost:<port>/rest`, or None.
+
+    None for a remote request (remote sites stay gated), a path that is not a
+    legacy site path, a wolt whose directory name cannot be a host label, or a
+    wolt that does not exist or has no anchored site directory. The query
+    string is the caller's to carry over.
+    """
+    if not local:
+        return None
+    match = _LEGACY_SITE_PATH_RE.fullmatch(path)
+    if match is None:
+        return None
+    name, rest = match.group(1), match.group(2) or ""
+    # Only a path the site host would serve: no `.`/`..`, no empty middle
+    # segment, no backslash. The gateway refuses those anyway; the lodge does
+    # not hand out an address it knows is dead.
+    segments = rest.split("/")
+    if any(seg in (".", "..") or "\\" in seg for seg in segments) or "" in segments[:-1]:
+        return None
+    try:
+        label = site_host_label(name)
+    except UnsupportedWoltName:
+        return None
+    if site_root(WOLTS_DIR, label) is None:
+        return None
+    return f"http://{label}{LOCAL_SITES_SUFFIX}:{get_app_gateway_port()}/{rest}"
+
+
+def _canonical_site_host(netloc: str) -> bool:
+    """Is this exact host:port an existing site's canonical local host?"""
+    content = parse_content_host(netloc, get_apps_domain())
+    if content is None or content.kind != "site" or not content.local:
+        return False
+    try:
+        port = urlsplit(f"//{netloc}").port
+    except ValueError:
+        return False
+    return port == get_app_gateway_port() and site_root(WOLTS_DIR, content.name) is not None
+
+
+def resolve_site_url(url: str, *, local: bool) -> str | None:
+    """A legacy site path (query kept) or an already-canonical site URL, resolved.
+
+    Returns the canonical `http://<label>.sites.localhost:<port>/...` URL, or
+    None when `url` is neither a legacy site path the resolver knows nor a URL
+    on an existing site's canonical host at the gateway port. The split view
+    and /current use this so that a frame only ever gets `allow-same-origin`
+    for a verified site host.
+    """
+    if not local:
+        return None
+    if url.startswith("/"):
+        path, sep, query = url.partition("?")
+        canonical = canonical_site_url(path, local=local)
+        return f"{canonical}{sep}{query}" if canonical else None
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return None
+    if parsed.scheme != "http" or not _canonical_site_host(parsed.netloc):
+        return None
+    return url
+
+
 def _separate_apps_domain_configured() -> bool:
     try:
         config = json.loads((WOLTS_DIR / "woltspace.json").read_text())
@@ -859,22 +945,50 @@ async def post_current(request: Request):
     return {"url": get_current_url(session)}
 
 
-def _viewport_url_navigable(url: str) -> bool:
-    """Where the lodge will send a browser for a pushed viewport URL.
+def _lodge_host_url_ok(parsed, hostname: str, *, local: bool) -> bool:
+    """An absolute URL naming this lodge itself, at its real port."""
+    if hostname in {"localhost", "127.0.0.1", "::1"}:
+        return local and parsed.scheme == "http" and parsed.port == PORT
+    tunnel_hostname = tunnel_mgr.get_tunnel_hostname().lower().rstrip(".")
+    return bool(tunnel_hostname) and hostname == tunnel_hostname and parsed.scheme == "https" \
+        and parsed.port in (None, 443)
 
-    A lodge path, or an http(s) URL on a lodge or app host (push-view takes
-    `http://my-app.localhost:<port>/`). Anything else - another scheme, a
-    foreign host, a protocol-relative `//host` - is stored for the split view
-    to decide about, but this lodge URL never redirects to it.
+
+def _viewport_redirect_target(url: str, *, local: bool) -> str | None:
+    """Where the lodge sends a browser for a pushed viewport URL, or None.
+
+    A lodge path stays a lodge path, except a legacy site path, which goes to
+    the site's own host. An absolute URL must name something the lodge knows
+    about: the lodge itself at its real port, a registered app on the gateway
+    port (push-view takes `http://my-app.localhost:<port>/`), or an existing
+    site on its canonical host. A host that merely looks like an app or a
+    site, a wrong port, another scheme, a foreign host or a protocol-relative
+    `//host` is stored for the split view to decide about, but this lodge URL
+    never redirects to it.
     """
     if url.startswith("/"):
-        return not url.startswith("//") and not url.startswith("/\\")
+        if url.startswith("//") or url.startswith("/\\"):
+            return None
+        return resolve_site_url(url, local=local) or url
     try:
         parsed = urlsplit(url)
     except ValueError:
-        return False
+        return None
     hostname = (parsed.hostname or "").lower().rstrip(".")
-    return parsed.scheme in {"http", "https"} and bool(hostname) and _allowed_http_hostname(hostname)
+    if parsed.scheme not in {"http", "https"} or not hostname:
+        return None
+    if _lodge_host_url_ok(parsed, hostname, local=local):
+        return url
+    content = parse_content_host(parsed.netloc, get_apps_domain())
+    if content is None or content.kind == "reserved":
+        return None
+    if content.kind == "site":
+        return resolve_site_url(url, local=local)
+    if content.local:
+        return url if local and parsed.scheme == "http" and parsed.port == get_app_gateway_port() \
+            and get_app(content.name) is not None else None
+    return url if parsed.scheme == "https" and parsed.port in (None, 443) \
+        and get_app(content.name) is not None else None
 
 
 @app.get("/current")
@@ -883,9 +997,10 @@ async def get_current(request: Request):
     url = get_current_url(session)
     if not url:
         return Response(status_code=204)
-    if not _viewport_url_navigable(url):
+    target = _viewport_redirect_target(url, local=_local_owner_request(request))
+    if target is None:
         return JSONResponse({"error": "viewport url is not a lodge destination"}, status_code=400)
-    return RedirectResponse(url, status_code=302)
+    return RedirectResponse(target, status_code=302)
 
 
 @app.get("/current/meta")
@@ -2573,25 +2688,49 @@ async def session_stop(name: str):
 # Each wolt has a persistent site at wolt/site/. Served via livereload.
 # Sites auto-start when a session begins outside an app context.
 
+def _site_entry(wolt_name: str, *, local: bool) -> dict:
+    """The legacy lodge path plus, when the site has a host, its canonical URL."""
+    entry = {"wolt": wolt_name, "url": f"/wolt/{wolt_name}/site/"}
+    site_url = canonical_site_url(entry["url"], local=local)
+    if site_url:
+        entry["site_url"] = site_url
+    return entry
+
+
 @app.get("/sites")
-async def list_sites_api():
+async def list_sites_api(request: Request):
     """List all wolt sites (any wolt with a site dir)."""
+    local = _local_owner_request(request)
     found = []
     for wolt_dir in sorted(WOLTS_DIR.iterdir()):
         if not wolt_dir.is_dir() or wolt_dir.name.startswith("."):
             continue
         if (wolt_dir / "wolt" / "site").is_dir():
-            found.append({"wolt": wolt_dir.name, "url": f"/wolt/{wolt_dir.name}/site/"})
+            found.append(_site_entry(wolt_dir.name, local=local))
     return found
 
 
+@app.get("/sites/resolve")
+async def site_resolve(request: Request, path: str = ""):
+    """The split view asks before it frames: is this a site, and where does it live?
+
+    `site_url` is the canonical site URL for a legacy `/wolt/{name}/site/...`
+    path (query kept) or for a URL already on a site's canonical host, else
+    null. The caller gives a frame `allow-same-origin` only on a non-null
+    answer, never on the look of the string it was handed.
+    """
+    return JSONResponse(
+        {"path": path, "site_url": resolve_site_url(path, local=_local_owner_request(request))},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @app.get("/sites/{wolt_name}")
-async def site_detail(wolt_name: str):
+async def site_detail(wolt_name: str, request: Request):
     """Get a wolt's site state."""
     sdir = site_dir(wolt_name)
     return {
-        "wolt": wolt_name,
-        "url": f"/wolt/{wolt_name}/site/",
+        **_site_entry(wolt_name, local=_local_owner_request(request)),
         "dir_exists": sdir.exists(),
     }
 
@@ -2654,9 +2793,22 @@ async def site_sharing_put(wolt_name: str, request: Request):
 @app.api_route("/wolt/{wolt_name}/site/{path:path}", methods=["GET", "HEAD"])
 @app.api_route("/wolt/{wolt_name}/site", methods=["GET", "HEAD"])
 async def serve_wolt_site(wolt_name: str, request: Request, path: str = ""):
-    """Serve a wolt's site directly from disk, injecting the livereload script."""
+    """Serve a wolt's site directly from disk, injecting the livereload script.
+
+    A navigation (a document or an iframe) from the local owner is sent to the
+    site's own host instead; everything else - subresources, remote requests,
+    wolts without a host - gets the opaque-sandboxed lodge copy below.
+    """
     if not re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_-]*", wolt_name):
         return JSONResponse({"error": "invalid wolt name"}, status_code=400)
+
+    if request.headers.get("sec-fetch-dest", "").lower() in ("document", "iframe"):
+        raw_path = (request.scope.get("raw_path") or b"").decode("latin-1") or request.url.path
+        target = canonical_site_url(raw_path, local=_local_owner_request(request))
+        if target:
+            if request.url.query:
+                target += f"?{request.url.query}"
+            return RedirectResponse(target, status_code=302)
 
     wolt_dir = WOLTS_DIR / wolt_name
     if not wolt_dir.exists():

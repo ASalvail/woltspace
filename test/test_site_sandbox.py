@@ -275,8 +275,11 @@ def test_tool_registry_module_and_routes_are_removed():
     (f"/wolt/{WOLT}/site/page.html", 302),
     ("/history/spark-1", 302),
     ("/settings", 302),
-    ("http://my-app.localhost:7117/", 302),
-    ("http://localhost:7777/w/n00b", 302),
+    # An app host the lodge has no registered app for, and the lodge's own
+    # host from a non-local client: neither is vouched for (test_lodge_sites
+    # covers the registered-app and local-owner cases that do redirect).
+    ("http://my-app.localhost:7117/", 400),
+    ("http://localhost:7777/w/n00b", 400),
     ("https://evil.example/", 400),
     ("//evil.example/", 400),
     ("/\\evil.example", 400),
@@ -356,16 +359,20 @@ def test_framing_directive_is_added_even_when_owner_html_has_its_own_policy():
 
 
 def test_wolt_page_frames_the_site_with_a_sandbox_attribute():
+    """The lodge copy of a site is framed opaque; only a resolved site host
+    (test_lodge_sites) ever gets allow-same-origin, and only once."""
     source = (ROOT / "public" / "static" / "wolt-page.js").read_text()
-    assert "frame.setAttribute('sandbox','allow-scripts')" in source
-    assert "allow-same-origin" not in source
+    assert "sandbox: 'allow-scripts' }" in source
+    assert "frame.setAttribute('sandbox',t.sandbox)" in source
+    assert source.count("'allow-scripts allow-same-origin'") == 1
 
 
 def test_split_view_sandboxes_sites_and_sparks_but_not_apps():
     source = (ROOT / "templates" / "tui.html").read_text()
     assert "preview.setAttribute('sandbox', 'allow-scripts')" in source
     assert "preview.removeAttribute('sandbox')" in source
-    assert "allow-same-origin" not in source
+    # allow-same-origin exists once, behind the lodge's resolve answer (test_lodge_sites).
+    assert source.count("'allow-scripts allow-same-origin'") == 1
 
 
 # --- The site shell works from inside the sandbox, without trusting it ----
