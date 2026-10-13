@@ -199,19 +199,55 @@ def slot_html(sdir: Path, name: object) -> str | None:
         return None
 
 
+# What a wolt's site.json may change about the lodge-drawn built-in pages:
+# the title, a few colours, the avatar emoji. Each value is checked, not
+# passed through - a hex colour is a hex colour, never `url(...)`, a font
+# stack or anything else CSS would act on. Stylesheets (`custom_css`), font
+# imports (`fonts_href`), slots and font tokens stay on the wolt's own site
+# pages, which are the wolt's own documents.
+_HEX_COLOUR_RE = re.compile(r"#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})")
+OWNER_COLOUR_TOKENS = ("accent", "bg", "ink", "muted", "line")
+_TITLE_MAX = 60
+_EMOJI_MAX = 8
+
+
+def owner_look(cfg: dict) -> dict:
+    """The checked subset of site.json a built-in page may use."""
+    look: dict = {}
+    title = cfg.get("title")
+    if isinstance(title, str) and title.strip():
+        look["title"] = " ".join(title.split())[:_TITLE_MAX]
+    tokens = cfg.get("tokens") if isinstance(cfg.get("tokens"), dict) else {}
+    safe = {k: v.strip() for k, v in tokens.items()
+            if k in OWNER_COLOUR_TOKENS and isinstance(v, str) and _HEX_COLOUR_RE.fullmatch(v.strip())}
+    emoji = tokens.get("emoji")
+    if isinstance(emoji, str) and 0 < len(emoji.strip()) <= _EMOJI_MAX and emoji.isprintable():
+        safe["emoji"] = emoji.strip()
+    if safe:
+        look["tokens"] = safe
+    return look
+
+
 def shell_manifest(wolt_name: str, wolt_dir: Path, sdir: Path, site_cfg: dict | None = None,
-                   slots: bool = False) -> dict:
+                   slots: bool = False, owner_page: bool = False) -> dict:
     """Everything the drawer needs, inlined into the page so it draws with no fetch.
 
     `slots` inlines the header/footer HTML too. Only a wolt's own site page
     asks for that: it is served sandboxed (opaque origin), so it could not
     fetch the slots itself, and the wolt's markup inside the wolt's own page
-    adds nothing. The built-in pages are lodge-origin documents and never get
-    it - shell.js draws no slot it was not handed.
+    adds nothing. shell.js draws no slot it was not handed.
+
+    `owner_page` is for the lodge-drawn built-in pages, which carry the wolt's
+    boot files: the site look is cut down to owner_look(), so no wolt
+    stylesheet, font import, slot or free-form token reaches that document.
+    One manifest shape per page kind, so the two renderers cannot disagree.
     """
     cfg = load_site_config(sdir) if site_cfg is None else site_cfg
-    site = {k: cfg[k] for k in ("title", "tokens", "fonts_href", "custom_css", "header_html", "footer_html") if k in cfg}
-    if slots:
+    if owner_page:
+        site = owner_look(cfg)
+    else:
+        site = {k: cfg[k] for k in ("title", "tokens", "fonts_href", "custom_css", "header_html", "footer_html") if k in cfg}
+    if slots and not owner_page:
         found = {k: slot_html(sdir, cfg.get(f"{k}_html")) for k in ("header", "footer")}
         found = {k: v for k, v in found.items() if v is not None}
         if found:
@@ -232,6 +268,18 @@ def _head(path: Path, n: int) -> tuple[str, int]:
     except OSError:
         return "", 0
     return "\n".join(lines[:n]), len(lines)
+
+
+def memory_for_tab(wolt_dir: Path, tab: str) -> dict:
+    """Only what one built-in tab shows: About gets identity, Memory gets the
+    boot files, Settings gets nothing. Inlined into the page, so each page
+    carries no more of the wolt's memory than it draws."""
+    if tab == "memory":
+        return memory_payload(wolt_dir)
+    if tab == "about":
+        identity, _ = _head(wolt_dir / "wolt" / "memory" / "identity.md", 10_000)
+        return {"identity": identity}
+    return {}
 
 
 def memory_payload(wolt_dir: Path) -> dict:

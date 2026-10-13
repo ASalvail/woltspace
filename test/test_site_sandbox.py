@@ -54,7 +54,15 @@ def tmp_wolts(tmp_path, monkeypatch):
     (site / "logo.svg").write_text('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>')
     (site / "noext").write_text("<html><body>no extension</body></html>")
     (site / "header.html").write_text('<img src=x onerror="fetch(\'/settings/access\',{method:\'POST\'})">')
-    (site / "site.json").write_text(json.dumps({"header_html": "header.html"}))
+    (site / "evil.css").write_text("body{background:url(/settings/access)}")
+    (site / "site.json").write_text(json.dumps({
+        "header_html": "header.html", "custom_css": "evil.css", "title": "  Noob   Works  ",
+        "fonts_href": "https://evil.example/exfil.css",
+        "tokens": {"accent": "#123456", "bg": "url(/sessions)", "ink": "red", "line": "#abcd",
+                   "display_font": "x; background:url(//evil.example/f)", "emoji": "🦝"},
+    }))
+    (site / "tools").mkdir()
+    (site / "tools" / "index.html").write_text("<html><body>site tools page</body></html>")
     (wolt / "wolt.json").write_text(json.dumps({"name": WOLT, "type": "raccoon", "display_name": "Noob"}))
     (wolt / "memory").mkdir()
     (wolt / "memory" / "identity.md").write_text("# n00b\n\nA raccoon.\n")
@@ -107,6 +115,14 @@ def assert_owner_page(response):
     ("/wolt/bare/site/", 307, None),
     ("/history/spark-1", 200, "text/html"),
     ("/history/missing", 404, "text/plain"),
+    (f"/wolt/{WOLT}/_/", 200, "text/html"),
+    (f"/wolt/{WOLT}/_/about", 200, "text/html"),
+    (f"/wolt/{WOLT}/_/memory", 200, "text/html"),
+    (f"/wolt/{WOLT}/_/settings", 200, "text/html"),
+    (f"/wolt/{WOLT}/_/nope", 404, "text/plain"),
+    ("/wolt/ghost/_/", 404, "text/plain"),
+    (f"/wolt/{WOLT}/_/memory.json", 200, "application/json"),
+    (f"/wolt/{WOLT}/_/manifest.json", 200, "application/json"),
 ])
 def test_untrusted_routes_are_sandboxed_with_a_correct_type(client, path, status, content_type):
     response = client.get(path, follow_redirects=False)
@@ -136,11 +152,11 @@ def test_redirect_destinations_carry_their_own_header(client, monkeypatch):
     assert landed.status_code == 404 and str(landed.url).endswith("/site/pages/")  # no index.html there
     assert_sandboxed(landed)
 
-    # A site without a home page lands on the lodge-owned About page: owner
-    # policy there, by design (see wolt_builtin_page), and no wolt markup in it.
+    # A site without a home page lands on the built-in About page, which
+    # carries the wolt's boot files and is sandboxed like the site.
     about = client.get("/wolt/bare/site/", follow_redirects=True)
     assert str(about.url).endswith("/wolt/bare/_/")
-    assert_owner_page(about)
+    assert_sandboxed(about)
 
     # The viewport redirect follows whatever URL a wolt pushed: the site it
     # points at answers sandboxed on its own.
@@ -209,6 +225,78 @@ def test_catch_all_sandboxes_every_site_file_type_but_not_owner_html(client, tmp
     assert missing.status_code == 404 and "content-security-policy" not in missing.headers
 
 
+# --- The tool registry and proxy are gone, for every spelling and method ---
+
+@pytest.mark.parametrize("path", ["/tools", "/tools/", "/tools/spawn", "/tools/x/y", "/tools/index.html",
+                                  "/Tools", "/TOOLS/x/y", "/tools/./x", "/%74ools", "/tools%2Fx", "/tools/x%2F..%2F..%2Fsettings"])
+@pytest.mark.parametrize("method", ["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH"])
+def test_tools_paths_are_gone_for_every_method_and_spelling(client, tmp_path, monkeypatch, method, path):
+    # A root-site dir with content under tools/ (case-insensitive filesystems
+    # also answer Tools/ and TOOLS/ from it): none of it may be served.
+    root_site = tmp_path / "root-site"
+    (root_site / "tools" / "x").mkdir(parents=True)
+    (root_site / "tools" / "index.html").write_text("<html><body>root site tools</body></html>")
+    (root_site / "tools" / "x" / "y").write_text("<html><body>root site tools x/y</body></html>")
+    monkeypatch.setattr(server_app, "SITE_DIR", root_site)
+
+    response = client.request(method, path, content='{"name":"t","command":"id","port":4100}',
+                              headers={"content-type": "application/json", "origin": "http://localhost:7777"},
+                              follow_redirects=False)
+
+    # The exact path is answered 404 by the removed-route handler; a case
+    # variant reaches the GET-only catch-all, which refuses it too (404), and
+    # has no other method at all (405). Never a document either way.
+    assert response.status_code in (404, 405), (method, path, response.headers.get("content-type"))
+    assert response.headers["content-type"].startswith("application/json"), (method, path)
+    if method != "HEAD":
+        assert response.json() in ({"error": "not found"}, {"detail": "Method Not Allowed"})
+    assert "content-security-policy" not in response.headers
+
+
+def test_encoded_slash_tools_alias_never_becomes_an_owner_document(client):
+    response = client.get("/%2Ftools", follow_redirects=False)
+    assert response.status_code in (404, 400, 307, 308)
+    if response.status_code == 404:
+        assert not response.headers["content-type"].startswith("text/html") or \
+            response.headers.get("content-security-policy") == SANDBOX
+
+
+def test_tool_registry_module_and_routes_are_removed():
+    assert not (ROOT / "server" / "tools.py").exists()
+    source = (ROOT / "server" / "app.py").read_text()
+    for gone in ("tool_registry", "proxy_tool", "spawn_tool", "_start_tool_gc", "import httpx"):
+        assert gone not in source, gone
+    assert "TOOL_REGISTRY_FILE" not in (ROOT / "server" / "config.py").read_text()
+
+
+# --- GET /current only sends the browser to lodge destinations ------------
+
+@pytest.mark.parametrize("url, status", [
+    (f"/wolt/{WOLT}/site/page.html", 302),
+    ("/history/spark-1", 302),
+    ("/settings", 302),
+    ("http://my-app.localhost:7117/", 302),
+    ("http://localhost:7777/w/n00b", 302),
+    ("https://evil.example/", 400),
+    ("//evil.example/", 400),
+    ("/\\evil.example", 400),
+    ("javascript:alert(1)", 400),
+    ("data:text/html,hi", 400),
+    ("http://evil.example:7777/", 400),
+    ("http://[::1", 400),
+])
+def test_viewport_redirect_follows_only_lodge_destinations(client, monkeypatch, url, status):
+    monkeypatch.setattr(server_app, "get_current_url", lambda session="main": url)
+
+    response = client.get("/current?session=main", follow_redirects=False)
+
+    assert response.status_code == status, url
+    if status == 302:
+        assert response.headers["location"] == url
+    else:
+        assert "location" not in response.headers
+
+
 def test_a_wolt_site_cannot_shadow_the_service_worker(client, tmp_path, monkeypatch):
     root_site = tmp_path / "root-site"
     root_site.mkdir()
@@ -227,18 +315,44 @@ def test_a_wolt_site_cannot_shadow_the_service_worker(client, tmp_path, monkeypa
 # --- Owner pages are framable by the lodge only, and not sandboxed --------
 
 @pytest.mark.parametrize("path", ["/", "/settings", "/tui", "/terminal", "/connectors", "/wolves",
-                                  f"/w/{WOLT}", f"/wolt/{WOLT}/_/", f"/wolt/{WOLT}/_/memory",
-                                  "/placeholder.html"])
+                                  f"/w/{WOLT}", "/placeholder.html", "/onboard.html", "/public-view.html"])
 def test_owner_pages_allow_only_the_lodge_to_frame_them(client, path):
     assert_owner_page(client.get(path))
 
 
 def test_owner_assets_and_apis_are_not_sandboxed(client):
     for path in ("/static/wolt-page.js", "/static/wolt-shell/shell.js", "/sw.js", "/sessions",
-                 f"/wolt/{WOLT}/_/memory.json", f"/wolt/{WOLT}/_/manifest.json", "/history", "/history/spark-1/meta"):
+                 "/history", "/history/spark-1/meta", f"/wolts/{WOLT}/settings"):
         response = client.get(path)
         assert response.status_code == 200, path
         assert "sandbox" not in response.headers.get("content-security-policy", ""), path
+
+
+def test_framing_directive_is_added_even_when_owner_html_has_its_own_policy():
+    """Whatever policy an owner response already names, frame-ancestors is required."""
+    from starlette.requests import Request
+    from starlette.responses import HTMLResponse, JSONResponse
+
+    def request(path):
+        return Request({"type": "http", "method": "GET", "path": path, "query_string": b"",
+                        "headers": [(b"host", b"localhost:7777")]})
+
+    async def run(path, response):
+        async def call_next(_request):
+            return response
+        return await server_app.content_isolation_headers(request(path), call_next)
+
+    own = asyncio.run(run("/settings", HTMLResponse("x", headers={"Content-Security-Policy": "default-src 'self'"})))
+    assert own.headers["content-security-policy"] == "default-src 'self'; frame-ancestors 'self'"
+    already = asyncio.run(run("/settings", HTMLResponse("x", headers={"Content-Security-Policy": "frame-ancestors 'none'"})))
+    assert already.headers["content-security-policy"] == "frame-ancestors 'none'"
+    plain = asyncio.run(run("/settings", HTMLResponse("x")))
+    assert plain.headers["content-security-policy"] == OWNER_FRAMES
+    api = asyncio.run(run("/sessions", JSONResponse([])))
+    assert "content-security-policy" not in api.headers
+    # An upstream policy on an untrusted path never replaces the sandbox.
+    site = asyncio.run(run(f"/wolt/{WOLT}/site/x.html", HTMLResponse("x", headers={"Content-Security-Policy": "sandbox allow-same-origin"})))
+    assert site.headers["content-security-policy"] == SANDBOX
 
 
 def test_wolt_page_frames_the_site_with_a_sandbox_attribute():
@@ -271,14 +385,38 @@ def test_site_page_inlines_its_slots_instead_of_fetching(client):
     assert "fetch(m.base" not in shell
 
 
-def test_builtin_pages_inline_memory_and_never_the_wolt_markup(client):
-    html = client.get(f"/wolt/{WOLT}/_/memory").text
+def test_builtin_pages_inline_only_the_memory_each_tab_shows(client):
+    memory = _manifest(client.get(f"/wolt/{WOLT}/_/memory").text)["memory"]
+    about = _manifest(client.get(f"/wolt/{WOLT}/_/").text)["memory"]
+    settings = _manifest(client.get(f"/wolt/{WOLT}/_/settings").text)["memory"]
+
+    assert memory["identity"].startswith("# n00b") and set(memory) >= {"context", "learnings", "archive"}
+    assert about == {"identity": memory["identity"]}
+    assert settings == {}
+
+
+def test_builtin_pages_carry_no_wolt_stylesheet_font_slot_or_free_form_token(client):
+    html = client.get(f"/wolt/{WOLT}/_/").text
     manifest = _manifest(html)
 
-    assert manifest["memory"]["identity"].startswith("# n00b")
-    assert "slots" not in manifest["site"]
-    assert "onerror" not in html
-    assert manifest["site"]["header_html"] == "header.html"  # the name is data; the markup stays out
+    assert manifest["site"] == {"title": "Noob Works", "tokens": {"accent": "#123456", "line": "#abcd", "emoji": "🦝"}}
+    for leaked in ("evil.css", "evil.example", "url(", "header.html", "onerror", "display_font", "custom_css", "fonts_href"):
+        assert leaked not in html, leaked
+    page = (ROOT / "public" / "static" / "wolt-shell" / "wolt.html").read_text()
+    assert "fonts_href" not in page and "display_font" not in page
+    assert "HEX.test(t[k])" in page
+
+
+def test_owner_look_accepts_only_checked_values():
+    import site_shell
+    assert site_shell.owner_look({}) == {}
+    assert site_shell.owner_look({"tokens": "nope", "title": 7}) == {}
+    look = site_shell.owner_look({
+        "title": "x" * 200, "custom_css": "a.css", "fonts_href": "https://x", "header_html": "h.html",
+        "tokens": {"accent": " #ABCDEF ", "bg": "#12345", "ink": "#fff;background:url(x)", "muted": "rgb(1,2,3)",
+                   "line": "#00000080", "display_font": "serif", "emoji": "<b>🦝</b>" + "x" * 20},
+    })
+    assert look == {"title": "x" * 60, "tokens": {"accent": "#ABCDEF", "line": "#00000080"}}
 
 
 def test_slot_files_stay_inside_the_site_dir(tmp_wolts):

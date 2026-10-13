@@ -16,7 +16,6 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 
-import httpx
 from fastapi import Body, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import (
     FileResponse,
@@ -30,7 +29,6 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from . import tools as tool_registry
 from .config import (
     APP_MIME_TYPES,
     dotenv_env,
@@ -119,7 +117,9 @@ from apps import (
 )
 from sites import ensure_site, site_dir
 import wolfcore
-from site_shell import inject_shell, load_site_config, memory_payload, shell_manifest, shell_tags, shell_wanted
+from site_shell import (
+    inject_shell, load_site_config, memory_for_tab, memory_payload, shell_manifest, shell_tags, shell_wanted,
+)
 from .state import (
     bot_log,
     get_current_meta,
@@ -223,21 +223,6 @@ def stop_file_watchers(timeout: float = _WATCHER_JOIN_TIMEOUT) -> None:
 # See creatures/wolf.py.
 
 
-# --- Tool GC ---
-# jerpint: what is this lol
-
-def _start_tool_gc():
-    import threading
-
-    def _gc_loop():
-        while True:
-            time.sleep(30)
-            tool_registry.gc()
-
-    t = threading.Thread(target=_gc_loop, daemon=True)
-    t.start()
-
-
 # --- Lifespan ---
 # jerpint: also this?
 
@@ -246,10 +231,8 @@ async def lifespan(app: FastAPI):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     await asyncio.to_thread(apply_default_harness_from_env)
     refresh_model_catalogs()
-    tool_registry.restore()
     apps_restore()
     _start_file_watcher()
-    _start_tool_gc()
     tunnel_mgr.start_tunnel()
     print(f"""
   woltspace server (python) · http://localhost:{PORT}
@@ -553,23 +536,30 @@ async def request_origin_guard(request: Request, call_next):
     return await call_next(request)
 
 
-# Wolt-authored documents - every file under a wolt's site, and spark/history
-# previews - are served on the lodge origin, and a prompt-injected wolt can
+# Wolt-authored documents - every file under a wolt's site, spark/history
+# previews, and the built-in About/Memory/Settings pages that carry a wolt's
+# boot files - are served on the lodge origin, and a prompt-injected wolt can
 # put script on its page. An enforced CSP sandbox (no allow-same-origin) gives
-# that document an opaque origin: its script still runs, but every request it
-# makes to the lodge carries `Origin: null`, which the write guard above and
-# every websocket handler reject, and it cannot read lodge responses. nosniff
-# keeps the browser from upgrading a text file into a document on its own.
-# The headers go on every response from these routes - errors and redirects
+# that document an opaque origin: its script still runs, but its credentialed
+# writes and websocket handshakes carry `Origin: null`, which the write guard
+# above and every websocket handler reject, and it cannot read lodge
+# responses. (GETs and subresource loads may omit Origin, so the lodge's GET
+# routes still have to stay side-effect free - the sandbox does not excuse
+# them.) nosniff keeps the browser from upgrading a text file into a document.
+# The headers go on every response these routes produce - errors and redirects
 # included - never Report-Only and never as a <meta> the page could precede.
+# Rejections from the outer AccessTokenMiddleware carry fixed JSON, no wolt
+# bytes, and are the one response class this does not reach.
 _UNTRUSTED_CONTENT_HEADERS = {
     "Content-Security-Policy": "sandbox allow-scripts",
     "X-Content-Type-Options": "nosniff",
 }
-_UNTRUSTED_PATH_RE = re.compile(r"/wolt/[^/]+/site(?:/.*)?|/history/[^/]+")
+_UNTRUSTED_PATH_RE = re.compile(r"/wolt/[^/]+/(?:site|_)(?:/.*)?|/history/[^/]+")
 # Lodge-owned pages may only be framed by the lodge itself: the split view and
 # the wolt page frame sites, sparks and apps, and a sandboxed site (opaque
-# origin) must not be able to frame settings or the shell in return.
+# origin) must not be able to frame settings or the shell in return. The
+# directive is required on every owner HTML response, whatever other policy
+# the response already carries.
 _OWNER_FRAME_POLICY = "frame-ancestors 'self'"
 
 
@@ -586,12 +576,15 @@ def _mark_untrusted(response: Response) -> Response:
 @app.middleware("http")
 async def content_isolation_headers(request: Request, call_next):
     response = await call_next(request)
-    if _untrusted_content_path(request.url.path):
+    sandboxed = response.headers.get("content-security-policy") == _UNTRUSTED_CONTENT_HEADERS["Content-Security-Policy"]
+    if _untrusted_content_path(request.url.path) or sandboxed:
+        # By path, or already marked by _mark_untrusted (catch-all site files).
         response.headers.update(_UNTRUSTED_CONTENT_HEADERS)
-    elif "content-security-policy" not in response.headers:
-        content_type = response.headers.get("content-type", "")
-        if content_type.startswith("text/html"):
-            response.headers["Content-Security-Policy"] = _OWNER_FRAME_POLICY
+    elif response.headers.get("content-type", "").startswith("text/html"):
+        policy = response.headers.get("content-security-policy", "")
+        if "frame-ancestors" not in policy:
+            response.headers["Content-Security-Policy"] = (
+                f"{policy.rstrip('; ')}; {_OWNER_FRAME_POLICY}" if policy else _OWNER_FRAME_POLICY)
     return response
 
 
@@ -834,13 +827,33 @@ async def post_current(request: Request):
     return {"url": get_current_url(session)}
 
 
+def _viewport_url_navigable(url: str) -> bool:
+    """Where the lodge will send a browser for a pushed viewport URL.
+
+    A lodge path, or an http(s) URL on a lodge or app host (push-view takes
+    `http://my-app.localhost:<port>/`). Anything else - another scheme, a
+    foreign host, a protocol-relative `//host` - is stored for the split view
+    to decide about, but this lodge URL never redirects to it.
+    """
+    if url.startswith("/"):
+        return not url.startswith("//") and not url.startswith("/\\")
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    return parsed.scheme in {"http", "https"} and bool(hostname) and _allowed_http_hostname(hostname)
+
+
 @app.get("/current")
 async def get_current(request: Request):
     session = sanitize_session(request.query_params.get("session", "main"))
     url = get_current_url(session)
-    if url:
-        return RedirectResponse(url, status_code=302)
-    return Response(status_code=204)
+    if not url:
+        return Response(status_code=204)
+    if not _viewport_url_navigable(url):
+        return JSONResponse({"error": "viewport url is not a lodge destination"}, status_code=400)
+    return RedirectResponse(url, status_code=302)
 
 
 @app.get("/current/meta")
@@ -2663,13 +2676,13 @@ async def wolt_builtin_page(wolt_name: str, tab: str = "about"):
         return PlainTextResponse("Not found", status_code=404)
     sdir = site_dir(wolt_name)
     site_cfg = load_site_config(sdir)
-    # Lodge-owned, so it stays outside the content sandbox - but it is also
-    # what the wolt page's sandboxed site frame navigates to, where a fetch
-    # of memory.json would come from an opaque origin and fail. The boot files
-    # ride inline instead, and the wolt's header/footer HTML never does: the
-    # shell must not write wolt-authored markup into a lodge-origin document.
-    manifest = shell_manifest(wolt_name, wolt_dir, sdir, site_cfg)
-    manifest["memory"] = memory_payload(wolt_dir)
+    # Lodge-drawn, but it shows a wolt's boot files, so it is served inside the
+    # content sandbox like the site (see _UNTRUSTED_PATH_RE) and has no
+    # same-origin fetch: the one tab's memory rides inline. Wolt styling stops
+    # at a few checked colours - no stylesheet, font import, slot or free-form
+    # value reaches a document that holds that memory (site_shell.owner_look).
+    manifest = shell_manifest(wolt_name, wolt_dir, sdir, site_cfg, owner_page=True)
+    manifest["memory"] = memory_for_tab(wolt_dir, tab)
     page = (STATIC_DIR / "wolt-shell" / "wolt.html").read_text(encoding="utf-8")
     # The built-in page always needs the manifest; the drawer only when the
     # wolt has not switched the shell off.
@@ -2756,48 +2769,20 @@ async def serve_app(app_name: str, request: Request, path: str = ""):
     return RedirectResponse(target, status_code=302)
 
 
-# --- Tools ---
-
-# jerpint: this is for the telegram bots right? good idea to have them all in one place, but maybe we can have this in a
-# separate /bot/ route
-@app.get("/tools")
-async def list_tools():
-    return tool_registry.list_all()
-
-
-@app.post("/tools/spawn")
-async def spawn_tool(request: Request):
-    body = await request.json()
-    name = body.get("name")
-    command = body.get("command")
-    port = body.get("port")
-    if not name or not command or not port:
-        return JSONResponse({"error": "name, command, and port required"}, status_code=400)
-    try:
-        result = tool_registry.spawn(name, command, port)
-        return result
-    except ValueError as e:
-        return JSONResponse({"error": str(e)}, status_code=409)
+# --- Tools (removed) ---
+# The lodge used to spawn local tool processes (POST /tools/spawn) and proxy
+# /tools/{name}/* to them: every request header - cookies, the Access
+# assertion - went to the tool, and the tool's body and headers came back on
+# the lodge origin, unsandboxed. Nothing in the platform calls it any more.
+# The paths stay answered, for every method, so they can never fall through
+# to the catch-all and come back as some other document.
+_REMOVED_ROUTE_METHODS = ["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH"]
 
 
-@app.api_route("/tools/{tool_name}/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
-async def proxy_tool(tool_name: str, path: str, request: Request):
-    tool = tool_registry.get(tool_name)
-    if not tool:
-        return PlainTextResponse("tool not found", status_code=404)
-    target = f"http://127.0.0.1:{tool['port']}/{path}"
-    if request.url.query:
-        target += f"?{request.url.query}"
-    async with httpx.AsyncClient() as client:
-        try:
-            resp = await client.request(
-                request.method, target,
-                headers={k: v for k, v in request.headers.items() if k.lower() != "host"},
-                content=await request.body(),
-            )
-            return Response(resp.content, status_code=resp.status_code, headers=dict(resp.headers))
-        except httpx.ConnectError:
-            return PlainTextResponse("tool unavailable", status_code=502)
+@app.api_route("/tools", methods=_REMOVED_ROUTE_METHODS)
+@app.api_route("/tools/{path:path}", methods=_REMOVED_ROUTE_METHODS)
+async def tools_removed(path: str = ""):
+    return JSONResponse({"error": "not found"}, status_code=404)
 
 
 # --- WebSocket: live reload ---
@@ -3009,6 +2994,11 @@ async def catch_all(path: str, request: Request):
             "active_nav": "home",
             "cache_bust": int(time.time()),
         })
+
+    # Removed routes stay gone whatever the spelling: /Tools/x must not come
+    # back as a site file or a platform asset.
+    if path.split("/", 1)[0].lower() == "tools":
+        return JSONResponse({"error": "not found"}, status_code=404)
 
     # Try wolt site first, then platform public dir
     resp = await _serve_static(f"/{path}", request)
