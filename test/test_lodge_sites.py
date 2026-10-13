@@ -130,6 +130,18 @@ def test_canonical_site_url_refuses_a_symlinked_site_dir(colony):
     ("http://evil.example/wolt/astre/site/", None),
     ("/history/spark-1", None),
     ("", None),
+    # Fragments and queries survive, with or without a trailing slash.
+    ("/wolt/astre/site/index.html#section", canonical("astre", "index.html#section")),
+    ("/wolt/astre/site#top", canonical("astre", "#top")),
+    ("/wolt/astre/site?v=1#top", canonical("astre", "?v=1#top")),
+    # Spellings parsers disagree about never resolve.
+    ("http://localhost:7777\\@astre.sites.localhost:7117/", None),
+    ("http://user@astre.sites.localhost:7117/", None),
+    ("http://astre.sites.localhost:7117/a b", None),
+    ("http://astre.sites.localhost:7117/\tx", None),
+    ("/wolt/astre/site/a\\b", None),
+    # An accepted URL is rebuilt, normalized, not echoed.
+    ("http://ASTRE.sites.localhost.:7117/p?q=1#f", canonical("astre", "p?q=1#f")),
 ])
 def test_resolve_site_url(url, expected):
     assert server_app.resolve_site_url(url, local=True) == expected
@@ -301,6 +313,10 @@ def test_current_redirects_to_lodge_sites_apps_and_itself(monkeypatch, url, loca
     "javascript:alert(1)",
     "data:text/html,hi",
     "http://[::1",
+    "http://localhost:bad/",                    # invalid port: 400, not 500
+    "http://localhost:99999/",                  # out-of-range port
+    "http://localhost:7777\\@notes.localhost:7117/",
+    "http://user@localhost:7777/",
 ])
 def test_current_refuses_hosts_the_lodge_cannot_vouch_for(monkeypatch, url):
     monkeypatch.setattr(server_app, "get_current_url", lambda session="main": url)
@@ -341,9 +357,16 @@ def test_split_view_resolves_before_it_frames():
     same_origin = source.index("preview.setAttribute('sandbox', 'allow-scripts allow-same-origin')")
     guard = source.index("if (siteUrl) {")
     assert guard < same_origin < source.index("preview.src = siteUrl")
-    assert "OPAQUE_VIEWS = /^\\/(wolt\\/[^/]+\\/site(\\/|$)|history\\/)/" in source
+    assert "OPAQUE_VIEWS = /^\\/(wolt\\/[^/]+\\/site([/?#]|$)|history\\/)/" in source
     assert "preview.setAttribute('sandbox', 'allow-scripts');" in source
     assert "preview.removeAttribute('sandbox')" in source
     load_view = source[source.index("async function loadView("):source.index("function setCurrent(")]
     assert load_view.index("await resolveSite(url)") < load_view.index("frameView(")
     assert "preview.src =" not in load_view  # every src goes through frameView, with its flags
+
+
+
+def test_split_view_treats_query_and_fragment_spellings_as_site_candidates():
+    html = (ROOT / "templates" / "tui.html").read_text()
+    assert r"site([/?#]|$)" in html
+    assert r"localhost(:\d+)?([/?#]|$)" in html

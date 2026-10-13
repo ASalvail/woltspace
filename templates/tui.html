@@ -534,8 +534,8 @@
   // storage and fetch. A sandboxed frame that merely followed the redirect
   // would stay opaque, so the flags and the src are always chosen together.
   // Apps live on their own origin and keep their own.
-  const OPAQUE_VIEWS = /^\/(wolt\/[^/]+\/site(\/|$)|history\/)/;
-  const MAYBE_SITE = /^(\/wolt\/[^/]+\/site(\/|$)|https?:\/\/[a-z0-9-]+\.sites\.localhost(:\d+)?\/)/i;
+  const OPAQUE_VIEWS = /^\/(wolt\/[^/]+\/site([/?#]|$)|history\/)/;
+  const MAYBE_SITE = /^(\/wolt\/[^/]+\/site([/?#]|$)|https?:\/\/[a-z0-9-]+\.sites\.localhost(:\d+)?([/?#]|$))/i;
   async function resolveSite(url) {
     if (!MAYBE_SITE.test(url || '')) return null;
     try {

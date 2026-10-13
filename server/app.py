@@ -600,17 +600,32 @@ def resolve_site_url(url: str, *, local: bool) -> str | None:
     """
     if not local:
         return None
+    # Spellings that parsers disagree about (a backslash, control characters,
+    # whitespace) never resolve: a browser and this server must agree on the
+    # host an answer names.
+    if "\\" in url or any(ord(ch) < 0x21 or ord(ch) == 0x7F for ch in url):
+        return None
     if url.startswith("/"):
-        path, sep, query = url.partition("?")
+        rest, hash_sep, fragment = url.partition("#")
+        path, query_sep, query = rest.partition("?")
         canonical = canonical_site_url(path, local=local)
-        return f"{canonical}{sep}{query}" if canonical else None
+        return f"{canonical}{query_sep}{query}{hash_sep}{fragment}" if canonical else None
     try:
         parsed = urlsplit(url)
+        port = parsed.port
     except ValueError:
         return None
-    if parsed.scheme != "http" or not _canonical_site_host(parsed.netloc):
+    if (parsed.scheme != "http" or parsed.username is not None or parsed.password is not None
+            or "@" in parsed.netloc or not _canonical_site_host(parsed.netloc)):
         return None
-    return url
+    # Rebuilt from parsed parts, never echoed: the answer is what was checked.
+    host = (parsed.hostname or "").lower().rstrip(".")
+    rebuilt = f"http://{host}:{port}{parsed.path or '/'}"
+    if parsed.query:
+        rebuilt += f"?{parsed.query}"
+    if parsed.fragment:
+        rebuilt += f"#{parsed.fragment}"
+    return rebuilt
 
 
 def _separate_apps_domain_configured() -> bool:
@@ -970,12 +985,16 @@ def _viewport_redirect_target(url: str, *, local: bool) -> str | None:
         if url.startswith("//") or url.startswith("/\\"):
             return None
         return resolve_site_url(url, local=local) or url
+    if "\\" in url or any(ord(ch) < 0x21 or ord(ch) == 0x7F for ch in url):
+        return None
     try:
         parsed = urlsplit(url)
+        parsed.port  # an invalid or out-of-range port is refused, not a 500
     except ValueError:
         return None
     hostname = (parsed.hostname or "").lower().rstrip(".")
-    if parsed.scheme not in {"http", "https"} or not hostname:
+    if (parsed.scheme not in {"http", "https"} or not hostname
+            or parsed.username is not None or parsed.password is not None):
         return None
     if _lodge_host_url_ok(parsed, hostname, local=local):
         return url
