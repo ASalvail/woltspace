@@ -443,3 +443,31 @@ class TestAppsRestore:
         actions = apps.apps_restore()
         assert actions[0]["action"] == "restore-failed"
         assert "boom" in actions[0]["error"]
+
+
+class TestPortAlreadyAnswers:
+    """The gateway trusts whoever answers on an app's port: never start into a held one."""
+
+    @patch("apps.subprocess.Popen")
+    def test_start_refuses_a_port_another_program_holds(self, mock_popen, wolts_dir):
+        import socket
+        holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        holder.bind(("127.0.0.1", 0))
+        holder.listen(1)
+        port = holder.getsockname()[1]
+        try:
+            _make_app(wolts_dir, "squatted", start="echo hi", port=port)
+            with pytest.raises(RuntimeError, match="already in use by another program"):
+                apps.start_app("squatted")
+            mock_popen.assert_not_called()
+            assert apps._read_state("squatted") is None
+        finally:
+            holder.close()
+
+    def test_a_free_port_answers_nothing(self):
+        import socket
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()  # bound then released, nothing listening
+        assert apps._port_answers(port) == ""

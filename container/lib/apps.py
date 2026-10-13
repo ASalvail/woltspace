@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -300,6 +301,19 @@ def intended_apps() -> list[dict]:
     return intended
 
 
+def _port_answers(port: int) -> str:
+    """The loopback address already accepting on `port`, or "" if none does."""
+    for family, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as sock:
+                sock.settimeout(0.3)
+                if sock.connect_ex((host, port)) == 0:
+                    return host
+        except OSError:
+            continue  # no IPv6 loopback, say
+    return ""
+
+
 @_locked_per_app
 def start_app(name: str) -> dict:
     """Start an app's dev server. Returns state dict with port and pid.
@@ -337,6 +351,17 @@ def start_app(name: str) -> dict:
     for r in running_apps():
         if r["port"] == port:
             raise RuntimeError(f"Port {port} already in use by running app '{r['name']}'")
+    # The gateway proxies to 127.0.0.1:<port> and trusts whoever answers. If
+    # another program (possibly another user's lodge on this machine) already
+    # holds the port, starting would serve that program under this app's
+    # name. Refuse instead.
+    holder = _port_answers(port)
+    if holder:
+        print(f"[apps] refusing to start {name}: port {port} already answers on {holder}")
+        raise RuntimeError(
+            f"port {port} is already in use by another program ({holder}); "
+            "pick a free port in the app's woltspace.json"
+        )
 
     work_dir = app_dir(name)
 
