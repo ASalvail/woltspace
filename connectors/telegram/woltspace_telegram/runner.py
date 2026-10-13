@@ -54,14 +54,50 @@ def configure_logging(bot_token: str, level: int = logging.INFO) -> None:
     logging.setLogRecordFactory(factory)
 
 
+HANDOFF_MAX_BYTES = 4096
+
+
+def read_handoff(path: str) -> dict:
+    """Consume the handoff file: a regular file, not followed, bounded, read once, then gone.
+
+    Raises `SystemExit` with the reason when it is not what the supervisor
+    wrote or was already taken: the process must not run on a guess.
+    """
+    import stat
+
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        raise SystemExit("woltspace_telegram: the handoff was already consumed; not starting") from None
+    except OSError as exc:
+        raise SystemExit(f"woltspace_telegram: cannot open the handoff: {exc}") from None
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > HANDOFF_MAX_BYTES:
+            raise SystemExit("woltspace_telegram: the handoff is not a small regular file; not starting")
+        if info.st_mode & 0o077:
+            raise SystemExit("woltspace_telegram: the handoff is readable by others; not starting")
+        raw = os.read(descriptor, HANDOFF_MAX_BYTES)
+    finally:
+        os.close(descriptor)
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        raise SystemExit("woltspace_telegram: the handoff was consumed twice; not starting") from None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        raise SystemExit("woltspace_telegram: the handoff does not parse; not starting") from None
+    if not isinstance(data, dict) or not isinstance(data.get("token"), str) or not data["token"]:
+        raise SystemExit("woltspace_telegram: the handoff carries no token; not starting")
+    return data
+
+
 def connector_token() -> str:
-    """Plain file or environment handoff: fixture grade, not the hardened design."""
+    """The token, from the handoff file the supervisor named (consumed) or, for development, the environment."""
     path = os.environ.get("WOLTSPACE_CONNECTOR_TOKEN_FILE")
     if path:
-        with open(path, encoding="utf-8") as handle:
-            token = json.load(handle)["token"]
-        os.unlink(path)
-        return token
+        return read_handoff(path)["token"]
     token = os.environ.get("WOLTSPACE_CONNECTOR_TOKEN", "")
     if not token:
         sys.exit("woltspace_telegram: no connector token (WOLTSPACE_CONNECTOR_TOKEN_FILE)")

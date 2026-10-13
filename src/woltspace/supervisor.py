@@ -140,7 +140,7 @@ class Supervisor:
         fact. This protects the one that was already there, which is the one
         that has no idea we exist.
         """
-        if not plan.enabled or plan.name != "telegram":
+        if not plan.enabled or plan.name not in ("telegram", "telegram-connector"):
             return plan
         token = plan.env.get("TELEGRAM_BOT_TOKEN", "")
         if not self.probe_token(token):

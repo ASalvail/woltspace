@@ -283,8 +283,17 @@ class ChannelSupervisor:
                 if state.state != "disabled":
                     state.state = "stopped"
                     state.pid = None
-        for _name, child in children:
+        for name, child in children:
+            # Terminate, then wait: the child releases its run lock only when
+            # it exits, and the lodge must not outlive that.
             self._terminate(child, timeout=timeout)
+            try:
+                child.wait(timeout=timeout)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+            handoff = self.states[name].plan.handoff
+            if handoff is not None:
+                handoff.abandon()
         thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=timeout)
@@ -301,8 +310,21 @@ class ChannelSupervisor:
         plan = state.plan
         log_path = self._log_path(name)
         state.log = str(log_path)
-        env = dict(os.environ)
-        env.update(plan.env)
+        if plan.isolated_env:
+            # Only what the plan names: the lodge's environment stays its own.
+            env = dict(plan.env)
+        else:
+            env = dict(os.environ)
+            env.update(plan.env)
+        if plan.handoff is not None:
+            # A real launch: the token for this process generation is minted
+            # now and travels by file, never in argv or the environment.
+            try:
+                env.update(plan.handoff.prepare())
+            except Exception as exc:  # noqa: BLE001 - registry unreadable, disk full: a named failure
+                state.state = "failed"
+                state.error = f"cannot prepare the connector handoff: {exc}"
+                return
         try:
             handle = log_path.open("a")
             # The adapter may log a request URL, and a request URL carries the
@@ -454,10 +476,25 @@ class ChannelSupervisor:
                 child = self._children.get(name)
             if child is None:
                 continue
+            handoff = state.plan.handoff
+            if handoff is not None and child.poll() is None:
+                problem = handoff.check()
+                if problem:
+                    # Not started: the token is revoked and the child goes;
+                    # its exit is handled below like any other.
+                    state.error = problem
+                    self._terminate(child, timeout=timeout_for_stillborn())
+                    try:
+                        child.wait(timeout=timeout_for_stillborn())
+                    except (subprocess.TimeoutExpired, OSError):
+                        pass
             code = child.poll()
             if code is None:
                 continue
             changed = True
+            if handoff is not None:
+                # The process generation is over: whatever it held is revoked.
+                handoff.abandon()
             state.last_exit_code = code
             state.pid = None
             with self._lock:
