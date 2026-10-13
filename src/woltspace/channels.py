@@ -333,6 +333,15 @@ class TelegramRuntimeConnector:
                 self.name, False, "telegram.runtime is adapter: the connector does not run",
                 remedy="Stop the lodge, then `woltspace connector runtime telegram connector`.",
             )
+        # The channel's own off switch means the same whichever runtime owns it.
+        configured = bool(settings.get("enabled", False))
+        raw_enabled = values.get("ENABLE_TELEGRAM_BOT")
+        from_env = _truthy(raw_enabled) if raw_enabled is not None else False
+        if (raw_enabled is not None and not from_env) or not (configured or from_env):
+            return ConnectorPlan(
+                self.name, False, "disabled",
+                remedy=f'Set channels.telegram = {{"enabled": true, "token": "<bot token>"}} in {config_path(layout, values)}.',
+            )
         token = (values.get("TELEGRAM_BOT_TOKEN") or settings.get("token") or "").strip()
         if not token:
             return ConnectorPlan(

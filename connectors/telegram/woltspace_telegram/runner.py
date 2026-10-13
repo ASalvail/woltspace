@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import sys
+import time
 
 import httpx
 
@@ -57,51 +58,105 @@ def configure_logging(bot_token: str, level: int = logging.INFO) -> None:
 HANDOFF_MAX_BYTES = 4096
 
 
-def read_handoff(path: str) -> dict:
-    """Consume the handoff file: a regular file, not followed, bounded, read once, then gone.
+def read_handoff(path: str, *, expected: dict, window: float, now: float | None = None) -> dict:
+    """Consume the handoff file inside its anchored directory, validating everything first.
 
-    Raises `SystemExit` with the reason when it is not what the supervisor
-    wrote or was already taken: the process must not run on a guess.
+    The directory is opened `O_DIRECTORY|O_NOFOLLOW` (a symlinked parent is
+    refused) and must be ours and private. The file is then *claimed* by an
+    atomic rename to a name of this process's own, so exactly one consumer
+    ever reads it (a second finds it gone before it could read a byte); the
+    claimed file is opened `O_NOFOLLOW|O_NONBLOCK` relative to the directory
+    and must be a small private regular file (a FIFO cannot block us, a link
+    is refused). The envelope must name the lodge, instance and generation
+    this process was told to expect, and be issued within `window` seconds.
+    Whatever the outcome, the claimed file is removed: a refused handoff is
+    gone too, and the lodge sees "taken but never activated" and revokes.
+    Raises `SystemExit` with the reason otherwise: no guess runs.
     """
     import stat
 
+    directory, name = os.path.split(os.path.abspath(path))
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    except FileNotFoundError:
-        raise SystemExit("woltspace_telegram: the handoff was already consumed; not starting") from None
+        dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError as exc:
-        raise SystemExit(f"woltspace_telegram: cannot open the handoff: {exc}") from None
+        raise SystemExit(f"woltspace_telegram: cannot open the handoff directory: {exc}") from None
     try:
-        info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode) or info.st_size > HANDOFF_MAX_BYTES:
-            raise SystemExit("woltspace_telegram: the handoff is not a small regular file; not starting")
-        if info.st_mode & 0o077:
-            raise SystemExit("woltspace_telegram: the handoff is readable by others; not starting")
-        raw = os.read(descriptor, HANDOFF_MAX_BYTES)
+        dir_info = os.fstat(dir_fd)
+        if dir_info.st_uid != os.getuid() or dir_info.st_mode & 0o077:
+            raise SystemExit("woltspace_telegram: the handoff directory is not private; not starting")
+        claimed = f".{name}.{os.getpid()}.{threading_ident()}.taken"
+        try:
+            os.rename(name, claimed, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        except FileNotFoundError:
+            raise SystemExit("woltspace_telegram: the handoff was already consumed; not starting") from None
+        except OSError as exc:
+            raise SystemExit(f"woltspace_telegram: cannot claim the handoff: {exc}") from None
+        try:
+            try:
+                descriptor = os.open(claimed, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+            except OSError as exc:
+                raise SystemExit(f"woltspace_telegram: cannot open the handoff: {exc}") from None
+            try:
+                info = os.fstat(descriptor)
+                if not stat.S_ISREG(info.st_mode):
+                    raise SystemExit("woltspace_telegram: the handoff is not a regular file; not starting")
+                if info.st_size > HANDOFF_MAX_BYTES:
+                    raise SystemExit("woltspace_telegram: the handoff is too large; not starting")
+                if info.st_uid != os.getuid() or info.st_mode & 0o077:
+                    raise SystemExit("woltspace_telegram: the handoff is not private; not starting")
+                raw = os.read(descriptor, HANDOFF_MAX_BYTES)
+            finally:
+                os.close(descriptor)
+            try:
+                data = json.loads(raw)
+            except ValueError:
+                raise SystemExit("woltspace_telegram: the handoff does not parse; not starting") from None
+            if not isinstance(data, dict) or not isinstance(data.get("token"), str) or not data["token"]:
+                raise SystemExit("woltspace_telegram: the handoff carries no token; not starting")
+            for key in ("lodge_id", "instance_id", "generation"):
+                if str(data.get(key)) != str(expected.get(key)):
+                    raise SystemExit(f"woltspace_telegram: the handoff's {key} is not the one expected; not starting")
+            issued = data.get("issued")
+            current = time.time() if now is None else now
+            if not isinstance(issued, (int, float)) or not (current - window <= issued <= current + 1):
+                raise SystemExit("woltspace_telegram: the handoff is stale; not starting")
+            return data
+        finally:
+            try:
+                os.unlink(claimed, dir_fd=dir_fd)
+            except OSError:
+                pass
     finally:
-        os.close(descriptor)
-    try:
-        os.unlink(path)
-    except FileNotFoundError:
-        raise SystemExit("woltspace_telegram: the handoff was consumed twice; not starting") from None
-    try:
-        data = json.loads(raw)
-    except ValueError:
-        raise SystemExit("woltspace_telegram: the handoff does not parse; not starting") from None
-    if not isinstance(data, dict) or not isinstance(data.get("token"), str) or not data["token"]:
-        raise SystemExit("woltspace_telegram: the handoff carries no token; not starting")
-    return data
+        os.close(dir_fd)
 
 
-def connector_token() -> str:
-    """The token, from the handoff file the supervisor named (consumed) or, for development, the environment."""
+def threading_ident() -> int:
+    import threading
+
+    return threading.get_ident()
+
+
+def connector_token() -> tuple[str, dict | None]:
+    """(token, activation): the handoff file the supervisor named, consumed and validated
+    against the expectations in the environment, with those expectations to activate it;
+    or, for development, a live token from the environment and no activation."""
     path = os.environ.get("WOLTSPACE_CONNECTOR_TOKEN_FILE")
     if path:
-        return read_handoff(path)["token"]
+        expected = {
+            "lodge_id": os.environ.get("WOLTSPACE_LODGE_ID", ""),
+            "instance_id": os.environ.get("WOLTSPACE_CONNECTOR_INSTANCE", ""),
+            "generation": os.environ.get("WOLTSPACE_CONNECTOR_GENERATION", ""),
+        }
+        try:
+            window = float(os.environ.get("WOLTSPACE_HANDOFF_WINDOW", "10"))
+        except ValueError:
+            window = 10.0
+        token = read_handoff(path, expected=expected, window=window)["token"]
+        return token, {**expected, "generation": int(expected["generation"])}
     token = os.environ.get("WOLTSPACE_CONNECTOR_TOKEN", "")
     if not token:
         sys.exit("woltspace_telegram: no connector token (WOLTSPACE_CONNECTOR_TOKEN_FILE)")
-    return token
+    return token, None
 
 
 async def run(connector: TelegramConnector, *, bot_token: str) -> int:
@@ -178,7 +233,10 @@ async def main() -> int:
     async with httpx.AsyncClient(base_url=api, timeout=60.0) as lodge, httpx.AsyncClient(
         base_url="https://api.telegram.org", timeout=httpx.Timeout(30.0, read=120.0),
     ) as bot:
-        connector = TelegramConnector(lodge, bot, bot_token=bot_token, connector_token=connector_token())
+        token, activation = connector_token()
+        connector = TelegramConnector(
+            lodge, bot, bot_token=bot_token, connector_token=token, activation=activation,
+        )
         try:
             return await run(connector, bot_token=bot_token)
         finally:

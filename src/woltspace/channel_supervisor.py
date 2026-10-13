@@ -147,6 +147,9 @@ class ConnectorState:
     log_offset: int = 0
     crash_times: list[float] = field(default_factory=list)
     fast_exits: int = 0
+    # "confirmed" once the child's exit was observed on stop; "unknown" when
+    # it could not be: its run lock may still be held.
+    shutdown: str = ""
 
     def to_record(self) -> dict:
         record = self.plan.to_record()
@@ -161,6 +164,11 @@ class ConnectorState:
             "error": self.error or None,
             "log": self.log or None,
         })
+        if self.shutdown:
+            record["shutdown"] = self.shutdown
+        if self.plan.handoff is not None:
+            # The generation in flight and any revocation still owed: never the token.
+            record["handoff"] = self.plan.handoff.status()
         return record
 
 
@@ -285,15 +293,18 @@ class ChannelSupervisor:
                     state.pid = None
         for name, child in children:
             # Terminate, then wait: the child releases its run lock only when
-            # it exits, and the lodge must not outlive that.
+            # it exits, and the lodge must not outlive that. An exit that
+            # cannot be confirmed is said so, never claimed.
             self._terminate(child, timeout=timeout)
+            state = self.states[name]
             try:
                 child.wait(timeout=timeout)
-            except (subprocess.TimeoutExpired, OSError):
-                pass
-            handoff = self.states[name].plan.handoff
-            if handoff is not None:
-                handoff.abandon()
+                state.shutdown = "confirmed"
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                state.shutdown = "unknown"
+                state.state = "failed"
+                state.error = f"did not exit within {timeout:g}s of stop ({exc}); its run lock may still be held"
+            self._abandon_handoff(state.plan)
         thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=timeout)
@@ -344,6 +355,7 @@ class ChannelSupervisor:
         except OSError as exc:
             state.state = "failed"
             state.error = f"cannot open {log_path}: {exc}"
+            self._abandon_handoff(plan)
             return
         try:
             child = self._popen(
@@ -360,6 +372,7 @@ class ChannelSupervisor:
             handle.close()
             state.state = "failed"
             state.error = str(exc)
+            self._abandon_handoff(plan)
             return
         finally:
             if not handle.closed:
@@ -383,9 +396,20 @@ class ChannelSupervisor:
                 stillborn = False
         if stillborn:
             self._terminate(child, timeout=timeout_for_stillborn())
+            try:
+                child.wait(timeout=timeout_for_stillborn())
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+            self._abandon_handoff(plan)
             with self._lock:
                 state.pid = None
                 state.state = "stopped"
+
+    @staticmethod
+    def _abandon_handoff(plan: ConnectorPlan) -> None:
+        """A launch that did not happen, or ended: its generation is revoked."""
+        if plan.handoff is not None:
+            plan.handoff.abandon()
 
     def _terminate(self, child: subprocess.Popen, *, timeout: float) -> None:
         if child.poll() is not None:
@@ -478,7 +502,11 @@ class ChannelSupervisor:
                 continue
             handoff = state.plan.handoff
             if handoff is not None and child.poll() is None:
+                # Also retries any revocation still owed from an earlier failure.
+                before = handoff.status()
                 problem = handoff.check()
+                if handoff.status() != before:
+                    changed = True
                 if problem:
                     # Not started: the token is revoked and the child goes;
                     # its exit is handled below like any other.
@@ -495,6 +523,8 @@ class ChannelSupervisor:
             if handoff is not None:
                 # The process generation is over: whatever it held is revoked.
                 handoff.abandon()
+                if handoff.unrevoked:
+                    changed = True
             state.last_exit_code = code
             state.pid = None
             with self._lock:
