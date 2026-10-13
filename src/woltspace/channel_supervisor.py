@@ -266,6 +266,11 @@ class ChannelSupervisor:
             if orphans:
                 print(f"[connectors] reaped {len(orphans)} orphaned connector(s): {orphans}")
         for name, state in self.states.items():
+            if state.plan.handoff is not None:
+                # Whatever a previous supervisor left (a pending or live
+                # generation it could not revoke) is revoked before anything
+                # new is minted.
+                state.plan.handoff.recover()
             if not state.plan.enabled:
                 state.state = "disabled"
                 continue
@@ -294,7 +299,8 @@ class ChannelSupervisor:
         for name, child in children:
             # Terminate, then wait: the child releases its run lock only when
             # it exits, and the lodge must not outlive that. An exit that
-            # cannot be confirmed is said so, never claimed.
+            # cannot be confirmed is said so, never claimed; the generation
+            # is revoked either way.
             self._terminate(child, timeout=timeout)
             state = self.states[name]
             try:
@@ -305,6 +311,9 @@ class ChannelSupervisor:
                 state.state = "failed"
                 state.error = f"did not exit within {timeout:g}s of stop ({exc}); its run lock may still be held"
             self._abandon_handoff(state.plan)
+        for state in self.states.values():
+            if state.plan.handoff is not None:
+                state.plan.handoff.retry_debts()
         thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=timeout)
@@ -398,12 +407,17 @@ class ChannelSupervisor:
             self._terminate(child, timeout=timeout_for_stillborn())
             try:
                 child.wait(timeout=timeout_for_stillborn())
-            except (subprocess.TimeoutExpired, OSError):
-                pass
+                shutdown, outcome, error = "confirmed", "stopped", ""
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                shutdown, outcome = "unknown", "failed"
+                error = f"stillborn child did not exit ({exc}); its run lock may still be held"
             self._abandon_handoff(plan)
             with self._lock:
                 state.pid = None
-                state.state = "stopped"
+                state.state = outcome
+                state.shutdown = shutdown
+                if error:
+                    state.error = error
 
     @staticmethod
     def _abandon_handoff(plan: ConnectorPlan) -> None:
@@ -492,6 +506,14 @@ class ChannelSupervisor:
         """One supervision tick. Public so tests can drive it deterministically."""
         changed = False
         for name, state in self.states.items():
+            handoff = state.plan.handoff
+            if handoff is not None:
+                # Debts (a revocation or a removal that failed) are retried
+                # from every state: failed spawn, no child, stopped.
+                before = handoff.status()
+                handoff.retry_debts()
+                if handoff.status() != before:
+                    changed = True
             if not state.plan.enabled or state.state in {"failed", "stopped", "disabled"}:
                 continue
             if state.state in {"running", "degraded"} and self.scan_log(name):

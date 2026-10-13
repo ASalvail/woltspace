@@ -385,7 +385,7 @@ class TelegramRuntimeConnector:
         })
         handoff = ConnectorHandoff(
             lambda: _connectors_module(layout).ConnectorStore(layout.wolts_dir / ".space" / "connectors"),
-            instance_id, layout.platform_state / "run",
+            instance_id, layout.platform_state,
         )
         return ConnectorPlan(
             name=self.name, enabled=True,

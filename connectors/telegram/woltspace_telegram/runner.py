@@ -56,30 +56,49 @@ def configure_logging(bot_token: str, level: int = logging.INFO) -> None:
 
 
 HANDOFF_MAX_BYTES = 4096
+RUN_DIR = "run"
 
 
-def read_handoff(path: str, *, expected: dict, window: float, now: float | None = None) -> dict:
-    """Consume the handoff file inside its anchored directory, validating everything first.
+def read_handoff(path: str, *, root: str, expected: dict, window: float, now: float | None = None) -> dict:
+    """Consume the handoff file below the anchored runtime root, validating everything first.
 
-    The directory is opened `O_DIRECTORY|O_NOFOLLOW` (a symlinked parent is
-    refused) and must be ours and private. The file is then *claimed* by an
-    atomic rename to a name of this process's own, so exactly one consumer
-    ever reads it (a second finds it gone before it could read a byte); the
-    claimed file is opened `O_NOFOLLOW|O_NONBLOCK` relative to the directory
-    and must be a small private regular file (a FIFO cannot block us, a link
-    is refused). The envelope must name the lodge, instance and generation
-    this process was told to expect, and be issued within `window` seconds.
-    Whatever the outcome, the claimed file is removed: a refused handoff is
-    gone too, and the lodge sees "taken but never activated" and revokes.
+    `root` is the runtime root the supervisor named, independently of the
+    file: the file must be exactly `<root>/run/<name>`, spelled with that
+    root (an alias of the root is not the root). The root is opened as a
+    directory we own; `run` is opened relative to it `O_DIRECTORY|
+    O_NOFOLLOW` (a link anywhere below the root is refused) and must be
+    ours and 0700. The file is then *claimed* by an atomic rename to a name
+    of this process's own, so exactly one consumer ever reads it; the
+    claimed file is opened `O_NOFOLLOW|O_NONBLOCK` relative to `run` and
+    must be a small private regular file (a FIFO cannot block us). The
+    envelope must name the lodge, instance and generation this process was
+    told to expect, and be issued within `window` seconds. Whatever the
+    outcome, the claimed file is removed: a refused handoff is gone too,
+    and the lodge sees "taken but never activated" and revokes.
     Raises `SystemExit` with the reason otherwise: no guess runs.
     """
     import stat
 
-    directory, name = os.path.split(os.path.abspath(path))
+    directory, name = os.path.split(path)
+    if not root or directory != os.path.join(root, RUN_DIR) or os.sep in name or name in ("", ".", ".."):
+        raise SystemExit("woltspace_telegram: the handoff is not below the runtime root; not starting")
+    if os.path.realpath(root) != root:
+        # The supervisor names the root by its canonical name; an alias is not it.
+        raise SystemExit("woltspace_telegram: the runtime root is not canonical; not starting")
     try:
-        dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
     except OSError as exc:
-        raise SystemExit(f"woltspace_telegram: cannot open the handoff directory: {exc}") from None
+        raise SystemExit(f"woltspace_telegram: cannot open the runtime root: {exc}") from None
+    try:
+        if os.fstat(root_fd).st_uid != os.getuid():
+            raise SystemExit("woltspace_telegram: the runtime root is not ours; not starting")
+        try:
+            dir_fd = os.open(RUN_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+        except OSError as exc:
+            raise SystemExit(f"woltspace_telegram: cannot open the handoff directory: {exc}") from None
+    except BaseException:
+        os.close(root_fd)
+        raise
     try:
         dir_info = os.fstat(dir_fd)
         if dir_info.st_uid != os.getuid() or dir_info.st_mode & 0o077:
@@ -128,6 +147,7 @@ def read_handoff(path: str, *, expected: dict, window: float, now: float | None 
                 pass
     finally:
         os.close(dir_fd)
+        os.close(root_fd)
 
 
 def threading_ident() -> int:
@@ -151,7 +171,9 @@ def connector_token() -> tuple[str, dict | None]:
             window = float(os.environ.get("WOLTSPACE_HANDOFF_WINDOW", "10"))
         except ValueError:
             window = 10.0
-        token = read_handoff(path, expected=expected, window=window)["token"]
+        token = read_handoff(
+            path, root=os.environ.get("WOLTSPACE_HANDOFF_ROOT", ""), expected=expected, window=window,
+        )["token"]
         return token, {**expected, "generation": int(expected["generation"])}
     token = os.environ.get("WOLTSPACE_CONNECTOR_TOKEN", "")
     if not token:

@@ -850,18 +850,27 @@ class ConnectorStore:
             return registry["lodge_id"]
 
     def issue_token(self, instance_id: str, *, pending: bool = False) -> str:
+        """Mint the next generation's token; see `mint`."""
+        return self.mint(instance_id, pending=pending)["token"]
+
+    def mint(self, instance_id: str, *, pending: bool = False) -> dict:
         """Mint the next generation's token; older generations are revoked.
 
-        One registry write. Leases the old generation held are released when
-        the queue is next read (its acks are refused anyway); the queue itself
-        is untouched. Called when a runner is actually relaunched, never
-        because the lodge restarted. A `pending` token (a handoff in flight)
-        authenticates nothing until its first use activates it; an unused
+        One registry write, and everything the caller must know about what
+        it minted comes back from inside that same lock: `token`,
+        `generation`, `issued` and `lodge_id`. Nothing is re-read afterwards,
+        so a concurrent mint can never be mistaken for this one. Leases the
+        old generation held are released when the queue is next read; the
+        queue itself is untouched. Called when a runner is actually
+        relaunched, never because the lodge restarted. A `pending` token (a
+        handoff in flight) authenticates nothing until `activate`; an unused
         one is revoked by whoever minted it.
         """
         with self._lock():
             registry = self._registry()
             instance = self._instance(registry, instance_id)
+            if not registry.get("lodge_id"):
+                registry["lodge_id"] = secrets.token_hex(16)
             instance["generation"] += 1
             now = self.clock()
             for token in registry["tokens"]:
@@ -878,7 +887,10 @@ class ConnectorStore:
                 if t.get("revoked") is None or now - t["revoked"] < 86400
             ]
             self._write_json(self.registry_path, registry)
-            return plain
+            return {
+                "token": plain, "generation": instance["generation"], "issued": now,
+                "lodge_id": registry["lodge_id"], "instance_id": instance_id,
+            }
 
     def revoke_generation(self, instance_id: str, generation: int) -> int:
         """Revoke exactly one generation's tokens; a newer generation is untouched."""

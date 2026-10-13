@@ -36,7 +36,7 @@ ENV = {"PATH": "/usr/bin:/bin", "HOME": "/tmp/home", "WOLTSPACE_ENTRYPOINT": "1"
 DECLARED_ENV = {
     "PATH", "HOME", "TELEGRAM_BOT_TOKEN", "WOLTSPACE_API", "PYTHONPATH", "PYTHONUNBUFFERED",
     "WOLTSPACE_CONNECTOR_TOKEN_FILE", "WOLTSPACE_LODGE_ID", "WOLTSPACE_CONNECTOR_INSTANCE",
-    "WOLTSPACE_CONNECTOR_GENERATION", "WOLTSPACE_HANDOFF_WINDOW",
+    "WOLTSPACE_CONNECTOR_GENERATION", "WOLTSPACE_HANDOFF_WINDOW", "WOLTSPACE_HANDOFF_ROOT",
 }
 # The interpreter adds its own locale variables on macOS.
 PLATFORM_ADDED = {"LC_CTYPE", "__CF_USER_TEXT_ENCODING"}
@@ -196,7 +196,7 @@ def test_launch_hands_a_pending_token_over_by_file_and_the_child_activates_it(la
         sup.poll_once()
         state = sup.report()["connectors"][0]
         assert state["state"] == "running" and TOKEN not in json.dumps(state)
-        assert state["handoff"] == {"generation": 1, "activated": True, "pending_file": False, "unrevoked": {}}
+        assert state["handoff"] == {"generation": 1, "activated": True, "pending_file": False, "unrevoked": {}, "uncleaned": {}}
     finally:
         sup.stop()
     after = read_connector_report(layout)["connectors"][0]
@@ -206,7 +206,7 @@ def test_launch_hands_a_pending_token_over_by_file_and_the_child_activates_it(la
 
 def test_a_pending_token_authenticates_nowhere_but_activation(layout, colony, monkeypatch):
     """A handoff in flight opens no route; activation needs the registry's own identity."""
-    handoff = ConnectorHandoff(lambda: colony, "tg", layout.platform_state / "run")
+    handoff = ConnectorHandoff(lambda: colony, "tg", layout.platform_state)
     env = handoff.prepare()
     token = json.loads(Path(env["WOLTSPACE_CONNECTOR_TOKEN_FILE"]).read_text())["token"]
     assert colony.authenticate(token) is None and colony.token_state("tg", 1) == "pending"
@@ -342,20 +342,23 @@ def test_stop_waits_for_the_child_and_says_when_it_cannot_confirm(layout, colony
 
 def test_every_post_mint_failure_revokes_that_generation(layout, colony, tmp_path, monkeypatch):
     """Finding 1: mkdir, open, log, Popen, stillborn: no live or pending token survives."""
-    # prepare: the run dir is a file.
+    # prepare: `run` under the root is a file, so there is no directory to anchor in.
     blocked = tmp_path / "blocked"
-    blocked.write_text("file")
+    blocked.mkdir()
+    (blocked / "run").write_text("file")
     handoff = ConnectorHandoff(lambda: colony, "tg", blocked)
     with pytest.raises(OSError):
         handoff.prepare()
     assert _live(colony) == [] and colony.token_state("tg", 1) == "revoked"
+    assert handoff.generation is None and handoff.status()["unrevoked"] == {}
     # prepare: the directory is fine but the file cannot be written out.
     with monkeypatch.context() as patched:
         patched.setattr(handoff_module.os, "fsync", lambda fd: (_ for _ in ()).throw(OSError("disk full")))
-        handoff = ConnectorHandoff(lambda: colony, "tg", tmp_path / "run")
+        handoff = ConnectorHandoff(lambda: colony, "tg", tmp_path / "root")
+        (tmp_path / "root").mkdir()
         with pytest.raises(OSError):
             handoff.prepare()
-    assert _live(colony) == [] and list((tmp_path / "run").glob("handoff-*.json")) == []
+    assert _live(colony) == [] and list((tmp_path / "root" / "run").glob("handoff-*.json")) == []
     # The log cannot be opened.
     plan = TelegramRuntimeConnector().plan(layout, ENV)
     layout.logs_dir.mkdir(parents=True, exist_ok=True)
@@ -404,19 +407,19 @@ def test_stale_sweep_revokes_the_pending_generation_not_just_the_file(layout, co
     """Astre's probe: deletion is not revocation."""
     clock = [1000.0]
     store = ConnectorStore(colony.root, clock=lambda: clock[0])
-    handoff = ConnectorHandoff(lambda: store, "tg", layout.platform_state / "run", clock=lambda: clock[0])
+    handoff = ConnectorHandoff(lambda: store, "tg", layout.platform_state, clock=lambda: clock[0])
     env = handoff.prepare()
     path = Path(env["WOLTSPACE_CONNECTOR_TOKEN_FILE"])
     token = json.loads(path.read_text())["token"]
     os.utime(path, (1, 1))
     clock[0] += handoff_module.STALE_AFTER + 1
-    fresh = ConnectorHandoff(lambda: store, "tg", layout.platform_state / "run", clock=lambda: clock[0])
+    fresh = ConnectorHandoff(lambda: store, "tg", layout.platform_state, clock=lambda: clock[0])
     assert fresh.sweep_stale() == 1
     assert store.token_state("tg", 1) == "revoked" and store.authenticate(token) is None
     # A newer generation, minted by another launch, is untouched by an old one's cleanup.
-    old = ConnectorHandoff(lambda: store, "tg", layout.platform_state / "run", clock=lambda: clock[0])
+    old = ConnectorHandoff(lambda: store, "tg", layout.platform_state, clock=lambda: clock[0])
     old.prepare()                                           # generation 2
-    new = ConnectorHandoff(lambda: store, "tg", layout.platform_state / "run", clock=lambda: clock[0])
+    new = ConnectorHandoff(lambda: store, "tg", layout.platform_state, clock=lambda: clock[0])
     newer = new.prepare()                                   # generation 3; the mint revoked 2
     assert store.token_state("tg", 3) == "pending"
     old.abandon()                                           # cleans up its own file and generation only
@@ -426,7 +429,7 @@ def test_stale_sweep_revokes_the_pending_generation_not_just_the_file(layout, co
 
 
 def test_a_failed_revocation_is_kept_visible_and_retried(layout, colony, monkeypatch):
-    handoff = ConnectorHandoff(lambda: colony, "tg", layout.platform_state / "run")
+    handoff = ConnectorHandoff(lambda: colony, "tg", layout.platform_state)
     handoff.prepare()
     broken = [True]
     real = ConnectorStore.revoke_generation
@@ -517,7 +520,7 @@ def _envelope(tmp_path, **override) -> tuple[Path, dict]:
 
 def test_the_runner_validates_the_envelope_against_what_it_was_told(tmp_path):
     path, expected = _envelope(tmp_path)
-    assert read_handoff(str(path), expected=expected, window=10, now=1005.0)["token"] == "wct_x"
+    assert read_handoff(str(path), root=str(tmp_path), expected=expected, window=10, now=1005.0)["token"] == "wct_x"
     assert not path.exists()
     for change, match in (
         ({"lodge_id": "other"}, "lodge_id"),
@@ -530,43 +533,62 @@ def test_the_runner_validates_the_envelope_against_what_it_was_told(tmp_path):
     ):
         path, expected = _envelope(tmp_path, **change)
         with pytest.raises(SystemExit, match=match):
-            read_handoff(str(path), expected=expected, window=10, now=1005.0)
+            read_handoff(str(path), root=str(tmp_path), expected=expected, window=10, now=1005.0)
         # Claimed then refused: gone either way, and the lodge's check sees
         # "taken but never activated" and revokes.
         assert not path.exists() and list((tmp_path / "run").iterdir()) == [], change
     with pytest.raises(SystemExit, match="already consumed"):
-        read_handoff(str(tmp_path / "run" / "missing.json"), expected=expected, window=10, now=1005.0)
+        read_handoff(str(tmp_path / "run" / "missing.json"), root=str(tmp_path), expected=expected, window=10, now=1005.0)
 
 
 def test_the_runner_opens_the_handoff_anchored_in_a_private_directory(tmp_path):
     path, expected = _envelope(tmp_path)
-    # A symlinked parent directory is refused.
-    link_dir = tmp_path / "link-run"
-    link_dir.symlink_to(tmp_path / "run")
+    # A path not spelled below the root (an alias of the root, a linked run dir) is refused.
+    alias = tmp_path.parent / f"{tmp_path.name}-alias"
+    alias.symlink_to(tmp_path, target_is_directory=True)
+    with pytest.raises(SystemExit, match="not below the runtime root"):
+        read_handoff(str(alias / "run" / "handoff-x.json"), root=str(tmp_path), expected=expected, window=10, now=1005.0)
+    with pytest.raises(SystemExit, match="not below the runtime root"):
+        read_handoff(str(tmp_path / "run" / "deeper" / "handoff-x.json"), root=str(tmp_path), expected=expected, window=10, now=1005.0)
+    # An alias spelled as the root itself is refused too: the file is below the real root, not the alias.
+    with pytest.raises(SystemExit):
+        read_handoff(str(alias / "run" / "handoff-x.json"), root=str(alias), expected=expected, window=10, now=1005.0)
+    # `run` replaced by a link below the root is refused (no-follow), its target untouched.
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir(mode=0o700)
+    (outside / "handoff-x.json").write_text(path.read_text())
+    (outside / "handoff-x.json").chmod(0o600)
+    real_run = tmp_path / "run"
+    real_run.rename(tmp_path / "run-real")
+    real_run.symlink_to(outside, target_is_directory=True)
     with pytest.raises(SystemExit, match="handoff directory"):
-        read_handoff(str(link_dir / "handoff-x.json"), expected=expected, window=10, now=1005.0)
+        read_handoff(str(tmp_path / "run" / "handoff-x.json"), root=str(tmp_path), expected=expected, window=10, now=1005.0)
+    assert (outside / "handoff-x.json").exists()
+    real_run.unlink()
+    (tmp_path / "run-real").rename(real_run)
+    assert path.exists()
     # A directory others can read is refused.
     (tmp_path / "run").chmod(0o755)
     with pytest.raises(SystemExit, match="not private"):
-        read_handoff(str(path), expected=expected, window=10, now=1005.0)
+        read_handoff(str(path), root=str(tmp_path), expected=expected, window=10, now=1005.0)
     (tmp_path / "run").chmod(0o700)
     # A FIFO in the file's place cannot hang the read: the non-blocking open and the regular check refuse it.
     fifo = tmp_path / "run" / "handoff-fifo.json"
     os.mkfifo(fifo, 0o600)
     with pytest.raises(SystemExit, match="not a regular file"):
-        read_handoff(str(fifo), expected=expected, window=10, now=1005.0)
+        read_handoff(str(fifo), root=str(tmp_path), expected=expected, window=10, now=1005.0)
     # A symlinked leaf is refused (claimed, then the no-follow open fails), and the target is untouched.
     leaf = tmp_path / "run" / "handoff-link.json"
     leaf.symlink_to(path)
     with pytest.raises(SystemExit):
-        read_handoff(str(leaf), expected=expected, window=10, now=1005.0)
+        read_handoff(str(leaf), root=str(tmp_path), expected=expected, window=10, now=1005.0)
     assert path.exists() and not leaf.exists()
     # A file others can read is refused; a private one is taken.
     path.chmod(0o640)
     with pytest.raises(SystemExit, match="not private"):
-        read_handoff(str(path), expected=expected, window=10, now=1005.0)
+        read_handoff(str(path), root=str(tmp_path), expected=expected, window=10, now=1005.0)
     path, expected = _envelope(tmp_path)
-    assert read_handoff(str(path), expected=expected, window=10, now=1005.0)["token"] == "wct_x"
+    assert read_handoff(str(path), root=str(tmp_path), expected=expected, window=10, now=1005.0)["token"] == "wct_x"
 
 
 def test_two_concurrent_consumers_exactly_one_wins(tmp_path):
@@ -577,7 +599,7 @@ def test_two_concurrent_consumers_exactly_one_wins(tmp_path):
     def consume():
         barrier.wait()
         try:
-            read_handoff(str(path), expected=expected, window=10, now=1005.0)
+            read_handoff(str(path), root=str(tmp_path), expected=expected, window=10, now=1005.0)
             outcomes.append("won")
         except SystemExit:
             outcomes.append("lost")
@@ -590,3 +612,170 @@ def test_two_concurrent_consumers_exactly_one_wins(tmp_path):
     for t in threads:
         t.join()
     assert sorted(outcomes) == ["lost", "won"] and not path.exists()
+
+
+# ------------------------------------------- round 3: atomic mint, debts, anchoring
+
+
+def test_a_failure_right_after_the_mint_leaves_nothing_live(layout, colony, monkeypatch):
+    """Astre's probe: the generation is tracked from the mint's return, not from a reread."""
+    handoff = ConnectorHandoff(lambda: colony, "tg", layout.platform_state)
+    with monkeypatch.context() as patched:
+        patched.setattr(handoff_module, "open_anchored_run_dir", lambda root, create: (_ for _ in ()).throw(OSError("read failure after mint")))
+        with pytest.raises(OSError):
+            handoff.prepare()
+    assert _live(colony) == [] and colony.token_state("tg", 1) == "revoked"
+    assert handoff.generation is None and handoff.status()["unrevoked"] == {}
+
+
+def test_a_mint_interleaved_before_the_envelope_is_written_is_not_mistaken_for_ours(layout, colony, monkeypatch):
+    """Astre's probe: an old handoff's cleanup revokes only its own generation."""
+    handoff = ConnectorHandoff(lambda: colony, "tg", layout.platform_state)
+    real = handoff_module.open_anchored_run_dir
+    minted = []
+
+    def mint_in_between(root, *, create):
+        if create and not minted:
+            minted.append(colony.issue_token("tg", pending=True))   # another launch, generation 2
+        return real(root, create=create)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(handoff_module, "open_anchored_run_dir", mint_in_between)
+        env = handoff.prepare()
+    envelope = json.loads(Path(env["WOLTSPACE_CONNECTOR_TOKEN_FILE"]).read_text())
+    assert envelope["generation"] == 1 and env["WOLTSPACE_CONNECTOR_GENERATION"] == "1"
+    assert colony.token_state("tg", 1) == "revoked"     # the newer mint revoked it, as any mint does
+    assert colony.token_state("tg", 2) == "pending"
+    handoff.abandon()
+    assert colony.token_state("tg", 2) == "pending"     # the old cleanup never touched it
+
+
+def test_abandon_revokes_even_when_the_file_cannot_be_removed(layout, colony):
+    """Astre's probe: an active generation is revoked whatever happens to its file."""
+    handoff = ConnectorHandoff(lambda: colony, "tg", layout.platform_state)
+    env = handoff.prepare()
+    path = Path(env["WOLTSPACE_CONNECTOR_TOKEN_FILE"])
+    data = json.loads(path.read_text())
+    colony.activate(data["token"], lodge_id=data["lodge_id"], instance_id="tg", generation=1)
+    path.unlink()
+    path.mkdir()
+    handoff.abandon()                     # does not raise
+    assert colony.token_state("tg", 1) == "revoked"
+    status = handoff.status()
+    assert status["unrevoked"] == {} and list(status["uncleaned"]) == [path.name]
+    # The removal debt is retried once the way is clear.
+    path.rmdir()
+    handoff.retry_debts()
+    assert handoff.status()["uncleaned"] == {}
+
+
+def test_debts_are_retried_from_a_failed_spawn_state_on_later_ticks(layout, colony, monkeypatch):
+    plan = TelegramRuntimeConnector().plan(layout, ENV)
+    broken = ConnectorPlan(
+        plan.name, True, plan.detail, ("/no/such/interpreter", "-m", "x"), plan.cwd, plan.env,
+        plan.remedy, plan.process_signature, isolated_env=True, handoff=plan.handoff,
+    )
+    failing = [True]
+    real = ConnectorStore.revoke_generation
+
+    def flaky(self, instance_id, generation):
+        if failing[0]:
+            raise OSError("registry on fire")
+        return real(self, instance_id, generation)
+
+    monkeypatch.setattr(ConnectorStore, "revoke_generation", flaky)
+    sup = ChannelSupervisor(layout, [broken])
+    sup.start(watch=False)
+    state = sup.report()["connectors"][0]
+    assert state["state"] == "failed" and state["handoff"]["unrevoked"] == {"1": "registry on fire"}
+    assert colony.token_state("tg", 1) == "pending"
+    sup.poll_once()
+    assert sup.report()["connectors"][0]["handoff"]["unrevoked"] == {"1": "registry on fire"}
+    failing[0] = False
+    sup.poll_once()                       # a tick in the failed, childless state pays the debt
+    assert sup.report()["connectors"][0]["handoff"]["unrevoked"] == {}
+    assert colony.token_state("tg", 1) == "revoked"
+    sup.stop()
+
+
+def test_a_debt_left_at_exit_is_paid_at_the_next_start_and_a_newer_live_generation_survives(layout, colony, monkeypatch):
+    """Active generation, revocation fails, the supervisor exits: the next start revokes exactly it."""
+    first = ConnectorHandoff(lambda: colony, "tg", layout.platform_state)
+    env = first.prepare()
+    data = json.loads(Path(env["WOLTSPACE_CONNECTOR_TOKEN_FILE"]).read_text())
+    colony.activate(data["token"], lodge_id=data["lodge_id"], instance_id="tg", generation=1)
+    real = ConnectorStore.revoke_generation
+    with monkeypatch.context() as patched:
+        patched.setattr(ConnectorStore, "revoke_generation", lambda self, i, g: (_ for _ in ()).throw(OSError("registry on fire")))
+        first.abandon()
+    assert colony.token_state("tg", 1) == "active"
+    debts = json.loads((layout.platform_state / "run" / "debts.json").read_text())
+    assert debts == [{"instance_id": "tg", "generation": 1}]
+    del first                                 # the supervisor is gone
+    # Meanwhile a newer generation is minted and activated (a connector that legitimately runs).
+    newer = ConnectorHandoff(lambda: colony, "tg", layout.platform_state)
+    env = newer.prepare()
+    data = json.loads(Path(env["WOLTSPACE_CONNECTOR_TOKEN_FILE"]).read_text())
+    colony.activate(data["token"], lodge_id=data["lodge_id"], instance_id="tg", generation=2)
+    assert colony.token_state("tg", 1) == "revoked"     # the mint already revoked the older one...
+    # ...but make the debt real again to prove recovery pays exactly it: re-arm generation 1.
+    registry = colony._registry()
+    for token in registry["tokens"]:
+        if token["generation"] == 1:
+            token["revoked"] = None
+    colony._write_json(colony.registry_path, registry)
+    assert colony.token_state("tg", 1) == "active"
+    restarted = ConnectorHandoff(lambda: colony, "tg", layout.platform_state)
+    restarted.recover()
+    assert colony.token_state("tg", 1) == "revoked"
+    assert colony.token_state("tg", 2) == "active"
+    assert json.loads((layout.platform_state / "run" / "debts.json").read_text()) == []
+    assert restarted.status()["unrevoked"] == {}
+
+
+def test_a_stillborn_child_that_cannot_be_confirmed_gone_is_reported_unknown(layout, colony, monkeypatch):
+    plan = TelegramRuntimeConnector().plan(layout, ENV)
+    sleeper = ConnectorPlan(
+        plan.name, True, plan.detail, (sys.executable, "-c", "import time; time.sleep(30)"), plan.cwd,
+        plan.env, plan.remedy, plan.process_signature, isolated_env=True, handoff=plan.handoff,
+    )
+    holder = {}
+
+    def popen_then_stop(*args, **kwargs):
+        child = subprocess.Popen(*args, **kwargs)
+        child.wait = lambda timeout=None: (_ for _ in ()).throw(subprocess.TimeoutExpired("x", timeout))
+        holder["sup"]._stopping.set()
+        return child
+
+    sup = ChannelSupervisor(layout, [sleeper], popen=popen_then_stop)
+    holder["sup"] = sup
+    sup.start(watch=False)
+    state = sup.report()["connectors"][0]
+    assert state["state"] == "failed" and state["shutdown"] == "unknown"
+    assert "run lock may still be held" in state["error"]
+    assert _live(colony) == []
+    sup.stop()
+
+
+def test_the_writer_is_anchored_too(layout, colony, tmp_path):
+    """A linked `run` below the root is refused; the target outside is never written or chmodded."""
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o755)
+    layout.platform_state.mkdir(parents=True, exist_ok=True)
+    (layout.platform_state / "run").symlink_to(outside, target_is_directory=True)
+    handoff = ConnectorHandoff(lambda: colony, "tg", layout.platform_state)
+    with pytest.raises(OSError):
+        handoff.prepare()
+    assert list(outside.iterdir()) == [] and stat.S_IMODE(outside.stat().st_mode) == 0o755
+    assert _live(colony) == []
+    (layout.platform_state / "run").unlink()
+    # The root's own alias (a platform canonicalization, a wolts dir reached through a link) is fine:
+    # it is resolved once, and the file lands below the real root.
+    alias = tmp_path / "alias"
+    alias.symlink_to(layout.platform_state, target_is_directory=True)
+    handoff = ConnectorHandoff(lambda: colony, "tg", alias)
+    env = handoff.prepare()
+    assert env["WOLTSPACE_HANDOFF_ROOT"] == os.path.realpath(layout.platform_state)
+    assert Path(env["WOLTSPACE_CONNECTOR_TOKEN_FILE"]).parent == Path(env["WOLTSPACE_HANDOFF_ROOT"]) / "run"
+    assert stat.S_IMODE((layout.platform_state / "run").stat().st_mode) == 0o700
+    handoff.abandon()
