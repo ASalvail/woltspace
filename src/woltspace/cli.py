@@ -1172,15 +1172,44 @@ def _connector_remove(args) -> int:
     return _connector_run(args, action)
 
 
+FORGED_SENDER_WARNING = (
+    "a malicious connector can forge an allowed sender and use any grant you turn on here"
+)
+
+
 def _connector_bind(args) -> int:
+    """Grant one provider sender in one conversation; the chat-command grants are the owner's.
+
+    Residual trust, said every time a grant is turned on: core bounds what
+    a connector submits, it cannot prove the provider sender really sent it,
+    so a malicious connector can forge an allowed sender and use any grant
+    the owner turned on for that binding.
+    """
     def action(_connectors, store):
+        selectable = [name.strip() for name in (args.selectable_wolts or "").split(",") if name.strip()]
         binding = store.bind(
             args.instance_id, sender=args.sender, conversation=args.conversation,
             thread=args.thread, default_wolt=args.wolt, may_wake=args.may_wake,
+            selectable_wolts=selectable, may_create=args.may_create,
+            may_stop_own_sessions=args.may_stop_own_sessions,
+            create_per_hour=args.create_per_hour, create_concurrent=args.create_concurrent,
         )
-        return {"binding": binding, "lines": [
-            f"{args.sender} in {args.conversation} -> {args.wolt}",
-        ]}
+        lines = [f"{args.sender} in {args.conversation} -> {args.wolt}"]
+        grants = []
+        if binding["may_wake"]:
+            grants.append("may wake a stopped session")
+        if binding["selectable_wolts"]:
+            grants.append("may pick: " + ", ".join(binding["selectable_wolts"]))
+        if binding["may_create"]:
+            grants.append(
+                f"may start sessions ({binding['create_per_hour']}/hour, {binding['create_concurrent']} live)"
+            )
+        if binding["may_stop_own_sessions"]:
+            grants.append("may stop the sessions it started or talked to")
+        if grants:
+            lines.extend(f"  grant: {grant}" for grant in grants)
+            lines.append(f"  warning: {FORGED_SENDER_WARNING}")
+        return {"binding": binding, "lines": lines}
     return _connector_run(args, action)
 
 
@@ -1610,6 +1639,14 @@ def build_parser() -> argparse.ArgumentParser:
     connector_bind.add_argument("--thread", default=None)
     connector_bind.add_argument("--wolt", required=True, help="where unrouted text goes")
     connector_bind.add_argument("--may-wake", action="store_true", help="a message may resume a stopped session")
+    connector_bind.add_argument(
+        "--selectable-wolts", default="", metavar="A,B",
+        help="wolts this chat may pick with /wolt and start with /new",
+    )
+    connector_bind.add_argument("--may-create", action="store_true", help="/new may start a session (not the same as --may-wake)")
+    connector_bind.add_argument("--may-stop-own-sessions", action="store_true", help="/kill may stop a session this chat started or talked to")
+    connector_bind.add_argument("--create-per-hour", type=int, default=None, help="/new limit per hour (default 6)")
+    connector_bind.add_argument("--create-concurrent", type=int, default=None, help="live sessions /new may have started at once (default 2)")
     connector_bind.add_argument("--json", action="store_true")
     connector_bind.set_defaults(func=_connector_bind)
     connector_unbind = connector_sub.add_parser("unbind", help="remove a binding")

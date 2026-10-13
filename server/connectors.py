@@ -158,6 +158,13 @@ class Limits:
     cursor_max_chars: int = 32
     # A pending (handoff) generation must be activated within this long of its mint.
     handoff_window_seconds: float = 10.0
+    # Inline-button callbacks: how long an issued id stays valid, how many a binding may hold.
+    callback_ttl_seconds: float = 3600.0
+    callbacks_per_binding: int = 50
+    # `/new` defaults when the owner sets no limit on the binding.
+    create_per_hour: int = 6
+    create_concurrent: int = 2
+    max_buttons: int = 20
 
 
 class ConnectorStateUnreadable(RuntimeError):
@@ -221,6 +228,8 @@ class AcceptedEvent:
     reply_to_session: str | None
     # The provider's position for this event (Telegram's update_id), or None.
     cursor: int | None = None
+    # An inline-button press: the opaque id core issued, resolved at execution.
+    callback: str | None = None
 
     @property
     def dedup_key(self) -> str:
@@ -233,7 +242,7 @@ class AcceptedEvent:
             "event_id": self.event_id, "binding": self.binding, "sender": self.sender,
             "conversation": self.conversation, "text": self.text,
             "attachments": list(self.attachments), "reply_to_session": self.reply_to_session,
-            "cursor": self.cursor,
+            "cursor": self.cursor, "callback": self.callback,
         }
 
     @classmethod
@@ -242,6 +251,7 @@ class AcceptedEvent:
             record["instance_id"], record["channel"], record["account"], record["event_id"],
             record["binding"], record["sender"], record["conversation"], record["text"],
             tuple(record["attachments"]), record.get("reply_to_session"), record.get("cursor"),
+            record.get("callback"),
         )
 
 
@@ -255,8 +265,11 @@ class _Queue:
     inbound: dict = field(default_factory=dict)
     # {"<account>\x00<provider_message_id>": {"delivery_id", "binding_id", "session", "at"}}
     provider_messages: dict = field(default_factory=dict)
-    # Per-binding routing memory: {binding_id: {"active_session": name}}.
+    # Per-binding routing memory: {binding_id: {"active_session", "active_wolt",
+    # "sessions": {name: {"via", "at"}}, "creates": [ts, ...]}}.
     routing: dict = field(default_factory=dict)
+    # Inline-button callbacks core issued: {id: {"binding_id", "action", "expires", "used"}}.
+    callbacks: dict = field(default_factory=dict)
     # The provider cursor the connector last confirmed, and the highest
     # position core has answered (accepted or dropped).
     cursor: int | None = None
@@ -267,6 +280,7 @@ class _Queue:
             "version": 1, "deliveries": self.deliveries, "dedup": self.dedup,
             "uploads": self.uploads, "counters": self.counters, "inbound": self.inbound,
             "provider_messages": self.provider_messages, "routing": self.routing,
+            "callbacks": self.callbacks,
             "cursor": self.cursor, "answered_cursor": self.answered_cursor,
         }
 
@@ -278,12 +292,13 @@ class _Queue:
             data.get("deliveries", []), data.get("dedup", {}),
             data.get("uploads", {}), data.get("counters", {"events": [], "uploads": []}),
             data.get("inbound", {}), data.get("provider_messages", {}), data.get("routing", {}),
+            data.get("callbacks", {}),
             data.get("cursor"), data.get("answered_cursor"),
         )
         if not (isinstance(queue.deliveries, list) and isinstance(queue.dedup, dict)
                 and isinstance(queue.uploads, dict) and isinstance(queue.counters, dict)
                 and isinstance(queue.inbound, dict) and isinstance(queue.provider_messages, dict)
-                and isinstance(queue.routing, dict)):
+                and isinstance(queue.routing, dict) and isinstance(queue.callbacks, dict)):
             raise ConnectorStateUnreadable("queue file has an unknown shape")
         for value in (queue.cursor, queue.answered_cursor):
             if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
@@ -294,7 +309,9 @@ class _Queue:
 
 
 _TERMINAL = frozenset({"delivered", "failed", "cancelled"})
-_EVENT_KEYS = frozenset({"event_id", "sender", "conversation", "text", "attachments", "reply_to", "cursor"})
+_EVENT_KEYS = frozenset({"event_id", "sender", "conversation", "text", "attachments", "reply_to", "cursor", "callback"})
+_CALLBACK_KEYS = frozenset({"id"})
+CALLBACK_PREFIX = "cb_"
 _SENDER_KEYS = frozenset({"provider_id", "display"})
 _CONVERSATION_KEYS = frozenset({"provider_id", "thread"})
 _ACK_KEYS = frozenset({"attempt_id", "ok", "provider_message_id", "provider_message_ids", "error", "retry"})
@@ -774,11 +791,22 @@ class ConnectorStore:
     def bind(
         self, instance_id: str, *, sender: str, conversation: str, default_wolt: str,
         thread: str | None = None, may_wake: bool = False,
+        selectable_wolts: tuple[str, ...] | list[str] = (), may_create: bool = False,
+        may_stop_own_sessions: bool = False, create_per_hour: int | None = None,
+        create_concurrent: int | None = None,
     ) -> dict:
         """Allow one provider sender in one conversation; the owner's grant, typed.
 
         Binding the same sender, conversation and thread again changes the
         grant in place and keeps its id, so deliveries made under it stand.
+
+        The chat-command grants are the owner's and only the owner's:
+        `selectable_wolts` (which wolts `/wolt` and `/new` may pick),
+        `may_create` (`/new`, with its hourly and concurrent limits; distinct
+        from `may_wake`, which is only resuming), `may_stop_own_sessions`
+        (`/kill`, and only a session this binding created or routed to).
+        Residual trust, stated plainly: a malicious connector can forge an
+        allowed sender and use any grant turned on here.
         """
         limit = self.limits.id_max_chars
         if _provider_id(sender, limit) is None:
@@ -789,6 +817,15 @@ class ConnectorStore:
             raise ConnectorError(400, "invalid_thread")
         if not valid_id(default_wolt, 64):
             raise ConnectorError(400, "invalid_wolt")
+        selectable = []
+        for name in selectable_wolts:
+            if not valid_id(name, 64):
+                raise ConnectorError(400, "invalid_wolt", f"{name!r} is not a wolt name")
+            if name not in selectable:
+                selectable.append(name)
+        for value, label in ((create_per_hour, "create_per_hour"), (create_concurrent, "create_concurrent")):
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > 1000):
+                raise ConnectorError(400, "invalid_limit", f"{label} must be an integer from 0 to 1000")
         with self._lock():
             registry = self._registry()
             instance = self._instance(registry, instance_id)
@@ -803,6 +840,10 @@ class ConnectorStore:
                 "instance_id": instance_id, "account": instance["account"],
                 "sender": sender, "conversation": conversation, "thread": thread,
                 "default_wolt": default_wolt, "may_wake": bool(may_wake),
+                "selectable_wolts": selectable, "may_create": bool(may_create),
+                "may_stop_own_sessions": bool(may_stop_own_sessions),
+                "create_per_hour": self.limits.create_per_hour if create_per_hour is None else create_per_hour,
+                "create_concurrent": self.limits.create_concurrent if create_concurrent is None else create_concurrent,
             }
             registry["bindings"] = [b for b in registry["bindings"] if b is not existing]
             registry["bindings"].append(binding)
@@ -1172,6 +1213,9 @@ class ConnectorStore:
             key: record for key, record in queue.provider_messages.items()
             if now - record["at"] < limits.dedup_retention_seconds
         }
+        queue.callbacks = {
+            key: record for key, record in queue.callbacks.items() if record["expires"] > now
+        }
 
     # --------------------------------------------------------------- inbound
 
@@ -1220,6 +1264,17 @@ class ConnectorStore:
         thread = conversation.get("thread")
         if thread is not None and _provider_id(thread, limits.id_max_chars) is None:
             raise ConnectorError(400, "malformed_event", "thread is not a provider id")
+        callback = payload.get("callback")
+        callback_id = None
+        if callback is not None:
+            if not isinstance(callback, dict) or set(callback) != _CALLBACK_KEYS:
+                raise ConnectorError(400, "malformed_event", "callback needs exactly an id")
+            callback_id = callback["id"]
+            if (
+                not isinstance(callback_id, str) or not callback_id.startswith(CALLBACK_PREFIX)
+                or outbox.ENTRY_ID_RE.fullmatch(callback_id[len(CALLBACK_PREFIX):]) is None
+            ):
+                raise ConnectorError(400, "malformed_event", "callback id is not one core issued")
         text = payload.get("text", "")
         if not isinstance(text, str):
             raise ConnectorError(400, "malformed_event", "text must be a string")
@@ -1266,6 +1321,7 @@ class ConnectorStore:
             "event_id": event_id, "sender": sender_id, "display": display,
             "conversation": conversation_id, "thread": thread, "text": text,
             "attachments": upload_ids, "reply_to": reply_ref, "cursor": cursor,
+            "callback": callback_id,
         }
 
     def accept_event(self, who: Principal, payload: object) -> tuple[int, dict]:
@@ -1331,6 +1387,8 @@ class ConnectorStore:
 
             if event.get("ignore"):
                 return drop(f"ignored_{event['ignore']}")
+            if not event["text"] and not event["attachments"] and not event.get("callback"):
+                return drop("empty_event")
             if not who.enabled:
                 return drop("instance_disabled")
             binding, reason = self._binding_for(
@@ -1380,7 +1438,7 @@ class ConnectorStore:
                         "name": handle["name"], "size": handle["size"],
                     } for upload_id, handle in claimed
                 ),
-                reply_session, event["cursor"],
+                reply_session, event["cursor"], event.get("callback"),
             )
             queue.dedup[key] = {"digest": digest, "status": 200, "body": body, "at": now}
             queue.inbound[key] = {"state": "accepted", "event": accepted.to_record(), "at": now}
@@ -1626,6 +1684,53 @@ class ConnectorStore:
             queue.routing[binding_id] = state
             self._save_queue(instance_id, queue)
 
+    def associate_session(self, instance_id: str, binding_id: str, session: str, *, via: str) -> None:
+        """An explicit association: this binding created (`via="created"`) or routed to the session.
+
+        `/sessions` lists and `/kill` may stop nothing else.
+        """
+        with self._lock():
+            queue = self._queue(instance_id)
+            state = dict(queue.routing.get(binding_id) or {})
+            sessions = dict(state.get("sessions") or {})
+            if session not in sessions or via == "created":
+                sessions[session] = {"via": via, "at": self.clock()}
+            state["sessions"] = sessions
+            if via == "created":
+                creates = [t for t in state.get("creates", []) if self.clock() - t < 3600]
+                creates.append(self.clock())
+                state["creates"] = creates
+            queue.routing[binding_id] = state
+            self._save_queue(instance_id, queue)
+
+    def creates_in_the_last_hour(self, instance_id: str, binding_id: str) -> int:
+        state = self.routing_state(instance_id, binding_id)
+        return sum(1 for t in state.get("creates", []) if self.clock() - t < 3600)
+
+    def resolve_callback(self, instance_id: str, binding_id: str, callback_id: object) -> dict | None:
+        """The action behind a button press, once: same binding, not expired, not used.
+
+        Anything else is None, and the connector's sender is told so by the
+        caller; a foreign id reveals nothing about the binding it belongs to.
+        """
+        if not isinstance(callback_id, str):
+            return None
+        with self._lock():
+            queue = self._queue(instance_id)
+            record = queue.callbacks.get(callback_id)
+            if (
+                record is None or record["binding_id"] != binding_id or record["used"]
+                or record["expires"] <= self.clock()
+            ):
+                return None
+            record["used"] = True
+            self._save_queue(instance_id, queue)
+            return dict(record["action"])
+
+    def record_command(self, instance_id: str, record: dict) -> None:
+        """Audit: one line per command executed or refused, never the token or a body."""
+        self._append_line("commands.jsonl", {"at": self.clock(), "instance_id": instance_id, **record})
+
     def _release_unclaimed(self, instance_id: str, queue: _Queue, upload_ids: list[str]) -> None:
         """A rejected event gives back the handles it named and nobody else holds."""
         for upload_id in upload_ids:
@@ -1770,6 +1875,7 @@ class ConnectorStore:
         thread: str | None = None, binding_id: str | None = None,
         attachment: Path | None = None, attachment_name: str = "",
         attachment_kind: str = "file", reply_footer: str = "", session: str | None = None,
+        buttons: list[list[dict]] | None = None,
     ) -> str:
         """Queue one message for the enabled connector bound to that conversation.
 
@@ -1779,10 +1885,15 @@ class ConnectorStore:
         that covers the conversation (two senders bound in one conversation
         make it ambiguous, and ambiguity is refused). The attachment is
         copied into core's own files, so the connector only ever reads a
-        lodge-owned path.
+        lodge-owned path. `buttons` are rows of `{"text", "action"}`: core
+        issues an opaque, binding-scoped, expiring callback id for each and
+        the connector renders them as inline buttons.
         """
         if not isinstance(text, str) or len(text.encode("utf-8")) > self.limits.outbound_text_max_bytes:
             raise ConnectorError(413, "text_too_long")
+        rows = buttons or []
+        if sum(len(row) for row in rows) > self.limits.max_buttons:
+            raise ConnectorError(400, "too_many_buttons")
         if attachment is not None and attachment.stat().st_size > self.limits.outbound_file_max_bytes:
             raise ConnectorError(413, "attachment_too_large")
         with self._transaction() as tx:
@@ -1816,6 +1927,22 @@ class ConnectorStore:
                 raise ConnectorError(429, "queue_full")
             now = self.clock()
             delivery_id = secrets.token_hex(16)
+            rendered = []
+            if rows:
+                issued = sum(1 for c in queue.callbacks.values() if c["binding_id"] == binding["binding_id"] and c["expires"] > now)
+                for row in rows:
+                    line = []
+                    for button in row:
+                        if issued >= self.limits.callbacks_per_binding:
+                            raise ConnectorError(429, "callbacks_exhausted")
+                        callback_id = CALLBACK_PREFIX + secrets.token_hex(16)
+                        queue.callbacks[callback_id] = {
+                            "binding_id": binding["binding_id"], "action": dict(button["action"]),
+                            "expires": now + self.limits.callback_ttl_seconds, "used": False,
+                        }
+                        issued += 1
+                        line.append({"text": str(button["text"])[:64], "callback_id": callback_id})
+                    rendered.append(line)
             attachments = []
             if attachment is not None:
                 file_id = secrets.token_hex(16)
@@ -1841,6 +1968,7 @@ class ConnectorStore:
                 "account": account, "conversation": conversation,
                 "thread": thread, "text": text, "attachments": attachments,
                 "reply_footer": reply_footer, "session": session, "created": now,
+                "buttons": rendered,
                 "status": "queued", "failed_attempts": 0, "lease": None, "acks": {},
                 "not_before": now, "clock_started": None, "paused_base": 0.0,
             })
@@ -1900,6 +2028,7 @@ class ConnectorStore:
                             for a in delivery["attachments"]
                         ],
                         "reply_footer": delivery.get("reply_footer", ""),
+                        "buttons": delivery.get("buttons", []),
                     })
             self._commit(tx, who.instance_id)
             return {"deliveries": leased, "paused": not active}

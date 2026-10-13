@@ -42,6 +42,8 @@ def test_add_bind_enable_token_disable_unbind_remove(colony, capsys):
     ]) == 0
     binding = _out(capsys)["binding"]
     assert binding.pop("binding_id")
+    assert (binding.pop("selectable_wolts"), binding.pop("may_create"), binding.pop("may_stop_own_sessions")) == ([], False, False)
+    assert (binding.pop("create_per_hour"), binding.pop("create_concurrent")) == (6, 2)
     assert binding == {
         "instance_id": "tg-main", "account": "bot:1", "sender": "u1", "conversation": "c1",
         "thread": None, "default_wolt": "softie", "may_wake": True,
@@ -168,3 +170,28 @@ def test_handoffs_are_listed_retried_and_cancelled_by_their_displayed_event_id(c
     assert [h["event_id"] for h in _out(capsys)["handoffs"]] == ["tg:41"]
     assert cli_main(["connector", "handoffs", "tg", "--retry", "tg:99"]) == 0
     assert "no such pending event" in capsys.readouterr().out
+
+
+def test_grants_are_owner_set_and_come_with_the_forged_sender_warning(colony, capsys):
+    assert cli_main(["connector", "add", "tg", "--channel", "telegram", "--account", "bot:1"]) == 0
+    capsys.readouterr()
+    assert cli_main(["connector", "bind", "tg", "--sender", "u1", "--conversation", "c1", "--wolt", "softie"]) == 0
+    plain = capsys.readouterr().out
+    assert "warning" not in plain and "grant" not in plain
+    assert cli_main([
+        "connector", "bind", "tg", "--sender", "u2", "--conversation", "c2", "--wolt", "softie",
+        "--selectable-wolts", "softie,otter", "--may-create", "--may-stop-own-sessions",
+        "--create-per-hour", "3", "--create-concurrent", "1",
+    ]) == 0
+    out = capsys.readouterr().out
+    assert "grant: may pick: softie, otter" in out
+    assert "grant: may start sessions (3/hour, 1 live)" in out
+    assert "grant: may stop the sessions it started or talked to" in out
+    assert "warning: a malicious connector can forge an allowed sender" in out
+    store = ConnectorStore(colony / ".space" / "connectors")
+    [binding] = [b for b in store.list_bindings("tg") if b["sender"] == "u2"]
+    assert binding["selectable_wolts"] == ["softie", "otter"] and binding["may_create"] is True
+    assert binding["may_stop_own_sessions"] is True and binding["may_wake"] is False
+    assert (binding["create_per_hour"], binding["create_concurrent"]) == (3, 1)
+    assert cli_main(["connector", "bind", "tg", "--sender", "u3", "--conversation", "c3", "--wolt", "softie", "--selectable-wolts", "Not A Wolt"]) == 1
+    assert "is not a wolt name" in capsys.readouterr().err
