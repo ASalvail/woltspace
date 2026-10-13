@@ -459,11 +459,19 @@ def _allowed_hosts_values(layout: RuntimeLayout) -> list[str]:
 
 def _allowed_hosts_check(names: list[str]) -> DoctorCheck | None:
     """Name WOLTSPACE_ALLOWED_HOSTS entries the lodge can never match."""
-    bad = [
-        name for name in names
-        if any(ch in name for ch in "/:*[]@ ") or name.lower().rstrip(".") == "localhost"
-        or name.lower().rstrip(".").endswith(".localhost")
-    ]
+    import ipaddress
+
+    def never_matches(name: str) -> bool:
+        try:
+            ipaddress.ip_address(name)
+            return False  # a bare IP, IPv6 included, is matched as written
+        except ValueError:
+            pass
+        lowered = name.lower().rstrip(".")
+        return (any(ch in name for ch in "/:*[]@ ") or lowered == "localhost"
+                or lowered.endswith(".localhost"))
+
+    bad = [name for name in names if never_matches(name)]
     if not bad:
         return None
     return DoctorCheck(

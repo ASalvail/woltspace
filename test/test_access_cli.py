@@ -132,9 +132,12 @@ def test_doctor_treats_an_allowed_host_as_published(colony, monkeypatch):
 
 def test_doctor_names_allowed_host_entries_that_never_match(colony, monkeypatch):
     monkeypatch.setenv("WOLTSPACE_ALLOWED_HOSTS",
-                       "ok.example, *.ts.net, [fd00::1], host:8080, https://x.example, studio.localhost")
+                       "ok.example, fd00::1, 10.0.0.5, *.ts.net, [fd00::1], host:8080, "
+                       "https://x.example, studio.localhost")
     check = {c.name: c for c in run_doctor(_layout(colony), check_port=False)}["allowed-hosts"]
     assert check.status == "warn"
     for bad in ("*.ts.net", "[fd00::1]", "host:8080", "https://x.example", "studio.localhost"):
         assert bad in check.detail
     assert "ok.example" not in check.detail
+    assert "fd00::1," not in check.detail.replace("[fd00::1]", "") + ","
+    assert "10.0.0.5" not in check.detail
