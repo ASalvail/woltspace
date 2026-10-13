@@ -1197,6 +1197,38 @@ def _connector_token(args) -> int:
     return _connector_run(args, action)
 
 
+def _connector_runtime(args) -> int:
+    """Show or set which runtime owns a channel: its adapter or its connector.
+
+    Takes effect for outbound routing at once and for polling at the next
+    `woltspace start`. Switching to the connector with no cursor stored makes
+    it start from Telegram's unconfirmed backlog, which is what the adapter
+    had not processed; switching back lets the adapter do the same.
+    """
+    def action(connectors, store):
+        path = RuntimeLayout.from_env().wolts_dir / "woltspace.json"
+        if args.runtime:
+            connectors.set_channel_runtime(path, args.channel, args.runtime)
+        runtime = connectors.channel_runtime(path, args.channel)
+        lines = [f"{args.channel}.runtime = {runtime}"]
+        if args.runtime == "connector":
+            lines.append("the adapter stops polling at the next `woltspace start`; "
+                         "run the connector with a token from `woltspace connector token`")
+        return {"channel": args.channel, "runtime": runtime, "lines": lines}
+    return _connector_run(args, action)
+
+
+def _connector_cursor(args) -> int:
+    """Seed or clear an instance's provider cursor by hand (a handover)."""
+    def action(_connectors, store):
+        cursor = None if args.clear else args.cursor
+        store.seed_cursor(args.instance_id, cursor)
+        return {"instance_id": args.instance_id, "cursor": cursor, "lines": [
+            f"{args.instance_id} cursor = {cursor if cursor is not None else '(none: provider backlog)'}",
+        ]}
+    return _connector_run(args, action)
+
+
 def _connector_queue(args) -> int:
     def action(_connectors, store):
         deliveries = store.list_deliveries(args.instance_id)
@@ -1521,6 +1553,21 @@ def build_parser() -> argparse.ArgumentParser:
     connector_unbind.add_argument("--thread", default=None)
     connector_unbind.add_argument("--json", action="store_true")
     connector_unbind.set_defaults(func=_connector_unbind)
+    connector_runtime = connector_sub.add_parser(
+        "runtime", help="show or set which runtime owns a channel: adapter or connector"
+    )
+    connector_runtime.add_argument("channel")
+    connector_runtime.add_argument("runtime", nargs="?", choices=("adapter", "connector"), default=None)
+    connector_runtime.add_argument("--json", action="store_true")
+    connector_runtime.set_defaults(func=_connector_runtime)
+    connector_cursor = connector_sub.add_parser(
+        "cursor", help="seed an instance's provider cursor (a handover), or clear it"
+    )
+    connector_cursor.add_argument("instance_id")
+    connector_cursor.add_argument("cursor", nargs="?", type=int, default=None)
+    connector_cursor.add_argument("--clear", action="store_true")
+    connector_cursor.add_argument("--json", action="store_true")
+    connector_cursor.set_defaults(func=_connector_cursor)
     connector_token = connector_sub.add_parser(
         "token", help="mint the instance's next token (printed once), or revoke it"
     )
