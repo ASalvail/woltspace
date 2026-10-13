@@ -736,7 +736,11 @@ class AccessTokenMiddleware:
             # like one (malformed, duplicated, another scheme), opens nothing
             # outside the connector API and is never retried as the
             # token-less owner. 401 whatever the host or peer; the connector
-            # routes do their own row 1 to 3 checks.
+            # routes do their own row 1 to 3 checks. Compatibility: a proxy
+            # that fronts the lodge with Basic auth must authenticate at its
+            # own boundary and strip Authorization before forwarding. This is
+            # not containment: a request that omits the header is still the
+            # ambient local owner (row 4).
             return await self._reject(scope, receive, send, "connector token not accepted here", status=401)
         headers = {
             key.decode("latin-1").lower(): value.decode("latin-1")

@@ -137,7 +137,8 @@ async def _json_body(request: Request, store: ConnectorStore) -> object:
         chunks.append(chunk)
     try:
         return json.loads(b"".join(chunks))
-    except ValueError:
+    except (ValueError, RecursionError):
+        # Nesting deep enough to exhaust the parser is malformed input, not a crash.
         raise ConnectorError(400, "malformed_json", "body is not JSON") from None
 
 

@@ -31,7 +31,14 @@ cancels, always.
 
 Listeners and the router run after the lock is released and the state is on
 disk, so they may call back into the store. A call made while the lock is
-held by the same thread is refused, not blocked.
+held by the same thread is refused, not blocked. Failure notifications go to
+committed transitions only, at most once: a crash between the write and the
+dispatch loses one.
+
+Dedup-before-router is a fixture-slice arrangement: the event is recorded as
+accepted before the router has it, so a crash in between loses or repeats it
+at the session. That window must close before a real provider (Telegram)
+advances its durable accept cursor on this store's answer.
 
 Stdlib only; the connector API and the CLI both import this.
 """
@@ -234,10 +241,25 @@ def _pid_alive(pid: object) -> bool:
 
 
 class _Tx:
-    """What one locked operation wants done once the lock is gone."""
+    """One locked operation's bookkeeping: what it loaded, changed and committed.
+
+    A terminal transition is `pending` until the queue holding it is written
+    (or deleted) and `committed` after; only committed ones are dispatched.
+    """
 
     def __init__(self):
-        self.finished: list[tuple[str, dict]] = []
+        self.pending: list[tuple[str, dict]] = []
+        self.committed: list[tuple[str, dict]] = []
+        self.queues: dict[str, _Queue] = {}
+        self.dirty: set[str] = set()
+
+    def settle(self, instance_id: str) -> None:
+        """The queue is on disk (or gone): its transitions are committed."""
+        self.dirty.discard(instance_id)
+        kept = []
+        for entry in self.pending:
+            (self.committed if entry[0] == instance_id else kept).append(entry)
+        self.pending = kept
 
 
 class ConnectorStore:
@@ -294,16 +316,45 @@ class ConnectorStore:
 
     @contextlib.contextmanager
     def _transaction(self):
-        """A locked operation whose callbacks run after the lock is released."""
+        """A locked operation whose callbacks run after the lock is released.
+
+        Whatever the sweep changed is written on every way out that the
+        protocol defines, a normal return and a refusal alike, so the disk
+        never lags the clock. An unexpected exception writes nothing more.
+        Listeners then hear about committed transitions only, at most once:
+        a crash between the write and the dispatch loses that notification.
+        """
         tx = _Tx()
-        with self._lock():
-            yield tx
-        for instance_id, delivery in tx.finished:
-            for listener in list(self._failure_listeners):
+        try:
+            with self._lock():
                 try:
-                    listener(instance_id, dict(delivery))
-                except Exception:
-                    pass
+                    yield tx
+                except ConnectorError:
+                    self._flush(tx)
+                    raise
+                self._flush(tx)
+        finally:
+            for instance_id, delivery in tx.committed:
+                for listener in list(self._failure_listeners):
+                    try:
+                        listener(instance_id, dict(delivery))
+                    except Exception:
+                        pass
+
+    def _load(self, tx: _Tx, instance_id: str) -> _Queue:
+        queue = self._queue(instance_id)
+        tx.queues[instance_id] = queue
+        return queue
+
+    def _commit(self, tx: _Tx, instance_id: str) -> None:
+        self._save_queue(instance_id, tx.queues[instance_id])
+        tx.settle(instance_id)
+
+    def _flush(self, tx: _Tx) -> None:
+        """Write every swept queue the operation did not write itself."""
+        for instance_id in list(tx.dirty):
+            if instance_id in tx.queues:
+                self._commit(tx, instance_id)
 
     def _read_json(self, path: Path, default: dict) -> dict:
         try:
@@ -335,20 +386,37 @@ class ConnectorStore:
             tmp.unlink(missing_ok=True)
             raise
 
+    @contextlib.contextmanager
+    def _journal_lock(self):
+        """Serialize journal rotation plus append, and nothing else.
+
+        Journals are written by listeners, which run outside the store lock
+        and possibly from several processes at once; two rotations racing
+        would displace a segment that was just rotated.
+        """
+        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with open(self.root / "journal.lock", "w") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
     def _append_line(self, name: str, record: dict) -> None:
         """Append one journal line, fsynced; the journal rotates once at its bound."""
-        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        path = self.root / name
-        try:
-            if path.stat().st_size >= self.limits.journal_max_bytes:
-                os.replace(path, path.with_name(f"{name}.1"))
-        except FileNotFoundError:
-            pass
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, sort_keys=True) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        line = json.dumps(record, sort_keys=True) + "\n"
+        with self._journal_lock():
+            path = self.root / name
+            try:
+                if path.stat().st_size >= self.limits.journal_max_bytes:
+                    os.replace(path, path.with_name(f"{name}.1"))
+            except FileNotFoundError:
+                pass
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
+                handle.write(line)
+                handle.flush()
+                os.fsync(handle.fileno())
 
     def _registry(self) -> dict:
         data = self._read_json(
@@ -478,7 +546,7 @@ class ConnectorStore:
         return cancelled
 
     def _cancel_orphan_queue(self, instance_id: str, tx: _Tx) -> int:
-        queue = self._queue(instance_id)
+        queue = self._load(tx, instance_id)
         cancelled = 0
         for delivery in queue.deliveries:
             if delivery["status"] not in _TERMINAL:
@@ -488,6 +556,8 @@ class ConnectorStore:
             self._part_path(instance_id, upload_id).unlink(missing_ok=True)
         self._queue_path(instance_id).unlink(missing_ok=True)
         shutil.rmtree(self._upload_dir(instance_id), ignore_errors=True)
+        # Gone from disk is as committed as written.
+        tx.settle(instance_id)
         return cancelled
 
     # -------------------------------------------------------------- bindings
@@ -651,7 +721,8 @@ class ConnectorStore:
             "finished": self.clock(),
         })
         self._drop_files(delivery)
-        tx.finished.append((instance_id, dict(delivery)))
+        tx.pending.append((instance_id, dict(delivery)))
+        tx.dirty.add(instance_id)
 
     def _drop_files(self, delivery: dict) -> None:
         for attachment in delivery.get("attachments", ()):
@@ -683,9 +754,15 @@ class ConnectorStore:
         return max(0.0, now - started - paused)
 
     def _sweep(self, instance_id: str, queue: _Queue, registry: dict, tx: _Tx) -> None:
-        """Apply the registry and the clocks to a queue, before anything reads it."""
+        """Apply the registry and the clocks to a queue, before anything reads it.
+
+        Marks the queue dirty: the transaction writes it before it ends, on
+        every protocol-defined way out, whether or not the operation itself
+        gets as far as a write.
+        """
         now = self.clock()
         limits = self.limits
+        tx.dirty.add(instance_id)
         instance = registry["instances"].get(instance_id) or {"enabled": False, "generation": 0}
         bindings = {b["binding_id"] for b in registry["bindings"] if b["instance_id"] == instance_id}
         for delivery in queue.deliveries:
@@ -826,7 +903,8 @@ class ConnectorStore:
 
         The claim (dedup record, upload handles) is on disk before the
         router runs, outside the lock. A crash between the two can lose or
-        repeat the event at the session: the documented known limit.
+        repeat the event at the session: the fixture-slice limit the module
+        docstring names.
         """
         event = self._parse_event(payload)
         # The digest leaves out the display name: it is shown, never routed on.
@@ -835,7 +913,7 @@ class ConnectorStore:
         with self._transaction() as tx:
             registry = self._registry()
             who = self._live(registry, who)
-            queue = self._queue(who.instance_id)
+            queue = self._load(tx, who.instance_id)
             self._sweep(who.instance_id, queue, registry, tx)
             now = self.clock()
             record = queue.dedup.get(key)
@@ -843,11 +921,11 @@ class ConnectorStore:
                 # Same answer first, before any question about its uploads.
                 if record["digest"] != digest:
                     self._release_unclaimed(who.instance_id, queue, event["attachments"])
-                    self._save_queue(who.instance_id, queue)
+                    self._commit(tx, who.instance_id)
                     raise ConnectorError(409, "event_conflict", "event_id seen with another payload")
                 return record["status"], dict(record["body"])
             if len(queue.counters["events"]) >= self.limits.events_per_minute:
-                self._save_queue(who.instance_id, queue)
+                self._commit(tx, who.instance_id)
                 raise ConnectorError(429, "events_rate_limited")
             queue.counters["events"].append(now)
 
@@ -855,7 +933,7 @@ class ConnectorStore:
                 body = {"accepted": False, "reason": reason, "event_id": event["event_id"]}
                 self._release_unclaimed(who.instance_id, queue, event["attachments"])
                 queue.dedup[key] = {"digest": digest, "status": 200, "body": body, "at": now}
-                self._save_queue(who.instance_id, queue)
+                self._commit(tx, who.instance_id)
                 return 200, body
 
             if not who.enabled:
@@ -890,7 +968,7 @@ class ConnectorStore:
                 "session": reply_session,
             }
             queue.dedup[key] = {"digest": digest, "status": 200, "body": body, "at": now}
-            self._save_queue(who.instance_id, queue)
+            self._commit(tx, who.instance_id)
             accepted = AcceptedEvent(
                 who.instance_id, who.channel, who.account, event["event_id"], dict(binding),
                 {"provider_id": event["sender"], "display": outbox.display_name(event["display"]) if event["display"] else ""},
@@ -969,16 +1047,16 @@ class ConnectorStore:
         with self._transaction() as tx:
             registry = self._registry()
             who = self._live(registry, who)
-            queue = self._queue(who.instance_id)
+            queue = self._load(tx, who.instance_id)
             self._sweep(who.instance_id, queue, registry, tx)
             if len(queue.counters["uploads"]) >= self.limits.uploads_per_hour:
-                self._save_queue(who.instance_id, queue)
+                self._commit(tx, who.instance_id)
                 raise ConnectorError(429, "uploads_rate_limited")
             if self._hourly_bytes(queue) >= self.limits.upload_bytes_per_hour:
-                self._save_queue(who.instance_id, queue)
+                self._commit(tx, who.instance_id)
                 raise ConnectorError(429, "upload_bytes_rate_limited")
             if self._held_bytes(queue) >= self.limits.upload_disk_cap_bytes:
-                self._save_queue(who.instance_id, queue)
+                self._commit(tx, who.instance_id)
                 raise ConnectorError(429, "upload_quota")
             upload_id = secrets.token_hex(16)
             now = self.clock()
@@ -987,7 +1065,7 @@ class ConnectorStore:
             }
             queue.counters["uploads"].append([now, 0, upload_id])
             self._upload_dir(who.instance_id).mkdir(mode=0o700, parents=True, exist_ok=True)
-            self._save_queue(who.instance_id, queue)
+            self._commit(tx, who.instance_id)
             return upload_id, self._part_path(who.instance_id, upload_id)
 
     def account_upload_bytes(self, who: Principal, upload_id: str, received: int) -> None:
@@ -1097,10 +1175,10 @@ class ConnectorStore:
                     f"{channel} {conversation} has {len(candidates)} bindings on {instance_id}; need exactly one",
                 )
             binding = candidates[0]
-            queue = self._queue(instance_id)
+            queue = self._load(tx, instance_id)
             self._sweep(instance_id, queue, registry, tx)
             if sum(1 for d in queue.deliveries if d["status"] not in _TERMINAL) >= self.limits.max_queued:
-                self._save_queue(instance_id, queue)
+                self._commit(tx, instance_id)
                 raise ConnectorError(429, "queue_full")
             now = self.clock()
             delivery_id = secrets.token_hex(16)
@@ -1132,7 +1210,7 @@ class ConnectorStore:
                 "status": "queued", "failed_attempts": 0, "lease": None, "acks": {},
                 "not_before": now, "clock_started": None, "paused_base": 0.0,
             })
-            self._save_queue(instance_id, queue)
+            self._commit(tx, instance_id)
             return delivery_id
 
     def list_deliveries(self, instance_id: str) -> list[dict]:
@@ -1140,9 +1218,9 @@ class ConnectorStore:
         with self._transaction() as tx:
             registry = self._registry()
             self._instance(registry, instance_id)
-            queue = self._queue(instance_id)
+            queue = self._load(tx, instance_id)
             self._sweep(instance_id, queue, registry, tx)
-            self._save_queue(instance_id, queue)
+            self._commit(tx, instance_id)
             return [dict(d) for d in queue.deliveries]
 
     def lease(self, who: Principal, max_items: int) -> dict:
@@ -1154,14 +1232,14 @@ class ConnectorStore:
             registry = self._registry()
             who = self._live(registry, who)
             instance = registry["instances"][who.instance_id]
-            queue = self._queue(who.instance_id)
+            queue = self._load(tx, who.instance_id)
             self._sweep(who.instance_id, queue, registry, tx)
             now = self.clock()
             leased = []
             if who.enabled:
                 in_flight = sum(1 for d in queue.deliveries if d["status"] == "leased")
                 if in_flight >= self.limits.max_in_flight:
-                    self._save_queue(who.instance_id, queue)
+                    self._commit(tx, who.instance_id)
                     raise ConnectorError(429, "deliveries_in_flight")
                 for delivery in queue.deliveries:
                     if len(leased) >= max_items or in_flight + len(leased) >= self.limits.max_in_flight:
@@ -1188,7 +1266,7 @@ class ConnectorStore:
                         ],
                         "reply_footer": delivery.get("reply_footer", ""),
                     })
-            self._save_queue(who.instance_id, queue)
+            self._commit(tx, who.instance_id)
             return {"deliveries": leased, "paused": not who.enabled}
 
     def ack(self, who: Principal, delivery_id: object, body: object) -> dict:
@@ -1212,7 +1290,7 @@ class ConnectorStore:
         with self._transaction() as tx:
             registry = self._registry()
             who = self._live(registry, who)
-            queue = self._queue(who.instance_id)
+            queue = self._load(tx, who.instance_id)
             delivery = next(
                 (d for d in queue.deliveries if d["delivery_id"] == delivery_id), None,
             )
@@ -1226,7 +1304,7 @@ class ConnectorStore:
             ):
                 # Foreign, stale, expired or cancelled: one answer for all, so
                 # a connector learns nothing about queues that are not its own.
-                self._save_queue(who.instance_id, queue)
+                self._commit(tx, who.instance_id)
                 raise ConnectorError(409, "stale_attempt", "no active lease for that attempt")
             if body["ok"]:
                 delivery.update({
@@ -1246,7 +1324,7 @@ class ConnectorStore:
             if delivery["status"] == "queued":
                 result["retry_at"] = delivery["not_before"]
             delivery.setdefault("acks", {})[attempt_id] = result
-            self._save_queue(who.instance_id, queue)
+            self._commit(tx, who.instance_id)
             return dict(result)
 
     def open_file(self, who: Principal, file_id: object, attempt_id: object) -> tuple[Path, dict]:
@@ -1265,9 +1343,9 @@ class ConnectorStore:
         with self._transaction() as tx:
             registry = self._registry()
             who = self._live(registry, who)
-            queue = self._queue(who.instance_id)
+            queue = self._load(tx, who.instance_id)
             self._sweep(who.instance_id, queue, registry, tx)
-            self._save_queue(who.instance_id, queue)
+            self._commit(tx, who.instance_id)
             for delivery in queue.deliveries:
                 lease = delivery.get("lease")
                 if (
@@ -1293,9 +1371,10 @@ class ConnectorStore:
     def on_failure(self, listener: Callable[[str, dict], None]) -> None:
         """Hear about every delivery that ends without a provider message.
 
-        The seam that will tell the session. Listeners run after the lock is
-        released and the state is on disk, so they may enqueue through this
-        store; the default writes a record.
+        The seam that will tell the session. Listeners hear about committed
+        transitions only, run after the lock is released (so they may enqueue
+        through this store), and at most once: a crash between the write and
+        the dispatch loses that notification. The default writes a record.
         """
         self._failure_listeners.append(listener)
 

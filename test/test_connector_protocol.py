@@ -34,7 +34,7 @@ LIMITS = Limits(
     lease_seconds=60, max_attempts=5, retry_window_seconds=600,
     backoff_seconds=(1, 1, 1, 1), upload_ttl_seconds=600, upload_max_bytes=1000,
     upload_disk_cap_bytes=2500, file_retention_seconds=86400, text_max_bytes=64,
-    request_max_bytes=4096, events_per_minute=20, uploads_per_hour=10,
+    request_max_bytes=65536, events_per_minute=20, uploads_per_hour=10,
     upload_bytes_per_hour=10_000, max_in_flight=3, lease_max_batch=10, max_queued=6,
     journal_max_bytes=400, outbound_file_max_bytes=1_000_000,
 )
@@ -1246,3 +1246,120 @@ async def test_revoking_mid_stream_cuts_the_file_at_the_next_chunk(lodge, tmp_pa
         except httpx.HTTPError:
             pass
     assert len(received) == connector_api._CHUNK
+
+
+# ------------------------------------- commit before dispatch (round 3)
+
+
+def _one_shot(lodge, **limits) -> "ConnectorStore":
+    """The lodge's store with a single allowed attempt: one expiry is terminal."""
+    store = ConnectorStore(
+        lodge.store.root, clock=lodge.clock,
+        limits=Limits(max_attempts=1, backoff_seconds=(1,), outbound_file_max_bytes=1_000_000, **limits),
+    )
+    store.on_failure(lambda instance_id, delivery: lodge.failed.append((instance_id, delivery)))
+    return store
+
+
+def test_a_refused_ack_still_commits_the_expiry_and_notifies_exactly_once(lodge):
+    """Astre's round-2 probe 1: the 409 path persisted the failure but told nobody."""
+    store = _one_shot(lodge)
+    who = store.authenticate(lodge.token)
+    delivery_id = lodge.enqueue()
+    leased = store.lease(who, 1)["deliveries"][0]
+    lodge.clock.advance(LIMITS.lease_seconds + 1)
+    with pytest.raises(ConnectorError) as refused:
+        store.ack(who, delivery_id, {"attempt_id": leased["attempt_id"], "ok": True})
+    assert refused.value.status == 409
+    assert store._queue("tg-main").deliveries[0]["status"] == "failed"
+    assert [f[1]["delivery_id"] for f in lodge.failed] == [delivery_id]
+    store.list_deliveries("tg-main")
+    store.lease(who, 1)
+    assert len(lodge.failed) == 1
+    assert len((store.root / "failures.jsonl").read_text().splitlines()) == 1
+
+
+def test_a_dedup_replay_commits_its_sweep_and_notifies_exactly_once(lodge):
+    """Astre's round-2 probe 2: the early return dispatched what it never wrote."""
+    store = _one_shot(lodge)
+    who = store.authenticate(lodge.token)
+    event = {"event_id": "e1", "sender": {"provider_id": "u1"}, "conversation": {"provider_id": "c1"}, "text": "hi"}
+    assert store.accept_event(who, event)[1]["accepted"] is True
+    delivery_id = lodge.enqueue()
+    store.lease(who, 1)
+    lodge.clock.advance(LIMITS.lease_seconds + 1)
+    first = store.accept_event(who, event)
+    second = store.accept_event(who, event)
+    assert first == second
+    assert store._queue("tg-main").deliveries[0]["status"] == "failed"
+    assert [f[1]["delivery_id"] for f in lodge.failed] == [delivery_id]
+    store.list_deliveries("tg-main")
+    assert len(lodge.failed) == 1
+
+
+def test_a_refusal_before_any_write_commits_the_sweep_too(lodge):
+    """A saved-then-refused path and a refused-before-saving path both leave the disk current."""
+    store = _one_shot(lodge)
+    who = store.authenticate(lodge.token)
+    delivery_id = lodge.enqueue()
+    store.lease(who, 1)
+    lodge.clock.advance(LIMITS.lease_seconds + 1)
+    # open_file sweeps, saves, then refuses: the expiry is on disk and announced once.
+    with pytest.raises(ConnectorError):
+        store.open_file(who, "0" * 32, "1" * 32)
+    assert store._queue("tg-main").deliveries[0]["status"] == "failed"
+    assert [f[1]["delivery_id"] for f in lodge.failed] == [delivery_id]
+    # An unexpected exception inside the lock commits nothing and announces nothing.
+    second = lodge.enqueue()
+    store.lease(who, 1)
+    lodge.clock.advance(LIMITS.lease_seconds + 1)
+    before = (store.root / "queues" / "tg-main.json").read_text()
+    original = ConnectorStore._save_queue
+
+    def crash(self, instance_id, queue):
+        raise OSError("disk gone")
+
+    ConnectorStore._save_queue = crash
+    try:
+        with pytest.raises(OSError):
+            store.list_deliveries("tg-main")
+    finally:
+        ConnectorStore._save_queue = original
+    assert (store.root / "queues" / "tg-main.json").read_text() == before
+    assert len(lodge.failed) == 1
+    store.list_deliveries("tg-main")
+    assert [f[1]["delivery_id"] for f in lodge.failed] == [delivery_id, second]
+
+
+def test_journal_rotation_and_append_are_serialized_without_the_store_lock(lodge):
+    import threading
+
+    store = lodge.store
+    written = threading.Event()
+
+    def append():
+        store.record_failure("tg-main", {"delivery_id": "x" * 32, "status": "failed", "conversation": "c1"})
+        written.set()
+
+    with store._journal_lock():
+        worker = threading.Thread(target=append)
+        worker.start()
+        assert not written.wait(0.2)
+        # The store lock is free meanwhile: the journal lock is its own.
+        assert store.list_instances()[0]["instance_id"] == "tg-main"
+        lodge.enqueue()
+    assert written.wait(2)
+    worker.join()
+    assert len((store.root / "failures.jsonl").read_text().splitlines()) == 1
+
+
+async def test_deeply_nested_json_is_malformed_input_not_a_crash(lodge):
+    nested = b"[" * 30000 + b"]" * 30000
+    assert len(nested) <= LIMITS.request_max_bytes
+    with pytest.raises(RecursionError):
+        json.loads(nested)
+    async with _client() as client:
+        connector = FakeConnector(client, lodge.token)
+        for path in ("/connector/v1/events", "/connector/v1/deliveries/lease"):
+            response = await client.post(path, content=nested, headers=connector.headers)
+            assert (response.status_code, response.json()["reason"]) == (400, "malformed_json"), path
