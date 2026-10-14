@@ -8,14 +8,21 @@ against a tiny fake lodge.
 import json
 import os
 import subprocess
+import socket
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import pytest
 
 SCRIPT = Path(__file__).resolve().parent.parent / "container" / "bin" / "push-view"
-PAGES = {"/wolt/sprout/site/hello.html", "/wolt/sprout/site/", "/wolt/other/site/a.html"}
+PAGES = {
+    "/wolt/sprout/site/hello.html", "/wolt/sprout/site/", "/wolt/other/site/a.html",
+    "/wolt/sprout/site/my%20page.html",
+}
+MOVED = {"/wolt/sprout/site/plans"}
+SLOW = {"/wolt/sprout/site/slow.html"}
 
 
 @pytest.fixture
@@ -27,7 +34,13 @@ def lodge():
             pass
 
         def do_GET(self):
-            self.send_response(200 if self.path in PAGES else 404)
+            if self.path in SLOW:
+                time.sleep(10)
+            if self.path in MOVED:
+                self.send_response(308)
+                self.send_header("Location", self.path + "/")
+            else:
+                self.send_response(200 if self.path in PAGES else 404)
             self.end_headers()
 
         def do_POST(self):
@@ -118,3 +131,33 @@ def test_quotes_in_url_stay_valid_json(lodge):
         PAGES.discard('/wolt/sprout/site/a"b.html')
     assert result.returncode == 0, result.stderr
     assert lodge[1][0][1] == '/wolt/sprout/site/a"b.html'
+
+
+def test_space_in_name_is_checked_encoded_and_pushed_as_typed(lodge):
+    result = run(lodge, "/wolt/sprout/site/my page.html")
+    assert result.returncode == 0, result.stderr
+    assert lodge[1][0][1] == "/wolt/sprout/site/my page.html"
+
+
+def test_redirect_counts_as_found(lodge):
+    result = run(lodge, "/wolt/sprout/site/plans")
+    assert result.returncode == 0, result.stderr
+    assert lodge[1][0][1] == "/wolt/sprout/site/plans"
+
+
+def test_hung_lodge_times_out(lodge):
+    started = time.monotonic()
+    result = run(lodge, "/wolt/sprout/site/slow.html")
+    assert time.monotonic() - started < 9
+    assert result.returncode == 1
+    assert "failed to reach" in result.stderr
+    assert lodge[1] == []
+
+
+def test_lodge_down_says_unreachable(tmp_path):
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    result = run((f"http://127.0.0.1:{port}", []), "/wolt/sprout/site/hello.html", cwd=tmp_path)
+    assert result.returncode == 1
+    assert "failed to reach" in result.stderr
