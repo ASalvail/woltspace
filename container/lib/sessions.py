@@ -163,6 +163,23 @@ _AGENT_APPEAR_TIMEOUT = 12.0
 _AGENT_REVIVE_TIMEOUT = 6.0
 _AGENT_POLL_INTERVAL = 0.4
 
+# How long a message waits for an agent that is up to start taking input
+# before it is refused instead of pasted (see _await_input_ready). Generous on
+# purpose: running out turns a Telegram message into a fresh session.
+INPUT_READY_TIMEOUT = 15
+_INPUT_READY_POLL = 0.25
+# How old the agent process must be before a paste. This is the readiness
+# test; the terminal mode is not. Measured on Claude Code 2.1.300: the tty
+# goes raw ~0.05 s after exec; input that early is caught and replayed, then
+# pasted input is DROPPED from ~0.25 to ~0.65 s, and from ~0.7 s the composer
+# takes it. The drop is inside Claude, long after raw, so raw tells nothing:
+# do not simplify readiness back to raw mode. 3 s and not 1, because that
+# window is boot time: it stretches with CPU load, and a loaded host or a
+# small container boots Claude in 2 to 3 s. The age counts from the wrapper's
+# process start, not the exec: natively wclaude execs at once, but in a
+# container trust-dir runs first (~0.1-0.3 s), which eats that much margin.
+AGENT_INPUT_READY_AGE = 3
+
 
 class SessionRegistry:
     """Per-wolt session registry.
@@ -910,6 +927,105 @@ def _await_agent(session: str | dict | RuntimeHandle, harness: str | None,
         time.sleep(_AGENT_POLL_INTERVAL)
 
 
+def _input_ready(handle: RuntimeHandle) -> bool | None:
+    """One look at whether the program in this exact pane has its terminal raw.
+
+    A runtime without the probe answers None — unknown — which pastes exactly
+    as delivery did before the probe existed.
+    """
+    probe = getattr(_runtime(), "input_ready", None)
+    return probe(handle) if probe is not None else None
+
+
+def _agent_age(handle: RuntimeHandle, harness: str | None) -> int | None:
+    """Seconds the youngest agent process in this exact pane has been up, or None.
+
+    A runtime without the probe answers None, read like an unreadable tty.
+    """
+    probe = getattr(_runtime(), "agent_age", None)
+    if probe is None:
+        return None
+    return probe(handle, get_harness(harness)["process_names"])
+
+
+def _await_input_ready(target: str | dict | RuntimeHandle, harness: str | None,
+                       timeout: float | None = None) -> RuntimeHandle | None:
+    """Wait until the agent in this session takes input: the pane to paste into, or None.
+
+    Finding the agent process is not enough, and neither is a raw terminal.
+    Claude Code takes its tty raw about 0.05 s after exec, then drops pasted
+    input until its composer mounts, around 0.7 s on an idle host and later on
+    a loaded one (AGENT_INPUT_READY_AGE has the measurements). A paste in that
+    gap is lost without a trace. So ready is: the agent process found
+    (launching excluded) and the youngest agent process in its pane at least
+    AGENT_INPUT_READY_AGE old (`agent_age`, read off the process: a revive puts
+    a new pid under an old record).
+
+    The terminal mode is read once the agent is old enough, and only reported.
+    Raw is pasted into as usual. A cooked or unreadable pane is pasted into
+    too, with one log line: a cooked reader buffers a paste and its Enter
+    fine, and a harness that never goes raw (hermes and pi are unmeasured)
+    must not have every message refused.
+
+    An agent already old at the first look returns at once, which is nearly
+    every message. A young one sleeps out the rest of its age, inside the
+    same timeout. An age that can't be read is pasted into straight away, as
+    before the probe existed.
+
+    None means paste nothing: no agent was found within the timeout (still
+    launching), or nothing is booting to wait for — no agent and no launching
+    shim, which the caller's own checks then name (agent-gone, session-dead).
+
+    Never call this under a session lock. It can run for the whole timeout,
+    and every writer of the record queues on that lock.
+
+    Read from the module globals at call time so a test can shorten them.
+    """
+    limit = INPUT_READY_TIMEOUT if timeout is None else timeout
+    name = _runtime_handle(target).woltspace_session_id
+    started = time.monotonic()
+    waited = False
+    while True:
+        pause = _INPUT_READY_POLL
+        found = resolve_agent_handle(target, harness, include_launching=False)
+        if found is not None:
+            age = _agent_age(found, harness)
+            if age is None:
+                print(f"[sessions] {name}: can't read the age of the {harness} "
+                      f"agent in pane {found.pane_id}; pasting without waiting "
+                      f"for input", file=sys.stderr)
+                return found
+            if age >= AGENT_INPUT_READY_AGE:
+                raw = _input_ready(found)
+                if raw is None:
+                    print(f"[sessions] {name}: the {harness} agent is old enough but "
+                          f"the terminal mode of pane {found.pane_id} can't be read; "
+                          f"pasting", file=sys.stderr)
+                elif not raw:
+                    print(f"[sessions] {name}: the {harness} agent is old enough but "
+                          f"its terminal is not raw; pasting", file=sys.stderr)
+                elif waited:
+                    print(f"[sessions] {name}: the {harness} agent took input after "
+                          f"{time.monotonic() - started:.2f}s", file=sys.stderr)
+                return found
+            # Young: inside the window where Claude drops input. Sleep out
+            # the rest of the age rather than poll through it.
+            pause = AGENT_INPUT_READY_AGE - age
+        elif resolve_agent_handle(target, harness, include_launching=True) is None:
+            if waited:
+                print(f"[sessions] {name}: stopped waiting after "
+                      f"{time.monotonic() - started:.2f}s; nothing is booting",
+                      file=sys.stderr)
+            return None
+        elapsed = time.monotonic() - started
+        if elapsed >= limit:
+            print(f"[sessions] {name}: the {harness} agent was not taking input after "
+                  f"{elapsed:.2f}s; not pasting", file=sys.stderr)
+            return None
+        waited = True
+        time.sleep(min(pause, limit - elapsed))
+
+
 def _guard_paste_text(harness: str | None, text: str) -> str:
     """Defuse harness-specific paste quirks. Pure no-op unless the harness
     opts in via a flag, so shared paste paths (IWCL, resume) are unchanged
@@ -1018,10 +1134,12 @@ def deliver_message(session_id: str, text: str, from_wolt: str = "",
     """Deliver a message into a running session, with optional attribution.
 
     Returns {"status": ..., "session": session_id} where status is:
-      delivered    — pasted into the pane an agent was actually found in
-      agent-gone   — tmux holds the session but no agent is ready in it
-      session-dead — the tmux session itself is gone
-      no-session   — no such session
+      delivered     — pasted into the pane an agent was actually found in
+      agent-booting — an agent is starting in the session but was not taking
+                      input by the end of the wait; nothing was pasted
+      agent-gone    — tmux holds the session but no agent is in it
+      session-dead  — the tmux session itself is gone
+      no-session    — no such session
 
     Delivery is the one place liveness has teeth. A paste is not a read: the
     text goes to whatever owns the pane, and a login shell left behind by a
@@ -1034,15 +1152,20 @@ def deliver_message(session_id: str, text: str, from_wolt: str = "",
         hope". The conservative side is cheap and self-healing — the caller
         sees agent-gone and resumes, and a resume that finds a live agent just
         delivers the prompt itself.
-      * a *launching* agent — counted as alive everywhere else, so a booting
-        session is not reported orphaned, but a half-painted TUI swallows a
-        paste. Detection uses include_launching=False and hands back the exact
-        pane, so a session found in one window can never be pasted into
-        another.
+      * a *booting* agent — a launching one is counted as alive everywhere
+        else, so a booting session is not reported orphaned, but a TUI that
+        has not mounted its input yet loses a paste. Delivery first waits for
+        the agent to take input (_await_input_ready), before and never under
+        the session lock, then finds the agent again under the lock without
+        waiting; its age only grows, so that is not asked again. Detection
+        uses include_launching=False and hands back the exact pane, so a
+        session found in one window can never be pasted into another.
 
     agent-gone is deliberately distinct from session-dead: the tmux session is
     still there, so a caller can resume-then-retry rather than concluding the
-    session is beyond reach.
+    session is beyond reach. agent-booting is distinct from both: the wait has
+    already been spent, and a resume on top of it would paste a relaunch into
+    the pane the agent is booting in.
 
     Delivery is harness-aware: it reuses _tmux_paste with the target harness's
     paste_settle (codex needs a settle before Enter; claude takes 0).
@@ -1052,6 +1175,7 @@ def deliver_message(session_id: str, text: str, from_wolt: str = "",
     if existing is None:
         return {"status": "no-session", "session": session_id}
     wolt = existing.get("wolt", "")
+    ready = _await_input_ready(existing, resolve_harness(existing.get("harness")))
     with reg._lock(wolt, session_id):
         data = reg.get(session_id, wolt=wolt)
         if data is None:
@@ -1069,11 +1193,11 @@ def deliver_message(session_id: str, text: str, from_wolt: str = "",
                 ),
             }
         target = resolve_agent_handle(data, harness, include_launching=False)
-        if target is None:
+        if target is None or ready is None:
             return {
-                "status": "agent-gone",
+                "status": "agent-booting",
                 "session": session_id,
-                "detail": f"the {harness} agent is still booting — retry shortly",
+                "detail": "the agent is still booting",
             }
         settle = get_harness(harness).get("paste_settle", 0.0)
         body = format_attributed_message(text, from_wolt, from_session)
@@ -1733,7 +1857,8 @@ def resume_session(name: str, prompt: str = "") -> dict:
 
     Logic:
       1. Look up session in registry (scan all wolts).
-      2. If tmux is alive and the agent is running → paste the prompt directly.
+      2. If tmux is alive and the agent is running, or still launching → wait
+         for it to take input, then paste the prompt directly.
       3. If tmux and the saved pane live but the agent exited → resume in that pane.
       4. If tmux lives but the saved pane is gone → resume in a fresh window.
       5. If tmux is dead → create a new tmux session with run-session.sh --resume.
@@ -1747,7 +1872,7 @@ def resume_session(name: str, prompt: str = "") -> dict:
     Returns dict with resume info.
     Raises ValueError if session not found in registry, ResumeUnavailable if
     the session has no conversation id to replay, ResumeFailed if the agent
-    did not come up.
+    did not come up — or, in step 2, did not take input within the wait.
     """
     registry = SessionRegistry()
     data = registry.get(name, check_alive=False)
@@ -1765,6 +1890,7 @@ def resume_session(name: str, prompt: str = "") -> dict:
 
     tmux_alive = _tmux_alive(data)
     agent_running = False
+    booting = False
     # Where the agent was actually found. Delivery targets this exact pane, so
     # a session detected in one window can never be pasted into another.
     target = _runtime_handle(data)
@@ -1775,8 +1901,13 @@ def resume_session(name: str, prompt: str = "") -> dict:
         agent_running = found is not None
         if found is not None:
             target = found
+        else:
+            # Only the launching shim: the agent has not exited, it has not
+            # started yet. Relaunching would paste `run-session.sh --resume`
+            # into the pane it is booting in, so it is waited for instead.
+            booting = resolve_agent_handle(data, harness, include_launching=True) is not None
 
-    if tmux_alive and agent_running:
+    if tmux_alive and (agent_running or booting):
         # Agent is running — paste the prompt into the TUI as a single buffer paste.
         # A resume prompt is a single logical instruction, so we flatten \n here
         # for EVERY harness (pre-existing behavior): a bare \n can submit the
@@ -1785,6 +1916,14 @@ def resume_session(name: str, prompt: str = "") -> dict:
         # the multi-line attributed message renders intact — hence the flatten
         # lives at the call site, not in _guard_paste_text.
         if prompt:
+            ready = _await_input_ready(target, harness)
+            if ready is None:
+                raise ResumeFailed(
+                    f"session '{name}': the {harness} agent is still booting — it "
+                    f"was not taking input after {INPUT_READY_TIMEOUT}s, so the "
+                    f"message was not sent"
+                )
+            target = ready
             _tmux_paste(target, _guard_paste_text(harness, prompt.replace("\n", " ")),
                         settle=get_harness(harness).get("paste_settle", 0.0))
         registry.update(
@@ -1793,7 +1932,9 @@ def resume_session(name: str, prompt: str = "") -> dict:
             status="running",
             runtime=target.to_record(),
         )
-        return {"name": name, "url": session_url, "status": "delivered", "detail": "agent running, message sent"}
+        detail = ("agent booting, nothing to send" if booting and not prompt
+                  else "agent running, message sent")
+        return {"name": name, "url": session_url, "status": "delivered", "detail": detail}
 
     # A record whose workdir does not exist on this host was written by a
     # different runtime (container vs native share a migrated data root).

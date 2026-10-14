@@ -369,6 +369,32 @@ def _spawn_session(wolt: str, chat_id: int, prompt: str = "") -> dict:
     return session
 
 
+def _session_message(text: str, chat_id: int) -> str:
+    """A Telegram message as its session reads it, pasted or in the opening prompt."""
+    return f"[telegram message from human, chat_id={chat_id}]: {text}"
+
+
+def _spawn_session_with_message(wolt: str, chat_id: int, text: str) -> dict:
+    """Spawn a session for an incoming message, the message in its opening prompt.
+
+    Pasted into the new pane after the spawn, the message was lost: the agent
+    isn't reading input a second in (#555). Start-chat leads, so the spawn
+    doesn't add a second one, and the spawn's Telegram context carries the
+    reply instruction. Records what _route_to_session would have.
+    """
+    session = _spawn_session(
+        wolt, chat_id, f"{_start_chat_prompt(wolt)}\n\n{_session_message(text, chat_id)}")
+    _bot_log("telegram_v2_spawn_with_message", {
+        "session": session["name"], "wolt": wolt, "text": text[:200],
+    })
+    _append_history(chat_id, "user", text)
+    _append_message(chat_id, {
+        "role": "assistant",
+        "content": f"[delivered to session {session['name']}]",
+    })
+    return session
+
+
 async def _route_to_session(update: Update, session_name: str, wolt: str, text: str, chat_id: int):
     """Route a message directly to a Claude Code session.
 
@@ -391,7 +417,7 @@ async def _route_to_session(update: Update, session_name: str, wolt: str, text: 
             pass
 
     session_msg = (
-        f"[telegram message from human, chat_id={chat_id}]: {text}\n"
+        f"{_session_message(text, chat_id)}\n"
         f"{notify_reply_instruction('--telegram', chat_id)}"
     )
     # message_session → resume_session blocks for as long as the agent takes
@@ -630,7 +656,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
                 # Route failed (session truly gone) — spawn new one for that wolt
                 try:
-                    session = _spawn_session(reply_wolt, chat_id)
+                    session = _spawn_session_with_message(reply_wolt, chat_id, reply_text)
                     state = _load_chat_state(chat_id)
                     state["active_wolt"] = reply_wolt
                     state["active_session"] = session["name"]
@@ -638,7 +664,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     tunnel_url = get_tunnel_url()
                     session_link = f"{tunnel_url}/tui?session={session['name']}" if tunnel_url else session["name"]
                     await _reply(update, f"🪵 session expired — new one for {reply_wolt}\n{session_link}")
-                    await _route_to_session(update, session["name"], reply_wolt, reply_text, chat_id)
                 except Exception as e:
                     logger.error(f"Failed to spawn session for {reply_wolt}: {e}")
                     await _reply(update, f"couldn't start session for {_shown(reply_wolt)}: {e}")
@@ -696,14 +721,12 @@ async def _route_message(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
         # message_session failed (session not in registry) — spawn new
         await _reply(update, f"🪵 session expired — spawning new one for {_shown(active_wolt)}")
         try:
-            session = _spawn_session(active_wolt, chat_id)
+            session = _spawn_session_with_message(active_wolt, chat_id, text)
             state["active_session"] = session["name"]
             _save_chat_state(chat_id, state)
             tunnel_url = get_tunnel_url()
             session_link = f"{tunnel_url}/tui?session={session['name']}" if tunnel_url else session["name"]
             await _reply(update, f"🪵 new session for {_shown(active_wolt)}\n{session_link}")
-            # Send the original message to the new session
-            await _route_to_session(update, session["name"], active_wolt, text, chat_id)
         except Exception as e:
             logger.error(f"Failed to spawn session for {active_wolt}: {e}")
             await _reply(update, f"couldn't start session for {_shown(active_wolt)}: {e}")
@@ -711,14 +734,12 @@ async def _route_message(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
 
     # --- Has active wolt but no session: spawn one ---
     try:
-        session = _spawn_session(active_wolt, chat_id)
+        session = _spawn_session_with_message(active_wolt, chat_id, text)
         state["active_session"] = session["name"]
         _save_chat_state(chat_id, state)
         tunnel_url = get_tunnel_url()
         session_link = f"{tunnel_url}/tui?session={session['name']}" if tunnel_url else session["name"]
         await _reply(update, f"🪵 new session for {_shown(active_wolt)}\n{session_link}")
-        # Send the message to the new session
-        await _route_to_session(update, session["name"], active_wolt, text, chat_id)
     except Exception as e:
         logger.error(f"Failed to spawn session for {active_wolt}: {e}")
         await _reply(update, f"couldn't start session for {_shown(active_wolt)}: {e}")
@@ -837,7 +858,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
                 # Route failed (session truly gone) — spawn new one for that wolt
                 try:
-                    session = _spawn_session(reply_wolt, chat_id)
+                    session = _spawn_session_with_message(reply_wolt, chat_id, reply_text)
                     new_state = dict(prev_state)
                     new_state["active_wolt"] = reply_wolt
                     new_state["active_session"] = session["name"]
@@ -845,7 +866,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     tunnel_url = get_tunnel_url()
                     session_link = f"{tunnel_url}/tui?session={session['name']}" if tunnel_url else session["name"]
                     await _reply(update, f"🪵 session expired — new one for {reply_wolt}\n{session_link}")
-                    await _route_to_session(update, session["name"], reply_wolt, reply_text, chat_id)
                 except Exception as e:
                     logger.error(f"Failed to spawn session for {reply_wolt}: {e}")
                     await _reply(update, f"couldn't start session for {_shown(reply_wolt)}: {e}")
@@ -867,25 +887,23 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _save_chat_state(chat_id, state)
         if not delivered:
             try:
-                session = _spawn_session(active_wolt, chat_id)
+                session = _spawn_session_with_message(active_wolt, chat_id, voice_message)
                 state["active_session"] = session["name"]
                 _save_chat_state(chat_id, state)
                 tunnel_url = get_tunnel_url()
                 session_link = f"{tunnel_url}/tui?session={session['name']}" if tunnel_url else session["name"]
                 await _reply(update, f"🪵 new session for {_shown(active_wolt)}\n{session_link}")
-                await _route_to_session(update, session["name"], active_wolt, voice_message, chat_id)
             except Exception as e:
                 await _reply(update, f"couldn't start session: {e}")
     elif active_wolt:
         # No active session — spawn one
         try:
-            session = _spawn_session(active_wolt, chat_id)
+            session = _spawn_session_with_message(active_wolt, chat_id, voice_message)
             state["active_session"] = session["name"]
             _save_chat_state(chat_id, state)
             tunnel_url = get_tunnel_url()
             session_link = f"{tunnel_url}/tui?session={session['name']}" if tunnel_url else session["name"]
             await _reply(update, f"🪵 new session for {_shown(active_wolt)}\n{session_link}")
-            await _route_to_session(update, session["name"], active_wolt, voice_message, chat_id)
         except Exception as e:
             await _reply(update, f"couldn't start session: {e}")
     else:
@@ -945,25 +963,23 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _save_chat_state(chat_id, state)
         if not delivered:
             try:
-                session = _spawn_session(active_wolt, chat_id)
+                session = _spawn_session_with_message(active_wolt, chat_id, file_msg)
                 state["active_session"] = session["name"]
                 _save_chat_state(chat_id, state)
                 tunnel_url = get_tunnel_url()
                 session_link = f"{tunnel_url}/tui?session={session['name']}" if tunnel_url else session["name"]
                 await _reply(update, f"🪵 new session for {_shown(active_wolt)}\n{session_link}")
-                await _route_to_session(update, session["name"], active_wolt, file_msg, chat_id)
             except Exception as e:
                 await _reply(update, f"couldn't start session: {e}")
     elif active_wolt:
         # No active session — spawn one
         try:
-            session = _spawn_session(active_wolt, chat_id)
+            session = _spawn_session_with_message(active_wolt, chat_id, file_msg)
             state["active_session"] = session["name"]
             _save_chat_state(chat_id, state)
             tunnel_url = get_tunnel_url()
             session_link = f"{tunnel_url}/tui?session={session['name']}" if tunnel_url else session["name"]
             await _reply(update, f"🪵 new session for {_shown(active_wolt)}\n{session_link}")
-            await _route_to_session(update, session["name"], active_wolt, file_msg, chat_id)
         except Exception as e:
             await _reply(update, f"couldn't start session: {e}")
     else:
@@ -1029,24 +1045,22 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _save_chat_state(chat_id, state)
         if not delivered:
             try:
-                session = _spawn_session(active_wolt, chat_id)
+                session = _spawn_session_with_message(active_wolt, chat_id, file_msg)
                 state["active_session"] = session["name"]
                 _save_chat_state(chat_id, state)
                 tunnel_url = get_tunnel_url()
                 session_link = f"{tunnel_url}/tui?session={session['name']}" if tunnel_url else session["name"]
                 await _reply(update, f"🪵 new session for {_shown(active_wolt)}\n{session_link}")
-                await _route_to_session(update, session["name"], active_wolt, file_msg, chat_id)
             except Exception as e:
                 await _reply(update, f"couldn't start session: {e}")
     elif active_wolt:
         try:
-            session = _spawn_session(active_wolt, chat_id)
+            session = _spawn_session_with_message(active_wolt, chat_id, file_msg)
             state["active_session"] = session["name"]
             _save_chat_state(chat_id, state)
             tunnel_url = get_tunnel_url()
             session_link = f"{tunnel_url}/tui?session={session['name']}" if tunnel_url else session["name"]
             await _reply(update, f"🪵 new session for {_shown(active_wolt)}\n{session_link}")
-            await _route_to_session(update, session["name"], active_wolt, file_msg, chat_id)
         except Exception as e:
             await _reply(update, f"couldn't start session: {e}")
     else:
@@ -1100,25 +1114,23 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _save_chat_state(chat_id, state)
         if not delivered:
             try:
-                session = _spawn_session(active_wolt, chat_id)
+                session = _spawn_session_with_message(active_wolt, chat_id, file_msg)
                 state["active_session"] = session["name"]
                 _save_chat_state(chat_id, state)
                 tunnel_url = get_tunnel_url()
                 session_link = f"{tunnel_url}/tui?session={session['name']}" if tunnel_url else session["name"]
                 await _reply(update, f"🪵 new session for {_shown(active_wolt)}\n{session_link}")
-                await _route_to_session(update, session["name"], active_wolt, file_msg, chat_id)
             except Exception as e:
                 await _reply(update, f"couldn't start session: {e}")
     elif active_wolt:
         # No active session — spawn one
         try:
-            session = _spawn_session(active_wolt, chat_id)
+            session = _spawn_session_with_message(active_wolt, chat_id, file_msg)
             state["active_session"] = session["name"]
             _save_chat_state(chat_id, state)
             tunnel_url = get_tunnel_url()
             session_link = f"{tunnel_url}/tui?session={session['name']}" if tunnel_url else session["name"]
             await _reply(update, f"🪵 new session for {_shown(active_wolt)}\n{session_link}")
-            await _route_to_session(update, session["name"], active_wolt, file_msg, chat_id)
         except Exception as e:
             await _reply(update, f"couldn't start session: {e}")
     else:

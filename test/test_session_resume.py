@@ -50,14 +50,15 @@ def wolt_env(tmp_path, monkeypatch):
     return tmp_path
 
 
-def _absent_then_present(pane_id: str = "%1", absences: int = 1):
+def _absent_then_present(pane_id: str = "%1", absences: int = 2):
     """resolve_agent_handle stand-in: no agent now, an agent after the relaunch.
 
-    resume_session asks at least twice on every relaunch path — once to pick
-    the path (nothing running) and once to verify the relaunch actually
-    produced an agent. A stub that always answers None describes a resume that
-    failed, not one that worked. `absences` covers paths that relaunch twice
-    (revive in place, then escalate to a clean respawn).
+    resume_session asks at least three times on a revive — once to pick the
+    path (nothing running), once to rule out a launching shim (a session still
+    booting is waited for, never relaunched), and once to verify the relaunch
+    actually produced an agent. A stub that always answers None describes a
+    resume that failed, not one that worked. `absences` covers paths that
+    relaunch twice (revive in place, then escalate to a clean respawn).
     """
     remaining = [None] * absences
 
@@ -401,7 +402,7 @@ class TestResumeVerification:
 
     @patch("sessions.session_has_agent_process", return_value=False)
     @patch("sessions.resolve_agent_handle",
-           side_effect=_absent_then_present("%1", absences=2))
+           side_effect=_absent_then_present("%1", absences=3))
     @patch("sessions._tmux_alive", return_value=True)
     def test_a_stale_agentless_tmux_session_is_killed_and_respawned(
         self, mock_alive, mock_agent, mock_has_agent,

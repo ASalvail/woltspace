@@ -235,7 +235,10 @@ class TestDeliverMessage:
 
     def test_refuses_a_still_booting_agent(self, tmp_registry, monkeypatch):
         """A launching agent counts as alive everywhere else — but a
-        half-painted TUI swallows a paste, so delivery waits for a real one."""
+        half-painted TUI swallows a paste, so delivery waits for a real one.
+
+        agent-booting, not agent-gone: the caller resumes on agent-gone, and a
+        resume pastes a relaunch into the pane the agent is booting in."""
         reg = tmp_registry
         reg.create("codexw-boot-oak-aaaaaa", wolt="codexw", harness="codex")
         monkeypatch.setattr(sessions, "_tmux_alive", lambda n: True)
@@ -249,7 +252,7 @@ class TestDeliverMessage:
                             lambda *a, **k: pasted.append(a))
 
         res = deliver_message("codexw-boot-oak-aaaaaa", "hi", registry=reg)
-        assert res["status"] == "agent-gone"
+        assert res["status"] == "agent-booting"
         assert "still booting" in res["detail"]
         assert pasted == []
 

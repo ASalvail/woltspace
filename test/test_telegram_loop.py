@@ -512,6 +512,7 @@ class TestOptionalDog:
         monkeypatch.setattr(adapter, "_route_to_session", route)
         monkeypatch.setattr(adapter, "get_response", model)
         monkeypatch.setattr(adapter, "_save_upload", lambda *args: tmp_path / "upload")
+        monkeypatch.setattr(adapter, "HISTORY_DIR", tmp_path / "history")
         return adapter, update, context, state, spawn, route, model
 
     @pytest.mark.asyncio
@@ -522,8 +523,11 @@ class TestOptionalDog:
             update.message.text = "@testbot hello"
             update.effective_chat.type = "group"
         await adapter.handle_message(update, context)
-        spawn.assert_called_once_with("nunu", 123)
-        route.assert_awaited_once_with(update, "nunu-swift-marsh-abc123", "nunu", "hello", 123)
+        # The message rides in the spawn's opening prompt, never pasted after (#555).
+        spawn.assert_called_once()
+        assert spawn.call_args.args[:2] == ("nunu", 123)
+        assert spawn.call_args.args[2].endswith("chat_id=123]: hello")
+        route.assert_not_awaited()
         assert state["active_wolt"] == "nunu"
         assert state["active_session"] == "nunu-swift-marsh-abc123"
         model.assert_not_called()
@@ -601,8 +605,9 @@ class TestOptionalDog:
         update.message.document.mime_type = "text/plain"
         monkeypatch.setattr(adapter, "transcribe_audio", lambda path: "hello")
         await getattr(adapter, "handle_" + kind)(update, context)
-        spawn.assert_called_once_with("nunu", 123)
-        route.assert_awaited_once()
+        spawn.assert_called_once()
+        assert spawn.call_args.args[:2] == ("nunu", 123)
+        route.assert_not_awaited()
         assert state["active_wolt"] == "nunu"
         model.assert_not_called()
 
@@ -614,9 +619,10 @@ class TestOptionalDog:
         context.bot.get_file = AsyncMock(return_value=file)
         monkeypatch.setenv("OPENAI_API_KEY", "")
         await adapter.handle_voice(update, context)
-        spawn.assert_called_once_with("nunu", 123)
-        route.assert_awaited_once()
-        assert "no OPENAI_API_KEY set for transcription" in route.await_args.args[3]
+        spawn.assert_called_once()
+        assert spawn.call_args.args[:2] == ("nunu", 123)
+        route.assert_not_awaited()
+        assert "no OPENAI_API_KEY set for transcription" in spawn.call_args.args[2]
         model.assert_not_called()
 
 
