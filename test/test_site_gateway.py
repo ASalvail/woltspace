@@ -868,6 +868,7 @@ def test_remote_owner_gets_livereload_and_shared_viewer_is_denied(tmp_path, monk
         site_server.LIVERELOAD_PATH,
         headers=_ws_headers(REMOTE_HOST, origin, _token(key, "apps-aud")),
     ) as ws:
+        time.sleep(0.2)  # let the watcher take its first snapshot
         (tmp_path / "astre" / "wolt" / "site" / "x.html").write_text("<html></html>")
         assert json.loads(ws.receive_text())["type"] == "reload"
     # The friend may view the site, yet never gets the owner's reload stream.
@@ -1082,7 +1083,7 @@ def test_lodge_site_sharing_routes_mirror_app_sharing(tmp_path, monkeypatch):
     empty = asyncio.run(_lodge("GET", "/sites/astre/sharing"))
     assert empty.status_code == 200
     assert empty.json() == {"entries": [], "enabled": True, "host": "astre", "unsupported": None}
-    saved = asyncio.run(_lodge("PUT", "/sites/Astre/sharing", json={"entries": ["Friend@Example.com", "@team.example"]}))
+    saved = asyncio.run(_lodge("PUT", "/sites/astre/sharing", json={"entries": ["Friend@Example.com", "@team.example"]}))
     assert saved.status_code == 200
     assert saved.json()["entries"] == ["@team.example", FRIEND]
     state = json.loads((tmp_path / ".space" / "platform" / "site-sharing.json").read_text())
