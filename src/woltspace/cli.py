@@ -141,6 +141,12 @@ def _update(args) -> int:
     return update(args)
 
 
+def _restart(args) -> int:
+    from .update import restart
+
+    return restart(args)
+
+
 def _status(args) -> int:
     from .instance import inspect_instance
     from .lifecycle import tunnel_report
@@ -1038,6 +1044,10 @@ def build_parser() -> argparse.ArgumentParser:
     stop.add_argument("--timeout", type=float, default=10.0)
     stop.add_argument("--json", action="store_true")
     stop.set_defaults(func=_stop)
+
+    restart = sub.add_parser("restart", help="stop and start the lodge on the same address, then check health")
+    restart.add_argument("--json", action="store_true")
+    restart.set_defaults(func=_restart)
 
     update = sub.add_parser("update", help="check or update a uv-managed native install")
     update.add_argument("--check", action="store_true", help="check only; change nothing")

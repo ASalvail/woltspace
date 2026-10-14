@@ -86,6 +86,7 @@ jobs:
           test/test_telegram_spawn_with_message.py
           test/test_wolts.py::TestCredentials
           test/test_wolts.py::TestSyncClaudeMdPlatformSection
+          test/test_update_cli.py
       - name: notify command
         # The script runs under woltspace-python, which needs a Python that
         # has the test install's dependencies.

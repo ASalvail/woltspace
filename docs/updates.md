@@ -27,6 +27,35 @@ For a running lodge it records status, stops, runs `uv tool install --force` wit
 
 The browser, tunnel and messaging briefly disconnect, but native tmux sessions survive. Existing sessions retain their loaded instructions; new sessions load newly synced skills.
 
+## Restart
+
+```sh
+woltspace restart
+```
+
+Stops a running lodge and starts it again on the same host and port, then waits up to thirty seconds for it to be healthy and reports connectors that got worse or sessions that were not adopted. It refuses a stopped lodge (use `woltspace start`) and container lodges. If start fails, the error names the exact `woltspace start` command that brings the lodge back. tmux sessions survive, as with an update.
+
+Prefer it over `woltspace stop && woltspace start` from inside a wolt: a wolt that runs `stop` alone leaves the lodge down, and cannot notify anyone until someone starts it again.
+
+## Recommended permissions
+
+Wolts that keep the lodge up to date need to run these commands without a prompt. For Claude, add them to the owner's `~/.claude/settings.json`, which covers every wolt on the machine:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Bash(woltspace update:*)",
+      "Bash(woltspace restart:*)",
+      "Bash(woltspace status:*)",
+      "Bash(woltspace doctor:*)"
+    ]
+  }
+}
+```
+
+Claude's auto mode honours these rules too. `woltspace start` and `woltspace stop` are left out on purpose: they are for the person at the keyboard.
+
 ## Manual native upgrade
 
 Older releases without the command can be upgraded once with the underlying steps. Review the [published release notes](https://github.com/jerpint/woltspace/releases), PyPI withdrawal state and crossed migrations, then run:

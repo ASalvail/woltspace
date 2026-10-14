@@ -164,3 +164,80 @@ def test_uv_tool_bin_wins_over_path(native, monkeypatch):
     assert [uv_executable, "status", "--json"] in calls
     assert [uv_executable, "--version"] in calls
     assert all(call[0] != "/shadowing/woltspace" for call in calls)
+
+
+def restart_run(calls, *, start_code=0, after=None):
+    statuses = iter([
+        {"state": "healthy", "endpoint": "http://127.0.0.1:7778", "connectors": [{"name": "telegram", "state": "running"}]},
+        {"state": "stopped"},
+        after or {"state": "healthy", "connectors": [{"name": "telegram", "state": "running"}]},
+    ])
+
+    def run(argv):
+        calls.append(argv)
+        if argv[-2:] == ["status", "--json"]: return completed(argv, stdout=json.dumps(next(statuses)))
+        if argv[1:2] == ["start"]: return completed(argv, start_code, stderr="port busy" if start_code else "")
+        return completed(argv)
+    return run
+
+
+def test_restart_stops_then_starts_on_same_address(native, monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(updater, "_run", restart_run(calls))
+    assert updater.restart(argparse.Namespace(json=True)) == 0
+    actions = [c for c in calls if c[1:2] in (["stop"], ["start"])]
+    assert actions == [["/tools/woltspace", "stop"], ["/tools/woltspace", "start", "--host", "127.0.0.1", "--port", "7778"]]
+    assert json.loads(capsys.readouterr().out)["health"] == "healthy"
+
+
+def test_restart_refuses_a_stopped_lodge(native, monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(updater, "_run", lambda argv: calls.append(argv) or completed(argv, stdout=json.dumps({"state": "stopped"})))
+    assert updater.restart(argparse.Namespace(json=True)) == 1
+    assert "woltspace start" in json.loads(capsys.readouterr().out)["error"]
+    assert all(c[1:2] != ["stop"] for c in calls)
+
+
+def test_restart_start_failure_names_the_recovery_command(native, monkeypatch, capsys):
+    monkeypatch.setattr(updater, "_run", restart_run([], start_code=1))
+    assert updater.restart(argparse.Namespace(json=True)) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "port busy" in error and "woltspace start --host 127.0.0.1 --port 7778" in error
+
+
+def test_restart_reports_a_connector_that_did_not_come_back(native, monkeypatch, capsys):
+    after = {"state": "healthy", "connectors": [{"name": "telegram", "state": "failed"}]}
+    monkeypatch.setattr(updater, "_run", restart_run([], after=after))
+    assert updater.restart(argparse.Namespace(json=True)) == 1
+    assert json.loads(capsys.readouterr().out)["degraded"] == ["connector telegram: failed"]
+
+
+def test_restart_container_refused(monkeypatch, capsys):
+    monkeypatch.setenv("WOLTSPACE_ISOLATION", "external")
+    assert updater.restart(argparse.Namespace(json=True)) == 1
+    assert "restarted by host tooling" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_stopped_lodge_beside_another_lodge_counts_as_stopped(native, monkeypatch, capsys):
+    # After stop, status probes the default port; a different lodge there shows "conflict".
+    calls = []
+    statuses = iter([
+        {"state": "healthy", "endpoint": "http://127.0.0.1:7778", "owner": {"pid": 1}, "connectors": []},
+        {"state": "conflict", "owner": None, "endpoint": "http://127.0.0.1:7777"},
+        {"state": "healthy", "owner": {"pid": 2}, "connectors": []},
+    ])
+
+    def run(argv):
+        calls.append(argv)
+        if argv[-2:] == ["status", "--json"]: return completed(argv, stdout=json.dumps(next(statuses)))
+        return completed(argv)
+
+    monkeypatch.setattr(updater, "_run", run)
+    assert updater.restart(argparse.Namespace(json=True)) == 0
+    assert ["/tools/woltspace", "start", "--host", "127.0.0.1", "--port", "7778"] in calls
+
+
+def test_conflict_with_an_owner_is_not_stopped():
+    assert not updater._is_stopped({"state": "conflict", "owner": {"pid": 1}})
+    assert updater._is_stopped({"state": "conflict", "owner": None})
+    assert updater._is_stopped({"state": "stopped"})

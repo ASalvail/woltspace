@@ -284,7 +284,7 @@ Then write `$WOLTSPACE_WOLTS_DIR/.space/platform/config.json`:
 Restart and check:
 
 ```bash
-woltspace stop && woltspace start
+woltspace restart
 woltspace status
 ```
 
