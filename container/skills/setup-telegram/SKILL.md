@@ -97,8 +97,10 @@ woltspace restart
 ```
 
 It stops the lodge, starts it again on the same host and port, and reports
-health. If the lodge is already stopped, start it with its configured host and
-port instead. For a container lodge, have the authorized host operator restart
+health. If the lodge is already stopped, run `woltspace start` instead, adding
+`--host`/`--port` if this lodge does not use the defaults. A stopped lodge's
+address comes from its configuration or environment; `woltspace status` then
+shows only the default address. For a container lodge, have the authorized host operator restart
 it through its existing container tooling; do not run native lifecycle commands
 inside the container.
 

@@ -56,6 +56,10 @@ Wolts that keep the lodge up to date need to run these commands without a prompt
 
 Claude's auto mode honours these rules too. `woltspace start` and `woltspace stop` are left out on purpose: they are for the person at the keyboard.
 
+What you accept with them: `update:*` also covers `--pre` and `--version X`, so a wolt can install a prerelease without asking (downgrades and yanked releases are still refused). `restart:*` lets any wolt, including one acting on text it was sent, bounce the lodge; tmux sessions survive, so the cost is a short outage.
+
+On a machine where two lodges share one install, updating one replaces the package under the other. `update` reports this and exits 1; restart the other lodge so it loads the new version.
+
 ## Manual native upgrade
 
 Older releases without the command can be upgraded once with the underlying steps. Review the [published release notes](https://github.com/jerpint/woltspace/releases), PyPI withdrawal state and crossed migrations, then run:

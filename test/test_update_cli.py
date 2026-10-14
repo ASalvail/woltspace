@@ -222,8 +222,8 @@ def test_stopped_lodge_beside_another_lodge_counts_as_stopped(native, monkeypatc
     # After stop, status probes the default port; a different lodge there shows "conflict".
     calls = []
     statuses = iter([
-        {"state": "healthy", "endpoint": "http://127.0.0.1:7778", "owner": {"pid": 1}, "connectors": []},
-        {"state": "conflict", "owner": None, "endpoint": "http://127.0.0.1:7777"},
+        {"state": "healthy", "endpoint": "http://127.0.0.1:7778", "wolts_dir": "/b", "owner": {"pid": 1}, "connectors": []},
+        {"state": "conflict", "owner": None, "wolts_dir": "/b", "endpoint": "http://127.0.0.1:7777", "health": {"wolts_dir": "/a", "pid": 9}},
         {"state": "healthy", "owner": {"pid": 2}, "connectors": []},
     ])
 
@@ -237,7 +237,66 @@ def test_stopped_lodge_beside_another_lodge_counts_as_stopped(native, monkeypatc
     assert ["/tools/woltspace", "start", "--host", "127.0.0.1", "--port", "7778"] in calls
 
 
-def test_conflict_with_an_owner_is_not_stopped():
-    assert not updater._is_stopped({"state": "conflict", "owner": {"pid": 1}})
-    assert updater._is_stopped({"state": "conflict", "owner": None})
+def test_is_stopped_tells_another_lodge_from_this_one():
+    other = {"state": "conflict", "owner": None, "wolts_dir": "/b", "health": {"wolts_dir": "/a"}}
+    same = {"state": "conflict", "owner": None, "wolts_dir": "/b", "health": {"wolts_dir": "/b"}}
+    assert updater._is_stopped(other)
+    assert not updater._is_stopped(same)  # this lodge running without an owner record
+    assert not updater._is_stopped({"state": "conflict", "owner": {"pid": 1}, "wolts_dir": "/b", "health": {"wolts_dir": "/a"}})
     assert updater._is_stopped({"state": "stopped"})
+
+
+def test_update_refuses_this_lodge_running_without_owner_record(native, monkeypatch, capsys):
+    calls = []
+    same = {"state": "conflict", "owner": None, "wolts_dir": "/b", "endpoint": "http://127.0.0.1:7777", "health": {"wolts_dir": "/b"}}
+
+    def run(argv):
+        calls.append(argv)
+        if argv[0] == "uv" and argv[1:3] == ["tool", "list"]: return receipt(argv)
+        if argv[-2:] == ["status", "--json"]: return completed(argv, stdout=json.dumps(same))
+        return completed(argv)
+
+    monkeypatch.setattr(updater, "_pypi", lambda: metadata("0.5.11", "0.5.12"))
+    monkeypatch.setattr(updater, "_run", run)
+    assert updater.update(args()) == 1
+    assert "resolve it" in json.loads(capsys.readouterr().out)["error"]
+    assert not any(c[:3] == ["uv", "tool", "install"] for c in calls)
+
+
+def test_update_flags_another_lodge_on_the_shared_install(native, monkeypatch, capsys):
+    statuses = iter([
+        {"state": "healthy", "endpoint": "http://127.0.0.1:7778", "wolts_dir": "/b", "owner": {"pid": 1}, "connectors": []},
+        {"state": "conflict", "owner": None, "wolts_dir": "/b", "endpoint": "http://127.0.0.1:7777", "health": {"wolts_dir": "/a", "pid": 9}},
+        {"state": "healthy", "owner": {"pid": 2}, "connectors": []},
+    ])
+
+    def run(argv):
+        if argv[0] == "uv" and argv[1:3] == ["tool", "list"]: return receipt(argv)
+        if argv[-2:] == ["status", "--json"]: return completed(argv, stdout=json.dumps(next(statuses)))
+        if argv[-1] == "--version": return completed(argv, stdout="woltspace 0.5.12\n")
+        return completed(argv)
+
+    monkeypatch.setattr(updater, "_pypi", lambda: metadata("0.5.11", "0.5.12"))
+    monkeypatch.setattr(updater, "_run", run)
+    assert updater.update(args()) == 1
+    degraded = json.loads(capsys.readouterr().out)["degraded"]
+    assert len(degraded) == 1 and "pid 9" in degraded[0] and "/a" in degraded[0]
+
+
+def test_restart_endpoint_brackets_ipv6(native, monkeypatch, capsys):
+    statuses = iter([
+        {"state": "healthy", "endpoint": "http://[::1]:7778", "owner": {"pid": 1}, "connectors": []},
+        {"state": "stopped"},
+        {"state": "healthy", "connectors": []},
+    ])
+    calls = []
+
+    def run(argv):
+        calls.append(argv)
+        if argv[-2:] == ["status", "--json"]: return completed(argv, stdout=json.dumps(next(statuses)))
+        return completed(argv)
+
+    monkeypatch.setattr(updater, "_run", run)
+    assert updater.restart(argparse.Namespace(json=True)) == 0
+    assert json.loads(capsys.readouterr().out)["endpoint"] == "http://[::1]:7778"
+    assert ["/tools/woltspace", "start", "--host", "::1", "--port", "7778"] in calls

@@ -19,7 +19,7 @@ from urllib.parse import urlsplit
 from packaging.version import InvalidVersion, Version
 
 from . import __version__
-from .layout import RuntimeLayout
+from .layout import RuntimeLayout, dialable_host
 
 
 PYPI_URL = "https://pypi.org/pypi/woltspace/json"
@@ -174,23 +174,48 @@ def _require_native(verb: str = "updated") -> None:
         raise UpdateError(f"container/external lodges must be {verb} by host tooling")
 
 
-def _is_stopped(status: dict[str, Any]) -> bool:
-    """True when this lodge has no running control plane.
+def _other_lodge(status: dict[str, Any]) -> dict[str, Any] | None:
+    """The health of a different lodge answering at this lodge's address, if any.
 
-    A stopped lodge has no owner record, so status probes the default
-    address; another lodge answering there shows as "conflict" even though
-    this one is down.
+    A stopped lodge has no owner record, so status probes the default address
+    and shows "conflict" when another data root's lodge answers there. The same
+    data root answering means this lodge runs without an owner record: not
+    another lodge, and not stopped.
     """
-    state = status.get("state")
-    return state == "stopped" or (state == "conflict" and not status.get("owner"))
+    if status.get("state") != "conflict" or status.get("owner"):
+        return None
+    health = status.get("health") or {}
+    theirs, ours = health.get("wolts_dir"), status.get("wolts_dir")
+    if not theirs or not ours:
+        return None
+    if Path(theirs).resolve(strict=False) == Path(ours).resolve(strict=False):
+        return None
+    return health
 
 
-def _stop_lodge(executable: str) -> None:
+def _is_stopped(status: dict[str, Any]) -> bool:
+    """True when this lodge has no running control plane."""
+    return status.get("state") == "stopped" or _other_lodge(status) is not None
+
+
+def _other_lodge_note(status: dict[str, Any]) -> list[str]:
+    other = _other_lodge(status)
+    if other is None:
+        return []
+    return [
+        f"another lodge (pid {other.get('pid')}, data root {other.get('wolts_dir')}, "
+        f"endpoint {status.get('endpoint')}) runs on this install; restart it so it loads the new version"
+    ]
+
+
+def _stop_lodge(executable: str) -> dict[str, Any]:
     stopped = _command(executable, "stop")
     if stopped.returncode:
         raise UpdateError(stopped.stderr.strip() or "woltspace stop failed")
-    if not _is_stopped(_status(executable)):
+    after_stop = _status(executable)
+    if not _is_stopped(after_stop):
         raise UpdateError("the lodge did not stop")
+    return after_stop
 
 
 def _wait_healthy(executable: str, before: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
@@ -231,7 +256,7 @@ def restart(args: Any) -> int:
                 + f"; the lodge is stopped - run: woltspace start --host {host} --port {port}"
             )
         after, problems = _wait_healthy(executable, before)
-        result = {"ok": not problems, "endpoint": f"http://{host}:{port}", "health": after.get("state"), "degraded": problems}
+        result = {"ok": not problems, "endpoint": f"http://{dialable_host(host)}:{port}", "health": after.get("state"), "degraded": problems}
         emit(result, f"restarted on {host}:{port}; lodge {after.get('state')}" + (f"; degraded: {', '.join(problems)}" if problems else ""))
         return 1 if problems else 0
     except UpdateError as exc:
@@ -280,9 +305,10 @@ def update(args: Any) -> int:
             raise UpdateError(f"lodge state is {state!r}; resolve it before updating")
         was_running = state == "healthy"
         start_host, start_port = _start_address(before) if was_running else ("", 0)
+        stopped_status = before
         if was_running:
             try:
-                _stop_lodge(executable)
+                stopped_status = _stop_lodge(executable)
             except UpdateError as exc:
                 raise UpdateError(f"{exc}; installation was not attempted") from exc
 
@@ -313,6 +339,7 @@ def update(args: Any) -> int:
         else:
             after = _status(new_executable)
             problems = _degraded(before, after)
+        problems += _other_lodge_note(stopped_status)
         result = {**summary, "health": after.get("state"), "degraded": problems}
         emit(result, f"updated {installed} -> {target.version}; lodge {after.get('state')}" + (f"; degraded: {', '.join(problems)}" if problems else ""))
         return 1 if problems else 0
