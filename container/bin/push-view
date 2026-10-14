@@ -74,11 +74,20 @@ esac
 
 # Check a lodge path loads before showing it: a page that 404s in the viewport
 # looks to the human like the wolt is broken, and the agent never sees it.
+# This also refuses a page the server has not written yet (a brand new wolt's
+# site); the server preloads that one itself, so push-view never needs to.
+# Spaces are encoded for curl only; the viewport gets the URL as typed, and the
+# browser encodes it as it always did.
 case "$URL" in
   /*)
-    CODE=$(curl -sS -o /dev/null -w '%{http_code}' "${API}${URL}" 2>/dev/null || true)
+    CHECK_URL=$(printf '%s' "$URL" | sed 's/ /%20/g')
+    CODE=$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' "${API}${CHECK_URL}" 2>/dev/null || true)
     case "$CODE" in
       2??|3??) ;;
+      000|"")
+        echo "[viewport:${SESSION}] failed to reach ${API}: no answer to ${URL}" >&2
+        exit 1
+        ;;
       404)
         echo "[viewport:${SESSION}] not pushed: ${URL} was not found." >&2
         echo "Wolt sites are served at /wolt/<name>/site/<file>; check the file exists under wolt/site/." >&2
@@ -98,7 +107,7 @@ JSON_URL=$(printf '%s' "$URL" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
 # `curl -s` swallows a connection refusal, and the old unconditional echo below
 # then reported a push that never happened — the single most misleading thing a
 # tool can do to an agent checking its own work. Fail loudly instead.
-if ! RESPONSE=$(curl -sS -f -X POST "${API}/current?session=${SESSION}" \
+if ! RESPONSE=$(curl -sS -f --max-time 5 -X POST "${API}/current?session=${SESSION}" \
   -H 'Content-Type: application/json' \
   -d "{\"url\":\"${JSON_URL}\"}" 2>&1); then
   echo "[viewport:${SESSION}] failed to reach ${API}: ${RESPONSE}" >&2
