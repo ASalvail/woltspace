@@ -200,11 +200,11 @@ def _is_stopped(status: dict[str, Any]) -> bool:
 
 def _other_lodge_note(status: dict[str, Any]) -> list[str]:
     other = _other_lodge(status)
-    if other is None:
+    if other is None or other.get("isolation") != "host":
         return []
     return [
-        f"another lodge (pid {other.get('pid')}, data root {other.get('wolts_dir')}, "
-        f"endpoint {status.get('endpoint')}) runs on this install; restart it so it loads the new version"
+        f"another native lodge (pid {other.get('pid')}, data root {other.get('wolts_dir')}, "
+        f"endpoint {status.get('endpoint')}) may run on this install; if so, restart it so it loads the new version"
     ]
 
 

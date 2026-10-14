@@ -266,7 +266,7 @@ def test_update_refuses_this_lodge_running_without_owner_record(native, monkeypa
 def test_update_flags_another_lodge_on_the_shared_install(native, monkeypatch, capsys):
     statuses = iter([
         {"state": "healthy", "endpoint": "http://127.0.0.1:7778", "wolts_dir": "/b", "owner": {"pid": 1}, "connectors": []},
-        {"state": "conflict", "owner": None, "wolts_dir": "/b", "endpoint": "http://127.0.0.1:7777", "health": {"wolts_dir": "/a", "pid": 9}},
+        {"state": "conflict", "owner": None, "wolts_dir": "/b", "endpoint": "http://127.0.0.1:7777", "health": {"wolts_dir": "/a", "pid": 9, "isolation": "host"}},
         {"state": "healthy", "owner": {"pid": 2}, "connectors": []},
     ])
 
@@ -300,3 +300,10 @@ def test_restart_endpoint_brackets_ipv6(native, monkeypatch, capsys):
     assert updater.restart(argparse.Namespace(json=True)) == 0
     assert json.loads(capsys.readouterr().out)["endpoint"] == "http://[::1]:7778"
     assert ["/tools/woltspace", "start", "--host", "::1", "--port", "7778"] in calls
+
+
+def test_container_on_the_default_port_is_not_flagged():
+    status = {"state": "conflict", "owner": None, "wolts_dir": "/b", "endpoint": "http://127.0.0.1:7777",
+              "health": {"wolts_dir": "/workspace/wolts", "pid": 9, "isolation": "external"}}
+    assert updater._is_stopped(status)
+    assert updater._other_lodge_note(status) == []
