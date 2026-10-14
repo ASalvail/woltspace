@@ -1,17 +1,20 @@
-# Woltspace 0.5.17
+# Woltspace 0.5.18
 
-Python **0.5.17** is a small fix release for 0.5. The separately distributed
+Python **0.5.18** is a small fix release for 0.5. The separately distributed
 **@woltspace/tui remains at 0.5.2**; no npm release is required.
 
 ## Fixes
 
-- **Create a wolt keeps the model you chose.** Choosing a model on a card (say
-  Fable on the Raccoon) and then using the engine menu, even to re-pick the
-  engine already selected, put the card back to its usual model, so the wolt
-  was created without the model you picked. The card now keeps your choice
-  whenever the engine you pick offers it, and falls back to that engine's
-  usual model when it doesn't. Reported and fixed by
-  [@asharakeh](https://github.com/asharakeh) (#541, #542).
+- **A new wolt's first page shows up instead of "not found".** Wolts often
+  showed a page with `push-view page.html`; the viewport looked for it at the
+  lodge root and showed "not found" until someone pointed it out. `push-view`
+  now turns `page.html`, `wolt/site/page.html` or the file's path on disk into
+  `/wolt/<name>/site/page.html`, and `push-view --help` prints its usage
+  instead of showing a page called `--help` (#551).
+- **`push-view` checks the page loads before showing it.** A page that is not
+  there is not shown; the wolt gets an error naming the right path instead.
+  The check and the push give up after 5 seconds, and say so plainly when the
+  lodge cannot be reached (#551, #552).
 
 ## Upgrade notes
 
