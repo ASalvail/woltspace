@@ -1,20 +1,20 @@
-# Woltspace 0.5.18
+# Woltspace 0.5.19
 
-Python **0.5.18** is a small fix release for 0.5. The separately distributed
+Python **0.5.19** is a small fix release for 0.5. The separately distributed
 **@woltspace/tui remains at 0.5.2**; no npm release is required.
 
 ## Fixes
 
-- **A new wolt's first page shows up instead of "not found".** Wolts often
-  showed a page with `push-view page.html`; the viewport looked for it at the
-  lodge root and showed "not found" until someone pointed it out. `push-view`
-  now turns `page.html`, `wolt/site/page.html` or the file's path on disk into
-  `/wolt/<name>/site/page.html`, and `push-view --help` prints its usage
-  instead of showing a page called `--help` (#551).
-- **`push-view` checks the page loads before showing it.** A page that is not
-  there is not shown; the wolt gets an error naming the right path instead.
-  The check and the push give up after 5 seconds, and say so plainly when the
-  lodge cannot be reached (#551, #552).
+- **A message sent while a session is starting is no longer lost.** A
+  Telegram message that started a new session, or one sent right after
+  `/new`, could vanish while the lodge logged it as delivered: the agent
+  ignores pasted input for its first moments. The message that starts a
+  session now goes in with the session's opening prompt. Messages to a
+  session that is still starting (Telegram, inter-wolt, `/message`) wait
+  until the agent is ready before they are pasted, for up to 15 seconds. If
+  it is still not ready, nothing is pasted, nothing is reported as
+  delivered, and `/message` answers 409 `agent-booting`. Reported and fixed
+  by [@asharakeh](https://github.com/asharakeh) (#555, #556).
 
 ## Upgrade notes
 
