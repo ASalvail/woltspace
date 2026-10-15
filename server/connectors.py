@@ -2067,12 +2067,13 @@ class ConnectorStore:
         Returns `{"claim": id}` to go ahead, or `{"done": {"text"|"reason"}}`
         for a disposition already settled (cached, reused by every retry),
         or one settled now: the binding's current `may_transcribe`, the
-        instance enabled and owning its channel, the per-attachment attempt
+        per-attachment attempt
         cap (across restarts and owner retries), and the instance's UTC-day
         byte and request budget, charged here and kept whatever happens
         next (the provider may have billed). A live claim held by another
         attempt answers `{"busy": True}`; a stale one is reclaimed within the
-        cap. Results are cached; a crash after the call and before its
+        cap. A disabled instance, or one whose channel the connector does not
+        own now, answers `{"paused": True}` and settles nothing. Results are cached; a crash after the call and before its
         settlement can call again, at most `transcribe_max_attempts` times.
         """
         tkey = f"{key}\x00{upload_id}"
@@ -2103,8 +2104,12 @@ class ConnectorStore:
             binding_id = ((inbound.get("event") or {}).get("binding") or {}).get("binding_id")
             binding = next((b for b in registry["bindings"] if b["binding_id"] == binding_id), None)
             instance = registry["instances"].get(instance_id)
-            if binding is None or instance is None or not instance.get("enabled") or not self.runtime_active(instance.get("channel", "")):
+            if binding is None or instance is None:
                 return settle("not_allowed")
+            if not instance.get("enabled") or not self.runtime_active(instance.get("channel", "")):
+                # A pause, not a refusal: no claim, no charge, nothing settled;
+                # the event waits and is transcribed once the instance is back.
+                return {"paused": True}
             if not binding.get("may_transcribe"):
                 return settle("not_enabled")
             if not key_present:
