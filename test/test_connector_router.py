@@ -436,3 +436,56 @@ def test_overlapping_attempts_never_both_act_on_one_event(tmp_path):
     now[0] += 31
     store.lease(who, 1)
     assert (len(started), len(pasted)) == (0, 1)
+
+
+@pytest.mark.parametrize("max_attempts", [1, 5])
+def test_the_last_permitted_attempt_is_never_parked_while_it_routes(tmp_path, max_attempts):
+    """Astre's round-2 reproduction: a sweep marked the event handoff_failed while its
+    last attempt was delivering, dropped the successful receipt, and an owner retry
+    pasted again."""
+    import threading
+
+    now = [1000.0]
+    store = ConnectorStore(tmp_path / "connectors", clock=lambda: now[0], limits=Limits(handoff_max_attempts=max_attempts))
+    store.add_instance("one", "fake", "acct")
+    store.bind("one", sender="u", conversation="c", default_wolt="astre")
+    store.enable("one")
+    who = store.authenticate(store.issue_token("one"))
+    pasted, holding, release = [], threading.Event(), threading.Event()
+    failures = [max_attempts - 1]
+
+    def deliver(session, text):
+        if failures[0]:
+            failures[0] -= 1
+            raise RuntimeError("not yet")
+        holding.set()
+        assert release.wait(5)
+        pasted.append(text)
+        return {"status": "delivered"}
+
+    store.router = Router(store, uploads_root=tmp_path, resolve=lambda w: "astre-1", deliver=deliver, wolt_of=lambda n: "astre")
+    payload = {"event_id": "e", "sender": {"provider_id": "u"}, "conversation": {"provider_id": "c"}, "text": "hello"}
+    key = "acct\x00e"
+    worker = None
+    for attempt in range(max_attempts):
+        if attempt == max_attempts - 1:
+            run = (lambda: store.accept_event(who, payload)) if attempt == 0 else (lambda: store.lease(who, 1))
+            worker = threading.Thread(target=run)
+            worker.start()
+            assert holding.wait(5)
+        elif attempt == 0:
+            store.accept_event(who, payload)
+        else:
+            store.lease(who, 1)
+        now[0] += 31
+    # The last attempt is delivering; a sweep runs with every attempt spent.
+    store.lease(who, 1)
+    assert store._queue("one").inbound[key]["state"] == "accepted"
+    release.set()
+    worker.join(5)
+    record = store._queue("one").inbound[key]
+    assert (record["state"], record["result"]["routed"]) == ("handed_off", "delivered")
+    assert store.retry_handoff("one", "e") is False      # nothing left to retry
+    now[0] += 31
+    store.lease(who, 1)
+    assert len(pasted) == 1

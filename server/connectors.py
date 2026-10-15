@@ -1292,6 +1292,10 @@ class ConnectorStore:
                     continue
                 if not (instance["enabled"] and self.runtime_active(instance.get("channel", ""))):
                     continue
+                if self._routing_now(instance_id, key):
+                    # An attempt is routing it right now: neither a new claim
+                    # nor exhaustion; its receipt settles the event.
+                    continue
                 if record.get("attempts", 0) >= limits.handoff_max_attempts:
                     record["state"] = "handoff_failed"
                     continue
@@ -1619,6 +1623,14 @@ class ConnectorStore:
                 yield
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def _routing_now(self, instance_id: str, key: str) -> bool:
+        """Whether an attempt holds the event's route lock at this moment (never waits)."""
+        try:
+            with self._route_lock(instance_id, key):
+                return False
+        except BlockingIOError:
+            return True
 
     def _hand_off_owned(self, instance_id: str, key: str, claim: str) -> dict:
         """`_hand_off` with the event's route lock held."""

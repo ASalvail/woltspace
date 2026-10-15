@@ -1812,9 +1812,8 @@ def test_a_pause_and_resume_during_an_attempt_does_not_let_a_new_claim_act(lodge
     lodge.store.router = old_router
     lodge.store.accept_event(who, _event())
     record = lodge.store._queue("tg-main").inbound["bot:1\x00e1"]
-    assert len(claims) == 2 and claims[0] != claims[1]
-    # The new claim could not route beside the running attempt; the running
-    # attempt's delivery is the receipt.
+    # No new claim is made while the attempt routes; its delivery is the receipt.
+    assert len(claims) == 2 and claims[0] == claims[1]
     assert (record["state"], record["result"]["session"]) == ("handed_off", "OLD")
 
 
