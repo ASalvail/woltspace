@@ -3,8 +3,8 @@
 0.6 is a groundwork release. It separates who can use your apps and wolt sites
 from who can reach your lodge, keeps what wolts write from acting as you in
 your browser, closes the public links that were on by default, and removes code
-the platform no longer uses. It also brings chat connectors, starting with
-Telegram, as an opt-in preview. It is a **minor**
+the platform no longer uses. Telegram now runs as a connector, outside the
+lodge. It is a **minor**
 release, so some setups need a step after updating. Read **Before you update**
 first.
 
@@ -37,6 +37,9 @@ Most lodges need to do nothing. You need to act if any of these is true:
   `woltspace access set` (see "The lodge checks its own login"). Without it the
   lodge keeps trusting whatever guards its way in, and `woltspace doctor` says
   so.
+- **You use Telegram.** It moves to the connector by itself on the first start
+  (below): your own chat keeps working as before. The dog is gone, and group
+  chats need to be allowed again by hand.
 - **A wolt's site uses livereload, or fetches its own files.** Sites now open on
   their own address (below), where both work. Inside the old lodge address they
   are sandboxed and can't.
@@ -53,7 +56,9 @@ each of these with your consent.
 - **Its own domain and its own login.** Remote apps are served at
   `<app>.<your app domain>`, behind their own Cloudflare Access application, so
   people you share an app with never pass the lodge's login. Configure the app
-  domain, the gateway port and both Access audiences under **Settings**.
+  domain, the gateway port and both Access audiences under **Settings**. An app
+  host with an Access application of its own adds that audience to the apps
+  audiences (comma-separated).
 - **Share lists.** Each app has a list of email addresses allowed to open it.
   You are always on it. Nobody else is until you add them.
 - **Apps know who is visiting.** The gateway passes the verified visitor's
@@ -127,35 +132,41 @@ each of these with your consent.
   user's lodge on the same machine, say). Before, the gateway would serve that
   program under your app's name.
 
-## Connectors (preview)
+## Telegram runs as a connector
 
-Chat apps can now run as **connectors**: a separate program that talks to the
-chat service and hands messages to the lodge through a small local API, instead
-of living inside the lodge. Telegram is the first one. It is a preview: the
-built-in Telegram adapter stays the default and behaves as in 0.5, so nothing
-changes unless you switch.
+Chat apps now run as **connectors**: a separate program that talks to the chat
+service and hands messages to the lodge through a small local API, instead of
+living inside the lodge. Telegram is the first, and it is the default.
 
-- **Opt in per channel.** `woltspace connector runtime telegram connector`
-  switches Telegram to the connector, `... telegram adapter` switches back.
-  Exactly one of them talks to Telegram at a time.
-- **Each chat is allowed on purpose.** `woltspace connector bind` allows one
-  sender in one chat, sends their messages to one wolt, and turns on only the
-  grants you name: wake a stopped session, pick other wolts with `/wolt`, start
-  sessions with `/new` (limited per hour and at once), stop the sessions that
-  chat started with `/kill`, transcribe voice notes.
+- **Nothing to do for your own chat.** On the first start, the lodge sets the
+  connector up from your bot token and `TELEGRAM_ALLOWED_USERS`: each allowed
+  user's own chat may talk to every wolt, start, wake and stop sessions, use
+  `/apps`, and have voice notes transcribed, as before. It picks up the wolt
+  and session the chat was on. `woltspace connector list` shows it.
+- **What works as before.** A message with no live session starts one with
+  your message in it; replying to a wolt's message goes to its session, quoted;
+  `/wolt`, `/new`, `/sessions`, `/kill`, `/apps`, `/help`; text, voice, photos,
+  videos and files.
+- **Every other chat is allowed on purpose.** `woltspace connector bind`
+  allows one sender in one chat, sends their messages to one wolt, and turns
+  on only the grants you name: wake a stopped session, pick other wolts, start
+  sessions (limited per hour and at once), stop the sessions that chat
+  started, `/apps`, transcribe voice notes.
 - **Messages wait instead of getting lost.** While the connector or the lodge
   is down or paused, messages queue and are handed over once, when it's back.
   `woltspace connector handoffs` shows what's waiting, with retry and cancel.
-- **Voice notes** are transcribed only for chats you allowed it on, with the
-  lodge's `OPENAI_API_KEY`, within a daily budget. The audio is sent to OpenAI.
-
-Not in the connector yet (the adapter still does these): a message to a wolt
-with no live session starting one, `/apps`, quoting the message you replied
-to, and the dog in group chats. The connector becomes the default once it does.
+- **Voice notes** are transcribed only for chats allowed to, with the lodge's
+  `OPENAI_API_KEY`, within a daily budget. The audio is sent to OpenAI.
+- **What changed.** The dog is deprecated: no @mention helper in groups, and
+  no group chat is carried over (bind it). `/kill` stops only sessions that
+  chat started or talked to. The old in-process adapter is still there for
+  this release: stop the lodge, then `woltspace connector runtime telegram
+  adapter` (and `... connector` to come back).
 
 ## Removed
 
 - **The desktop app.** It may come back as its own project.
+- The dog (Telegram's group helper), with the move to the connector.
 - The first Telegram adapter, a one-off session migration script and
   `CHANGELOG.md` (release notes live here).
 
