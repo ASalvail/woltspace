@@ -42,7 +42,7 @@ from typing import Callable
 
 from .config import SPACE_DIR, WOLTS_DIR
 from .connector_commands import Commands, _default_wolt_of, allowed_wolts
-from .connector_transcribe import TranscriptionPending, Transcriber
+from .connector_transcribe import TranscriptionPending, TranscriptionStopped, Transcriber
 from .connectors import AcceptedEvent, ConnectorError, ConnectorStore, NoConnectorBinding
 
 logger = logging.getLogger(__name__)
@@ -214,12 +214,18 @@ class Router:
             notes = self.transcriber.notes(event, files)
         except TranscriptionPending:
             return {"routed": "deferred", "reason": "transcription_pending"}
+        except TranscriptionStopped:
+            return {"routed": "stopped", "reason": "event_over"}
         binding_id = event.binding["binding_id"]
-        # Authorization after the (possibly slow) transcription: the binding
-        # as it is now decides where this goes, or that it goes nowhere.
-        current = self.store.binding_now(binding_id)
+        # Authorization after the (possibly slow) transcription: the event
+        # must still be waiting for its receipt, and the binding, instance
+        # and runtime as they are now decide where it goes, or that it goes
+        # nowhere.
+        verdict, current = self.store.dispatch_allowed(event.instance_id, event.dedup_key, binding_id)
+        if verdict == "later":
+            return {"routed": "deferred", "reason": "instance_paused"}
         if current is None:
-            return {"routed": "refused", "reason": "binding_removed"}
+            return {"routed": "stopped", "reason": "no_longer_dispatchable"}
         event = dataclasses.replace(event, binding=current)
         text = session_text(event, files, notes)
         state = self.store.routing_state(event.instance_id, binding_id)

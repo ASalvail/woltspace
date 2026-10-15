@@ -2,6 +2,7 @@
 Fake provider only; no real API call anywhere."""
 
 import fcntl
+import json
 import os
 import sys
 from pathlib import Path
@@ -167,9 +168,9 @@ def test_a_late_response_after_reclamation_cannot_overwrite(lodge):
     first = lodge.store.claim_transcription("tg-main", event.dedup_key, upload, 10)["claim"]
     lodge.clock.now += 121
     second = lodge.store.claim_transcription("tg-main", event.dedup_key, upload, 10)["claim"]
-    assert lodge.store.settle_transcription("tg-main", event.dedup_key, upload, first, {"text": "OLD"}) == {"reason": "superseded"}
-    assert lodge.store.settle_transcription("tg-main", event.dedup_key, upload, second, {"text": "NEW"}) == {"text": "NEW"}
-    assert lodge.store.settle_transcription("tg-main", event.dedup_key, upload, first, {"text": "OLD"}) == {"text": "NEW"}
+    assert lodge.store.settle_transcription("tg-main", event.dedup_key, upload, first, {"text": "OLD"}) == {"pending": True}
+    assert lodge.store.settle_transcription("tg-main", event.dedup_key, upload, second, {"text": "NEW"}) == {"done": {"text": "NEW"}}
+    assert lodge.store.settle_transcription("tg-main", event.dedup_key, upload, first, {"text": "OLD"}) == {"done": {"text": "NEW"}}
     lodge.clock.now += 121
     assert lodge.store.claim_transcription("tg-main", event.dedup_key, upload, 10) == {"done": {"text": "NEW"}}
 
@@ -219,7 +220,24 @@ def test_authorization_is_read_again_after_the_call(lodge):
 
     lodge.provider.outcome = slow_call
     result = lodge.router(_accepted(lodge))
-    assert result == {"routed": "refused", "reason": "binding_removed"} and lodge.sessions.pasted == []
+    assert result["routed"] == "stopped" and lodge.sessions.pasted == []
+
+
+def test_pausing_the_instance_during_the_call_defers_and_never_drops(lodge):
+    event = _accepted(lodge)
+
+    def pause_meanwhile():
+        lodge.store.disable("tg-main")
+        return {"text": "kept for later"}
+
+    lodge.provider.outcome = pause_meanwhile
+    assert lodge.router(event)["routed"] == "deferred"
+    assert lodge.sessions.pasted == []
+    assert lodge.store._queue("tg-main").inbound[event.dedup_key]["state"] == "accepted"
+    lodge.store.enable("tg-main")
+    assert lodge.router(event)["routed"] == "delivered"
+    assert "kept for later" in _pasted(lodge)
+    assert len(lodge.provider.calls) == 1                 # the saved transcript, not a second call
 
 
 def test_no_free_slot_defers(lodge):
@@ -249,17 +267,17 @@ def test_delivered_bodies_become_tombstones_that_keep_the_count(lodge):
     assert record["disposition"] == {"reason": "delivered"} and record["attempts"] == 1
     # A late result for the finished event restores nothing.
     upload = event.attachments[0]["upload_id"]
-    assert lodge.store.settle_transcription("tg-main", event.dedup_key, upload, "x", {"text": "body"}) == {"reason": "superseded"}
+    assert lodge.store.settle_transcription("tg-main", event.dedup_key, upload, "x", {"text": "body"}) == {"stopped": True}
 
 
-_REAL_CLIENT = httpx.Client
+_REAL_CLIENT = httpx.AsyncClient
 
 
 def _provider_transport(monkeypatch, handler):
     def client(**kwargs):
         return _REAL_CLIENT(transport=httpx.MockTransport(handler), **kwargs)
 
-    monkeypatch.setattr(connector_transcribe.httpx, "Client", client)
+    monkeypatch.setattr(connector_transcribe.httpx, "AsyncClient", client)
 
 
 def test_provider_errors_are_fixed_reasons_never_the_body(monkeypatch):
@@ -270,7 +288,7 @@ def test_provider_errors_are_fixed_reasons_never_the_body(monkeypatch):
 
 
 def test_an_oversized_response_is_refused(monkeypatch):
-    _provider_transport(monkeypatch, lambda request: httpx.Response(200, content=b"{" + b" " * 70000 + b"}"))
+    _provider_transport(monkeypatch, lambda request: httpx.Response(200, stream=httpx.ByteStream(b"{" + b" " * 70000 + b"}")))
     assert openai_transcribe(b"x", "voice.ogg", "audio/ogg", SECRET) == {"reason": "response_too_large"}
 
 
@@ -279,10 +297,161 @@ def test_a_good_response_is_bounded_text_from_a_fixed_endpoint(monkeypatch):
 
     def handler(request):
         seen.append(request)
-        return httpx.Response(200, json={"text": "hi " * 3000})
+        return httpx.Response(200, stream=httpx.ByteStream(json.dumps({"text": "hi " * 3000}).encode()))
 
     _provider_transport(monkeypatch, handler)
     outcome = openai_transcribe(b"x", "voice.ogg", "audio/ogg", SECRET)
     assert len(outcome["text"]) == 4000
     assert str(seen[0].url) == "https://api.openai.com/v1/audio/transcriptions"
     assert b'filename="voice.ogg"' in seen[0].content
+
+
+# ------------------------------------------ round 2: boundaries that hold
+
+
+def test_cancelling_the_event_during_the_call_means_no_paste_and_no_new_claim(lodge):
+    event = _accepted(lodge)
+
+    def cancel_meanwhile():
+        lodge.store.cancel_handoff("tg-main", event.event_id)
+        return {"text": "too late"}
+
+    lodge.provider.outcome = cancel_meanwhile
+    assert lodge.router(event)["routed"] == "stopped"
+    assert lodge.sessions.pasted == []
+    assert lodge.store._queue("tg-main").inbound[event.dedup_key]["state"] == "cancelled"
+    upload = event.attachments[0]["upload_id"]
+    assert lodge.store.claim_transcription("tg-main", event.dedup_key, upload, 10) == {"stopped": True}
+    assert len(lodge.provider.calls) == 1
+
+
+@pytest.mark.parametrize("replacement_settles", [False, True])
+def test_a_replaced_claim_defers_until_the_replacement_settles(lodge, replacement_settles):
+    """Through _hand_off: the first claim goes stale and a replacement takes it; then the first returns."""
+    event = _accepted(lodge)
+    upload = event.attachments[0]["upload_id"]
+    held = {}
+
+    def first_call():
+        lodge.clock.now += 121                                 # the first claim goes stale meanwhile
+        held["claim"] = lodge.store.claim_transcription("tg-main", event.dedup_key, upload, 10)["claim"]
+        if replacement_settles:
+            lodge.store.settle_transcription("tg-main", event.dedup_key, upload, held["claim"], {"text": "NEW"})
+        return {"text": "OLD"}
+
+    lodge.provider.outcome = first_call
+    queue = lodge.store._queue("tg-main")
+    queue.inbound[event.dedup_key].update({"attempts": 1, "claim": "h1"})
+    lodge.store._save_queue("tg-main", queue)
+    routed = lodge.store._hand_off("tg-main", event.dedup_key, "h1")["routed"]
+    if replacement_settles:
+        # The replacement's result is a true terminal disposition: it is what gets pasted.
+        assert routed == "delivered" and "[voice note transcript]: NEW" in _pasted(lodge)
+        assert "OLD" not in _pasted(lodge)
+        return
+    assert routed == "deferred" and lodge.sessions.pasted == []
+    record = lodge.store._queue("tg-main").inbound[event.dedup_key]
+    assert record["state"] == "accepted" and record["attempts"] == 0
+    lodge.store.settle_transcription("tg-main", event.dedup_key, upload, held["claim"], {"text": "NEW"})
+    queue = lodge.store._queue("tg-main")
+    queue.inbound[event.dedup_key].update({"attempts": 1, "claim": "h2"})
+    lodge.store._save_queue("tg-main", queue)
+    assert lodge.store._hand_off("tg-main", event.dedup_key, "h2")["routed"] == "delivered"
+    assert "[voice note transcript]: NEW" in _pasted(lodge) and "OLD" not in _pasted(lodge)
+
+
+def test_the_deadline_is_end_to_end_for_a_slow_body(monkeypatch):
+    import asyncio
+
+    monkeypatch.setattr(connector_transcribe, "CALL_DEADLINE_SECONDS", 0.5)
+
+    class Slow(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            for _ in range(5):
+                await asyncio.sleep(0.3)
+                yield b" "
+
+    _provider_transport(monkeypatch, lambda request: httpx.Response(200, stream=Slow()))
+    import time
+
+    started = time.monotonic()
+    assert openai_transcribe(b"x", "voice.ogg", "audio/ogg", SECRET) == {"reason": "timeout"}
+    assert time.monotonic() - started < 1.0
+
+
+def test_the_deadline_covers_slow_headers_too(monkeypatch):
+    import asyncio
+
+    monkeypatch.setattr(connector_transcribe, "CALL_DEADLINE_SECONDS", 0.3)
+
+    async def slow(request):
+        await asyncio.sleep(2)
+        return httpx.Response(200, json={"text": "never"})
+
+    _provider_transport(monkeypatch, slow)
+    assert openai_transcribe(b"x", "voice.ogg", "audio/ogg", SECRET) == {"reason": "timeout"}
+
+
+def test_an_encoded_response_is_refused_before_it_is_decoded(monkeypatch):
+    _provider_transport(monkeypatch, lambda request: httpx.Response(200, headers={"content-encoding": "gzip"}, content=b"x"))
+    assert openai_transcribe(b"x", "voice.ogg", "audio/ogg", SECRET) == {"reason": "bad_response"}
+
+
+async def test_the_lodge_stays_responsive_while_a_transcription_holds_and_a_cancel_cleans_up(lodge, monkeypatch):
+    """Isolated ASGI app, held fake provider: /state answers meanwhile; a cancelled request's worker still frees its slot."""
+    import asyncio
+    import threading
+
+    import server.app as server_app
+    from server import connector_api
+
+    entered, release = threading.Event(), threading.Event()
+
+    def held(*args):
+        entered.set()
+        release.wait(10)
+        return {"text": "held"}
+
+    lodge.transcriber.call = held
+    monkeypatch.setattr(connector_api, "CONNECTORS_DIR", lodge.store.root)
+    monkeypatch.setattr(connector_api, "_store", lodge.store)
+    token = lodge.store.issue_token("tg-main")
+    headers = {"Authorization": f"Bearer {token}"}
+    transport = httpx.ASGITransport(app=server_app.app, client=("127.0.0.1", 1))
+    async with httpx.AsyncClient(transport=transport, base_url="http://localhost:7777") as client:
+        up = await client.post("/connector/v1/uploads", params={"name": "voice_a.ogg"}, content=b"opus bytes", headers=headers)
+        upload_id = up.json()["upload_id"]
+        post = asyncio.create_task(client.post("/connector/v1/events", headers=headers, json={
+            "event_id": "tg:1", "sender": {"provider_id": "u1"}, "conversation": {"provider_id": "c1"},
+            "text": "", "attachments": [{"upload_id": upload_id}],
+        }))
+        for _ in range(100):
+            if entered.is_set():
+                break
+            await asyncio.sleep(0.05)
+        assert entered.is_set()
+        state = await asyncio.wait_for(client.get("/connector/v1/state", headers=headers), 2)
+        assert state.status_code == 200                      # the event loop is not blocked
+        post.cancel()
+        release.set()
+        try:
+            await post
+        except asyncio.CancelledError:
+            pass
+    # The worker finished on its own: both slots are free again.
+    directory = lodge.store.root / "transcribe"
+    for _ in range(100):
+        fds = []
+        try:
+            for index in range(2):
+                fd = os.open(directory / f"slot-{index}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+                fds.append(fd)
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            await asyncio.sleep(0.05)
+        finally:
+            for fd in fds:
+                os.close(fd)
+    else:
+        raise AssertionError("a transcription slot stayed held")

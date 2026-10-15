@@ -2045,6 +2045,14 @@ class ConnectorStore:
         with self._lock():
             registry = self._registry()
             queue = self._queue(instance_id)
+            inbound = queue.inbound.get(key)
+            if (
+                inbound is None or inbound["state"] != "accepted"
+                or upload_id not in [a.get("upload_id") for a in inbound["event"].get("attachments", ())]
+            ):
+                # The event is over (cancelled, delivered, pruned) or does not
+                # own this file: no call, and nothing for a session either.
+                return {"stopped": True}
             record = queue.transcriptions.get(tkey)
             if record is not None and record["state"] == "done":
                 return {"done": dict(record["disposition"])}
@@ -2058,7 +2066,6 @@ class ConnectorStore:
 
             if record is not None and record["state"] == "claimed" and now - record.get("claimed_at", 0) < self.limits.transcribe_claim_seconds:
                 return {"busy": True}
-            inbound = queue.inbound.get(key) or {}
             binding_id = ((inbound.get("event") or {}).get("binding") or {}).get("binding_id")
             binding = next((b for b in registry["bindings"] if b["binding_id"] == binding_id), None)
             instance = registry["instances"].get(instance_id)
@@ -2092,26 +2099,49 @@ class ConnectorStore:
             self._save_queue(instance_id, queue)
             return {"claim": claim}
 
+    def dispatch_allowed(self, instance_id: str, key: str, binding_id: str) -> tuple[str, dict | None]:
+        """May this event be delivered now: `("ok", binding)`, `("later", None)` or `("gone", None)`.
+
+        Gone: the event is no longer waiting for its receipt (cancelled,
+        delivered, pruned) or its binding was removed. Later: the instance is
+        disabled or its runtime is not running; the event stays queued and
+        is tried again, never dropped.
+        """
+        with self._lock():
+            registry = self._registry()
+            inbound = self._queue(instance_id).inbound.get(key)
+            binding = next((b for b in registry["bindings"] if b["binding_id"] == binding_id), None)
+            instance = registry["instances"].get(instance_id)
+            if inbound is None or inbound["state"] != "accepted" or binding is None or instance is None:
+                return "gone", None
+            if not instance.get("enabled") or not self.runtime_active(instance.get("channel", "")):
+                return "later", None
+            return "ok", dict(binding)
+
     def settle_transcription(self, instance_id: str, key: str, upload_id: str, claim: str, disposition: dict) -> dict:
         """Persist the terminal disposition of a claim: `{"text"}` or `{"reason"}`.
 
-        Applies only while `claim` is the record's current claim; a late
-        settlement from an older claim gets the disposition already there.
+        Answers `{"done": disposition}` (saved now, or already saved),
+        `{"pending": True}` when a replacement claim owns the record, or
+        `{"stopped": True}` when the event is over or pruned.
         """
         tkey = f"{key}\x00{upload_id}"
         with self._lock():
             queue = self._queue(instance_id)
             record = queue.transcriptions.get(tkey)
-            if record is None:
-                return {"reason": "superseded"}         # pruned: never recreated by a late result
             inbound = queue.inbound.get(key)
-            if inbound is None or inbound["state"] in ("handed_off", "cancelled"):
-                return {"reason": "superseded"}         # the event is over: no body restored
-            if record["state"] == "done" or record.get("claim") != claim:
-                return dict(record.get("disposition") or {"reason": "superseded"})
+            if record is None or inbound is None or inbound["state"] != "accepted":
+                # Pruned, or the event is over: never recreated, no body
+                # restored, nothing for a session.
+                return {"stopped": True}
+            if record["state"] == "done":
+                return {"done": dict(record["disposition"])}
+            if record.get("claim") != claim:
+                # A replacement attempt owns it now: its result is the one.
+                return {"pending": True}
             record.update({"state": "done", "disposition": dict(disposition), "claim": None})
             self._save_queue(instance_id, queue)
-            return dict(disposition)
+            return {"done": dict(disposition)}
 
     def record_command(self, instance_id: str, record: dict) -> None:
         """Audit: one line per command executed or refused, never the token or a body."""

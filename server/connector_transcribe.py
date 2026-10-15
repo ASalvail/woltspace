@@ -21,7 +21,16 @@ retries_exhausted, timeout, network, provider_<status>, bad_response,
 response_too_large). A skip saved while the grant was off, or with no
 key, stays a skip for that attachment even after the owner turns it on.
 Provider error bodies are never read or relayed; nothing here logs audio,
-transcripts or headers.
+transcripts or headers. The call has an end-to-end deadline (connect,
+upload, headers, body), after which it is cancelled and its client closed
+before the slot is released; the response is read raw with identity
+encoding only, so the bound applies to what is buffered.
+
+Only an event still waiting for its receipt is worked on: a cancelled,
+delivered or pruned event stops the work (no call, no paste). A claim
+replaced by a newer attempt defers its handoff until the replacement's
+result is saved; only a saved disposition is ever pasted. The API runs
+all of this on worker threads, off the lodge's event loop.
 
 The file is opened through the uploads directory with no-follow
 traversal and the bytes sent come from that same descriptor, after a
@@ -33,6 +42,7 @@ limit).
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import fcntl
 import json
@@ -62,29 +72,30 @@ class TranscriptionPending(RuntimeError):
     """Another attempt holds this attachment, or no slot came free: defer the handoff."""
 
 
-def openai_transcribe(data: bytes, filename: str, content_type: str, key: str) -> dict:
-    """One call: `{"text"}` or `{"reason"}`. Fixed endpoint, no redirects, bounded everything."""
-    deadline = time.monotonic() + CALL_DEADLINE_SECONDS
+class TranscriptionStopped(RuntimeError):
+    """The event is over (cancelled, delivered, pruned): no call and no paste."""
+
+
+async def _call(data: bytes, filename: str, content_type: str, key: str) -> dict:
     body = bytearray()
-    try:
-        with httpx.Client(follow_redirects=False, timeout=httpx.Timeout(CALL_DEADLINE_SECONDS, connect=10.0)) as client:
-            with client.stream(
-                "POST", API_URL, headers={"Authorization": f"Bearer {key}"},
-                files={"file": (filename, data, content_type)},
-                data={"model": "whisper-1", "response_format": "json"},
-            ) as response:
-                if response.status_code != 200:
-                    return {"reason": f"provider_{response.status_code}"}     # body never read
-                for chunk in response.iter_bytes():
-                    body += chunk
-                    if len(body) > RESPONSE_MAX_BYTES:
-                        return {"reason": "response_too_large"}
-                    if time.monotonic() > deadline:
-                        return {"reason": "timeout"}
-    except httpx.TimeoutException:
-        return {"reason": "timeout"}
-    except httpx.HTTPError:
-        return {"reason": "network"}
+    async with httpx.AsyncClient(
+        follow_redirects=False, timeout=httpx.Timeout(CALL_DEADLINE_SECONDS, connect=10.0),
+    ) as client:
+        async with client.stream(
+            "POST", API_URL,
+            headers={"Authorization": f"Bearer {key}", "Accept-Encoding": "identity"},
+            files={"file": (filename, data, content_type)},
+            data={"model": "whisper-1", "response_format": "json"},
+        ) as response:
+            if response.status_code != 200:
+                return {"reason": f"provider_{response.status_code}"}     # body never read
+            if response.headers.get("content-encoding", "identity").strip().lower() not in ("", "identity"):
+                return {"reason": "bad_response"}
+            # Raw bytes, identity encoding only: what is buffered is what arrived.
+            async for chunk in response.aiter_raw():
+                if len(body) + len(chunk) > RESPONSE_MAX_BYTES:
+                    return {"reason": "response_too_large"}
+                body += chunk
     try:
         text = json.loads(bytes(body))["text"]
     except (ValueError, KeyError, TypeError):
@@ -92,6 +103,25 @@ def openai_transcribe(data: bytes, filename: str, content_type: str, key: str) -
     if not isinstance(text, str):
         return {"reason": "bad_response"}
     return {"text": " ".join(text.split())[:TRANSCRIPT_MAX_CHARS]}
+
+
+def openai_transcribe(data: bytes, filename: str, content_type: str, key: str) -> dict:
+    """One call: `{"text"}` or `{"reason"}`. Fixed endpoint, no redirects, bounded everything.
+
+    `CALL_DEADLINE_SECONDS` is end to end (connect, upload, headers, body):
+    past it the call is cancelled and its client closed before this
+    returns, so the caller's slot is released only after cleanup. A
+    timeout does not prove the provider stopped or did not bill.
+    """
+    async def bounded() -> dict:
+        try:
+            return await asyncio.wait_for(_call(data, filename, content_type, key), CALL_DEADLINE_SECONDS)
+        except (asyncio.TimeoutError, httpx.TimeoutException):
+            return {"reason": "timeout"}
+        except httpx.HTTPError:
+            return {"reason": "network"}
+
+    return asyncio.run(bounded())
 
 
 def read_anchored(root: Path, parts: tuple[str, ...], name: str, size: int, cap: int) -> bytes | None:
@@ -185,6 +215,8 @@ class Transcriber:
             claimed = self.store.claim_transcription(
                 event.instance_id, key, upload_id, size, key_present=api_key is not None,
             )
+            if claimed.get("stopped"):
+                raise TranscriptionStopped("the event is over")
             if "done" in claimed:
                 return claimed["done"]
             if claimed.get("busy"):
@@ -202,4 +234,9 @@ class Transcriber:
                     outcome = self.call(data, name, AUDIO_TYPES[extension], api_key)
                 except Exception:  # noqa: BLE001 - a fixed reason, never the provider's words
                     outcome = {"reason": "network"}
-            return self.store.settle_transcription(event.instance_id, key, upload_id, claim, outcome)
+            settled = self.store.settle_transcription(event.instance_id, key, upload_id, claim, outcome)
+            if settled.get("stopped"):
+                raise TranscriptionStopped("the event is over")
+            if settled.get("pending"):
+                raise TranscriptionPending("a replacement attempt owns this file")
+            return settled["done"]
