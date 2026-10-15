@@ -603,6 +603,21 @@ async def test_reply_to_resolves_only_through_the_events_exact_binding(lodge):
     assert lodge.routed[0].reply_to_session == "softie-1"
 
 
+async def test_a_reply_carries_core_s_own_record_of_what_it_replies_to(lodge):
+    """Quoted from the delivery core sent, by delivery id or by the provider's message id."""
+    plan = lodge.enqueue("the plan is ready", conversation="c1", binding_id=lodge.binding["binding_id"])
+    async with _client() as client:
+        connector = FakeConnector(client, lodge.token)
+        by_delivery = await connector.send_event("tg:1", "u1", "c1", "ship it", reply_to=plan)
+        leased = (await connector.lease()).json()["deliveries"]
+        attempt = next(d["attempt_id"] for d in leased if d["delivery_id"] == plan)
+        await connector.ack(plan, attempt, provider_message_id="m-7")
+        by_message = await connector.send_event("tg:2", "u1", "c1", "ok", reply_to={"provider_message_id": "m-7"})
+    assert by_delivery.json()["accepted"] is True and by_message.json()["accepted"] is True
+    quote = {"text": "the plan is ready", "file": None, "voice": False}
+    assert [e.reply_quote for e in lodge.routed] == [quote, quote]
+
+
 # ----------------------------------------------------------------- uploads
 
 

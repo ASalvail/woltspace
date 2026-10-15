@@ -10,8 +10,10 @@ Every answer goes back through a delivery in the same binding.
     /wolt [name]      pick the wolt this chat talks to. No name: a picker of
                       the binding's `selectable_wolts` as buttons. A name must
                       be in that set.
-    /new [name]       a new session for a selectable wolt (the active one by
-                      default). Needs `may_create`, which is not `may_wake`;
+    /new [name]       a new session for a wolt this chat may talk to (the
+                      active one by default). Needs `may_create`, which is
+                      not `may_wake`, and is what also lets a plain message
+                      start a session when its wolt has none (the router);
                       bounded per binding by `create_per_hour` and
                       `create_concurrent` live sessions it created.
     /sessions         the sessions this binding created or routed to, and no
@@ -66,7 +68,7 @@ import dataclasses
 import re
 from typing import Callable
 
-from .connectors import AcceptedEvent, ConnectorError, ConnectorStore, NoConnectorBinding, valid_id
+from .connectors import AcceptedEvent, ConnectorError, ConnectorStore, NoConnectorBinding, may_start, valid_id
 
 COMMANDS = ("wolt", "new", "sessions", "kill", "start", "help")
 _COMMAND_RE = re.compile(r"^/([a-z]+)(?:@\w+)?(?:\s+(\S+))?\s*$")
@@ -322,7 +324,27 @@ class Commands:
             if record.get("via") == "created" and self.live(name) in LIVE_STATES
         )
 
-    def _new(self, event: AcceptedEvent, argument: str | None, previous: dict | None) -> dict:
+    def start_with_message(self, event: AcceptedEvent, wolt: str, prompt: str) -> dict:
+        """A message for a wolt with no session to take it: start one, the message in its opening prompt.
+
+        The same durable operation as `/new`, keyed by the message's event,
+        under the same command lock, grants and limits: a retry of the event
+        resumes the operation and never starts a second session.
+        """
+        binding_id = event.binding["binding_id"]
+        with self.store.command_lock(binding_id):
+            binding = self.store.binding_now(binding_id)
+            if binding is None:
+                return self._audit(event, "new", "refused", reason="binding_removed")
+            event = dataclasses.replace(event, binding=binding)
+            key = event.dedup_key
+            previous = self.store.operation(event.instance_id, key)
+            if previous is not None and previous["state"] in ("answered", "failed", "uncertain"):
+                return dict(previous.get("result") or {"routed": "command", "command": "new", "outcome": previous["state"]})
+            previous = self.store.begin_operation(event.instance_id, key, binding_id, "new", wolt)
+            return self._new(event, wolt, previous, prompt=prompt)
+
+    def _new(self, event: AcceptedEvent, argument: str | None, previous: dict | None, prompt: str = "") -> dict:
         binding = event.binding
         binding_id = binding["binding_id"]
         key = event.dedup_key
@@ -330,7 +352,7 @@ class Commands:
         wolt = (previous or {}).get("wolt") or argument or self._state(event).get("active_wolt") or binding["default_wolt"]
         if previous and previous["state"] != "reserved" or (previous and previous.get("wolt")):
             # A resumption: the grant is checked again, like a first execution.
-            if not binding.get("may_create") or wolt not in (binding.get("selectable_wolts") or []):
+            if not may_start(binding, wolt):
                 self.store.settle_operation(
                     event.instance_id, key, "uncertain", expect=("reserved", "effect_in_progress", "started", "associated"),
                     note="grant withdrawn during the operation",
@@ -384,7 +406,7 @@ class Commands:
                 self._tell(event, "🪵 this chat may not start sessions now; ask the owner")
                 return self._done(event, "new", "refused", reason="grant_withdrawn", wolt=wolt)
             try:
-                result = self.start(wolt, "", routing)
+                result = self.start(wolt, prompt, routing)
             except Exception as exc:  # noqa: BLE001
                 # Not proven to have failed before the effect (the session
                 # layer may spawn and then fail its bookkeeping): reconcile
