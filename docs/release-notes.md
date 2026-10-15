@@ -3,7 +3,8 @@
 0.6 is a groundwork release. It separates who can use your apps and wolt sites
 from who can reach your lodge, keeps what wolts write from acting as you in
 your browser, closes the public links that were on by default, and removes code
-the platform no longer uses. It is a **minor**
+the platform no longer uses. It also brings chat connectors, starting with
+Telegram, as an opt-in preview. It is a **minor**
 release, so some setups need a step after updating. Read **Before you update**
 first.
 
@@ -126,6 +127,32 @@ each of these with your consent.
   user's lodge on the same machine, say). Before, the gateway would serve that
   program under your app's name.
 
+## Connectors (preview)
+
+Chat apps can now run as **connectors**: a separate program that talks to the
+chat service and hands messages to the lodge through a small local API, instead
+of living inside the lodge. Telegram is the first one. It is a preview: the
+built-in Telegram adapter stays the default and behaves as in 0.5, so nothing
+changes unless you switch.
+
+- **Opt in per channel.** `woltspace connector runtime telegram connector`
+  switches Telegram to the connector, `... telegram adapter` switches back.
+  Exactly one of them talks to Telegram at a time.
+- **Each chat is allowed on purpose.** `woltspace connector bind` allows one
+  sender in one chat, sends their messages to one wolt, and turns on only the
+  grants you name: wake a stopped session, pick other wolts with `/wolt`, start
+  sessions with `/new` (limited per hour and at once), stop the sessions that
+  chat started with `/kill`, transcribe voice notes.
+- **Messages wait instead of getting lost.** While the connector or the lodge
+  is down or paused, messages queue and are handed over once, when it's back.
+  `woltspace connector handoffs` shows what's waiting, with retry and cancel.
+- **Voice notes** are transcribed only for chats you allowed it on, with the
+  lodge's `OPENAI_API_KEY`, within a daily budget. The audio is sent to OpenAI.
+
+Not in the connector yet (the adapter still does these): a message to a wolt
+with no live session starting one, `/apps`, quoting the message you replied
+to, and the dog in group chats. The connector becomes the default once it does.
+
 ## Removed
 
 - **The desktop app.** It may come back as its own project.
@@ -151,6 +178,9 @@ each of these with your consent.
 - The app-port check catches a port that's already taken; it doesn't yet prove
   the process answering later is the one the lodge started.
 - Only Chromium was used for the browser checks.
+- A connector is trusted to say who sent a message. A malicious connector
+  can claim to be any sender you allowed and use that chat's grants, so only
+  run connectors you trust, and grant each chat only what it needs.
 
 ## Upgrade notes
 
