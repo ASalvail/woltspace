@@ -343,6 +343,7 @@ RUNTIMES = ("adapter", "connector")
 
 
 QUOTE_MAX_CHARS = 200
+ROUTE_LOCK_STRIPES = 1024
 
 
 def _quote_of(delivery: dict) -> dict:
@@ -1568,12 +1569,59 @@ class ConnectorStore:
         does not own leaves it waiting (the claim is given back, and the
         next one has a new identity). The event's binding snapshot is
         refreshed, so a changed grant (default wolt, may_wake) is what the
-        router sees. The receipt is written only while `claim` is still the
-        record's current claim: a late receipt from a slower, older claim,
-        or from before an owner retry, is ignored.
+        router sees.
+
+        One attempt at a time decides where the event goes and acts on it:
+        the whole route decision and its effect (a paste, a session start)
+        run under the event's route lock, taken without waiting, before the
+        claim is checked. An attempt that finds it held gives its claim back
+        and acts on nothing; one that takes it after another attempt
+        finished finds the event over. A claim can be overtaken while its
+        attempt still runs (the retry interval passed, the owner retried or
+        paused and resumed), but no other attempt can act meanwhile, so the
+        holder's receipt is the event's: it is written whenever the event is
+        still waiting, not only while `claim` is still the record's. An
+        event resolved or cancelled meanwhile keeps that outcome.
         """
         if self.router is None:
             return {}
+        try:
+            with self._route_lock(instance_id, key):
+                return self._hand_off_owned(instance_id, key, claim)
+        except BlockingIOError:
+            # Another attempt is routing this event right now: never a second
+            # decision or effect beside it. This claim is given back.
+            with self._lock():
+                record = self._queue(instance_id).inbound.get(key)
+                if record is not None and record["state"] == "accepted" and record.get("claim") == claim:
+                    queue = self._queue(instance_id)
+                    record = queue.inbound[key]
+                    record["attempts"] = max(record.get("attempts", 1) - 1, 0)
+                    record["tried"] = self.clock()
+                    record["claim"] = None
+                    self._save_queue(instance_id, queue)
+            return {"routed": "deferred", "reason": "routing_in_progress"}
+
+    @contextlib.contextmanager
+    def _route_lock(self, instance_id: str, key: str):
+        """The event's route lock: one attempt decides and acts at a time, across threads and processes.
+
+        One of a fixed set of lock files, chosen by the event, so they never
+        pile up. Two events sharing one while both route is rare and only
+        defers the later one to its next attempt.
+        """
+        stripe = int(hashlib.sha256(f"{instance_id}\x00{key}".encode()).hexdigest(), 16) % ROUTE_LOCK_STRIPES
+        path = self.root / "routing" / f"{stripe:04d}.lock"
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with open(path, "a+") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def _hand_off_owned(self, instance_id: str, key: str, claim: str) -> dict:
+        """`_hand_off` with the event's route lock held."""
         with self._lock():
             registry = self._registry()
             queue = self._queue(instance_id)
@@ -1615,10 +1663,12 @@ class ConnectorStore:
         with self._lock():
             queue = self._queue(instance_id)
             record = queue.inbound.get(key)
-            if record is None or record["state"] != "accepted" or record.get("claim") != claim:
-                # Resolved, cancelled, retried by the owner or re-claimed
-                # meanwhile: this receipt is late.
+            if record is None or record["state"] != "accepted":
+                # Resolved or cancelled meanwhile: that outcome stands. A claim
+                # taken meanwhile acted on nothing (it could not take the
+                # route lock), so this attempt's receipt is the event's.
                 return {}
+            record["claim"] = claim
             if routed.get("routed") == "deferred":
                 # Waiting on something bounded elsewhere (a transcription in
                 # flight): give the claim back without spending an attempt;

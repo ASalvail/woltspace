@@ -679,8 +679,8 @@ def test_a_stale_attempt_cannot_redo_or_overwrite_a_finished_operation(lodge, co
     assert paused.wait(5)
     lodge.clock.now += 31
     b = _run(lambda: lodge.store.lease(who, 1))          # the sweep's retry of the same event
-    b.join(0.3)
-    assert b.is_alive()                                  # it waits for A's command lock
+    b.join(5)
+    assert not b.is_alive()                              # it cannot route beside A: given back at once
     go.set()
     a.join(5)
     b.join(5)
