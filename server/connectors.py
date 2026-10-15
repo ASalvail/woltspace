@@ -876,6 +876,7 @@ class ConnectorStore:
         selectable_wolts: tuple[str, ...] | list[str] = (), may_create: bool = False,
         may_stop_own_sessions: bool = False, create_per_hour: int | None = None,
         create_concurrent: int | None = None, may_transcribe: bool = False,
+        may_manage_apps: bool = False,
     ) -> dict:
         """Allow one provider sender in one conversation; the owner's grant, typed.
 
@@ -888,7 +889,9 @@ class ConnectorStore:
         from `may_wake`, which is only resuming), `may_stop_own_sessions`
         (`/kill`, and only a session this binding created or routed to),
         `may_transcribe` (voice notes are sent to OpenAI for transcription
-        with the lodge's key, within the daily byte and request budget).
+        with the lodge's key, within the daily byte and request budget),
+        `may_manage_apps` (`/apps`: list the lodge's apps, start and stop
+        any of them; lodge-wide, so an owner's grant).
         Residual trust, stated plainly: a malicious connector can forge an
         allowed sender and use any grant turned on here.
         """
@@ -927,6 +930,7 @@ class ConnectorStore:
                 "selectable_wolts": selectable, "may_create": bool(may_create),
                 "may_stop_own_sessions": bool(may_stop_own_sessions),
                 "may_transcribe": bool(may_transcribe),
+                "may_manage_apps": bool(may_manage_apps),
                 "create_per_hour": self.limits.create_per_hour if create_per_hour is None else create_per_hour,
                 "create_concurrent": self.limits.create_concurrent if create_concurrent is None else create_concurrent,
             }

@@ -21,6 +21,11 @@ Every answer goes back through a delivery in the same binding.
     /kill [name]      stop one session this binding created or routed to.
                       Needs `may_stop_own_sessions`; never another session,
                       never everything.
+    /apps             the lodge's apps, running first, with a start or stop
+                      button each; stopping asks to confirm. Needs
+                      `may_manage_apps`. Starting a running app or stopping
+                      a stopped one changes nothing, so a retried press is
+                      harmless and these keep no durable operation.
     /start, /help     what this chat may do.
 
 Anything else that starts with `/` is answered "not supported"; text that
@@ -70,7 +75,9 @@ from typing import Callable
 
 from .connectors import AcceptedEvent, ConnectorError, ConnectorStore, NoConnectorBinding, may_start, valid_id
 
-COMMANDS = ("wolt", "new", "sessions", "kill", "start", "help")
+COMMANDS = ("wolt", "new", "sessions", "kill", "apps", "start", "help")
+# Reached only through a button core issued, never typed.
+BUTTON_COMMANDS = ("appstart", "appstop", "appstopok")
 _COMMAND_RE = re.compile(r"^/([a-z]+)(?:@\w+)?(?:\s+(\S+))?\s*$")
 MAX_REPLY_CHARS = 1000
 LIVE_STATES = ("running", "resting")
@@ -131,6 +138,36 @@ def _default_find(operation: str) -> str | None:
     return None
 
 
+def _default_apps() -> list[dict]:
+    """The lodge's apps as /apps shows them: name, emoji, running, own_url."""
+    from apps import discover_apps_with_errors, running_apps
+
+    from .app import get_apps_domain
+
+    apps, _invalid = discover_apps_with_errors()
+    running = {r["name"] for r in running_apps()}
+    domain = get_apps_domain()
+    return [
+        {
+            "name": a.name, "emoji": getattr(a, "emoji", "") or "", "running": a.name in running,
+            "own_url": f"https://{a.name}.{domain}" if domain else None,
+        }
+        for a in apps
+    ]
+
+
+def _default_app_start(name: str) -> dict:
+    from apps import start_app
+
+    return start_app(name)
+
+
+def _default_app_stop(name: str) -> bool:
+    from apps import stop_app
+
+    return stop_app(name)
+
+
 def _default_resolve(wolt: str) -> str | None:
     from sessions import resolve_active_session
 
@@ -158,8 +195,14 @@ class Commands:
         resolve: Callable[[str], str | None] = _default_resolve,
         find: Callable[[str], str | None] = _default_find,
         wolt_of: Callable[[str], str | None] = _default_wolt_of,
+        apps: Callable[[], list[dict]] = _default_apps,
+        app_start: Callable[[str], dict] = _default_app_start,
+        app_stop: Callable[[str], bool] = _default_app_stop,
     ):
         self.store = store
+        self.apps = apps
+        self.app_start = app_start
+        self.app_stop = app_stop
         self.wolt_of = wolt_of
         self.start = start
         self.stop = stop
@@ -238,7 +281,7 @@ class Commands:
                     self._tell(event, "🪵 that button has expired or is not yours; ask again")
                     return self._audit(event, "callback", "refused", reason="callback_invalid")
                 command, argument = str(action.get("command", "")), action.get("argument")
-            if command not in COMMANDS:
+            if command not in COMMANDS + BUTTON_COMMANDS:
                 return self._done(event, "callback", "refused", reason="callback_unknown_command")
         else:
             parsed = parse_command(event.text)
@@ -251,6 +294,8 @@ class Commands:
         handler = {
             "wolt": self._wolt, "new": self._new, "sessions": self._sessions, "kill": self._kill,
             "start": self._help, "help": self._help, "unsupported": self._unsupported,
+            "apps": self._apps, "appstart": self._app_start, "appstop": self._app_stop_ask,
+            "appstopok": self._app_stop,
         }[command]
         if command in ("new", "kill"):
             previous = self.store.begin_operation(event.instance_id, key, event.binding["binding_id"], command, argument)
@@ -295,6 +340,8 @@ class Commands:
         lines.append("/sessions  the sessions this chat started or talked to")
         if binding.get("may_stop_own_sessions"):
             lines.append("/kill <session>  stop one of them")
+        if binding.get("may_manage_apps"):
+            lines.append("/apps  the lodge's apps, to start and stop")
         self._tell(event, "\n".join(lines))
         return self._audit(event, "help", "answered")
 
@@ -427,6 +474,71 @@ class Commands:
             state = "associated"
         self._tell(event, f"🐾 new session for {wolt}: {session}")
         return self._done(event, "new", "created", wolt=wolt, session=session)
+
+    # ---------------------------------------------------------------- apps
+
+    def _apps_refused(self, event: AcceptedEvent, command: str) -> dict | None:
+        if event.binding.get("may_manage_apps"):
+            return None
+        self._tell(event, "🪵 this chat may not manage apps; ask the owner")
+        return self._audit(event, command, "refused", reason="no_grant")
+
+    def _apps(self, event: AcceptedEvent, argument: str | None, previous: dict | None) -> dict:
+        if (refused := self._apps_refused(event, "apps")) is not None:
+            return refused
+        try:
+            apps = sorted(self.apps(), key=lambda a: (not a.get("running"), a.get("name", "")))
+        except Exception as exc:  # noqa: BLE001 - the human is told, nothing else happens
+            self._tell(event, f"🪵 couldn't list apps: {exc}")
+            return self._audit(event, "apps", "failed")
+        if not apps:
+            self._tell(event, "no apps yet.")
+            return self._audit(event, "apps", "answered", count=0)
+        running = sum(1 for a in apps if a.get("running"))
+        lines = [f"{len(apps)} app{'s' if len(apps) != 1 else ''} · {running} running"]
+        buttons = []
+        for a in apps:
+            name, emoji = a["name"], a.get("emoji") or "📦"
+            if a.get("running"):
+                lines.append(f"{emoji} {name}" + (f"  {a['own_url']}" if a.get("own_url") else ""))
+                buttons.append([{"text": f"⏹ {name}", "action": {"command": "appstop", "argument": name}}])
+            else:
+                lines.append(f"{emoji} {name} (off)")
+                buttons.append([{"text": f"▶ {name}", "action": {"command": "appstart", "argument": name}}])
+        self._tell(event, "\n".join(lines), buttons)
+        return self._audit(event, "apps", "answered", count=len(apps))
+
+    def _app_start(self, event: AcceptedEvent, argument: str | None, previous: dict | None) -> dict:
+        if (refused := self._apps_refused(event, "appstart")) is not None:
+            return refused
+        try:
+            self.app_start(str(argument))
+        except Exception as exc:  # noqa: BLE001 - ValueError (unknown), RuntimeError (port taken, ...)
+            self._tell(event, f"🪵 couldn't start {argument}: {exc}")
+            return self._audit(event, "appstart", "failed", app=argument)
+        self._tell(event, f"▶ started {argument}")
+        return self._audit(event, "appstart", "started", app=argument)
+
+    def _app_stop_ask(self, event: AcceptedEvent, argument: str | None, previous: dict | None) -> dict:
+        if (refused := self._apps_refused(event, "appstop")) is not None:
+            return refused
+        buttons = [[
+            {"text": "✓ stop", "action": {"command": "appstopok", "argument": argument}},
+            {"text": "cancel", "action": {"command": "apps", "argument": None}},
+        ]]
+        self._tell(event, f"stop app {argument}?", buttons)
+        return self._audit(event, "appstop", "asked", app=argument)
+
+    def _app_stop(self, event: AcceptedEvent, argument: str | None, previous: dict | None) -> dict:
+        if (refused := self._apps_refused(event, "appstopok")) is not None:
+            return refused
+        try:
+            was_running = self.app_stop(str(argument))
+        except Exception as exc:  # noqa: BLE001
+            self._tell(event, f"🪵 couldn't stop {argument}: {exc}")
+            return self._audit(event, "appstopok", "failed", app=argument)
+        self._tell(event, f"⏹ stopped {argument}" if was_running else f"{argument} was not running")
+        return self._audit(event, "appstopok", "stopped" if was_running else "not_running", app=argument)
 
     def _sessions(self, event: AcceptedEvent, argument: str | None, previous: dict | None) -> dict:
         sessions = self._state(event).get("sessions") or {}
