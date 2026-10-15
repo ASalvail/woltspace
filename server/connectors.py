@@ -925,7 +925,8 @@ class ConnectorStore:
         may_stop_own_sessions: bool = False, create_per_hour: int | None = None,
         create_concurrent: int | None = None, may_transcribe: bool = False,
         may_manage_apps: bool = False, any_wolt: bool = False,
-    ) -> dict:
+        _adopt_route: dict | None = None,
+    ) -> dict | None:
         """Allow one provider sender in one conversation; the owner's grant, typed.
 
         Binding the same sender, conversation and thread again changes the
@@ -972,6 +973,18 @@ class ConnectorStore:
                  if (b["instance_id"], b["sender"], b["conversation"], b.get("thread")) == key),
                 None,
             )
+            if _adopt_route is not None:
+                # The lodge's own carry-over (see adopt_chat): once per sender,
+                # never over a binding that is already there.
+                if instance.get("adoption") != "pending":
+                    raise ConnectorError(409, "not_adopting")
+                adopted = instance.setdefault("adopted", [])
+                if sender in adopted:
+                    return None
+                if existing is not None:
+                    adopted.append(sender)
+                    self._write_json(self.registry_path, registry)
+                    return None
             binding = {
                 "binding_id": existing["binding_id"] if existing else secrets.token_hex(8),
                 "instance_id": instance_id, "account": instance["account"],
@@ -985,10 +998,29 @@ class ConnectorStore:
                 "create_per_hour": self.limits.create_per_hour if create_per_hour is None else create_per_hour,
                 "create_concurrent": self.limits.create_concurrent if create_concurrent is None else create_concurrent,
             }
+            if _adopt_route is not None:
+                # The route first (a crash after it leaves an unused entry and
+                # the sender not adopted: redone whole), then the binding and
+                # the progress mark in one registry write.
+                queue = self._queue(instance_id)
+                queue.routing[binding["binding_id"]] = dict(_adopt_route)
+                self._save_queue(instance_id, queue)
+                instance["adopted"].append(sender)
             registry["bindings"] = [b for b in registry["bindings"] if b is not existing]
             registry["bindings"].append(binding)
             self._write_json(self.registry_path, registry)
             return dict(binding)
+
+    def adopt_chat(self, instance_id: str, *, sender: str, route: dict, **grants) -> dict | None:
+        """Carry one adapter-era chat over, once: its binding, its route and the progress mark together.
+
+        Only on an instance the lodge is still adopting (`adoption:
+        pending`). A sender adopted before is never bound again, even after
+        the owner removed or changed that binding; a binding the owner made
+        for that chat first is left as it is. Answers the new binding, or
+        None when there was nothing to do.
+        """
+        return self.bind(instance_id, sender=sender, conversation=sender, _adopt_route=route, **grants)
 
     def unbind(self, instance_id: str, *, sender: str, conversation: str, thread: str | None = None) -> bool:
         """Withdraw a grant. Its queued and leased deliveries are cancelled on the next read."""

@@ -81,14 +81,15 @@ def adopt_telegram(layout: RuntimeLayout, env: Mapping[str, str] | None = None) 
     is adopted at the start after that wolt exists). Then, resumable at
     every step: the bot is registered disabled and marked as the lodge's
     own carry-over in progress (`adoption: pending`; its account is the
-    bot id, the part of the token before the colon); each allowed user
-    without a binding yet is bound in their own chat with the grants the
-    adapter gave them (every chat wolt, wake, start and stop sessions,
-    /apps, voice transcription) and picks up where the adapter left that
-    chat (its active wolt and session); the instance is enabled; the
-    carry-over is marked done. A start interrupted anywhere resumes the
-    missing steps and never rebinds a user it already bound, so an owner's
-    change to that binding stands. A Telegram instance the owner registered
+    bot id, the part of the token before the colon); each allowed user is
+    adopted once (`adopt_chat`: their own chat bound with the grants the
+    adapter gave them, every chat wolt, wake, start and stop sessions,
+    /apps, voice transcription, together with where the adapter left that
+    chat, its active wolt and session, and a per-user progress mark); the
+    instance is enabled; the carry-over is marked done. A start
+    interrupted anywhere resumes the missing steps; a user adopted before
+    is never bound again, so an owner's change to that binding, or its
+    removal, stands. A Telegram instance the owner registered
     (no `adoption` mark), or a finished carry-over, is never touched:
     anyone allowed later is bound by hand. Groups are not carried over.
     Never raises into a boot.
@@ -129,22 +130,16 @@ def adopt_telegram(layout: RuntimeLayout, env: Mapping[str, str] | None = None) 
             return None             # nothing to carry yet; adopted at a later start
         if pending is None:
             store.add_instance(TELEGRAM_INSTANCE, "telegram", bot_id, adoption="pending")
-        bound = {b["sender"] for b in store.list_bindings(TELEGRAM_INSTANCE) if b["conversation"] == b["sender"]}
         for user in users:
-            if user in bound:
-                continue
             chat = _adapter_chat_state(layout, user)
             wolt = chat.get("active_wolt") if chat.get("active_wolt") in wolts else wolts[0]
-            binding = store.bind(
-                TELEGRAM_INSTANCE, sender=user, conversation=user, default_wolt=wolt,
+            session = chat.get("active_session")
+            store.adopt_chat(
+                TELEGRAM_INSTANCE, sender=user, default_wolt=wolt,
+                route={"active_wolt": wolt, "active_session": session if isinstance(session, str) and session else None},
                 may_wake=True, any_wolt=True, may_create=True, may_stop_own_sessions=True,
                 may_manage_apps=True, may_transcribe=True,
                 create_per_hour=OWNER_CREATE_PER_HOUR, create_concurrent=OWNER_CREATE_CONCURRENT,
-            )
-            session = chat.get("active_session")
-            store.remember_route(
-                TELEGRAM_INSTANCE, binding["binding_id"], active_wolt=wolt,
-                active_session=session if isinstance(session, str) and session else None,
             )
         store.enable(TELEGRAM_INSTANCE)
         store.finish_adoption(TELEGRAM_INSTANCE)

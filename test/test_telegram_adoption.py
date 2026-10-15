@@ -125,55 +125,95 @@ def test_no_allowed_user_writes_nothing(layout):
     assert _store(layout).list_instances() == []
 
 
-@pytest.mark.parametrize("step", ["bind_first", "bind_second", "remember", "enable", "finish"])
+def _saved_chat(layout, user, wolt, session):
+    chats = layout.wolts_dir / ".space" / "telegram" / "chats"
+    chats.mkdir(parents=True, exist_ok=True)
+    (chats / f"{user}.json").write_text(json.dumps({"active_wolt": wolt, "active_session": session}))
+
+
+@pytest.mark.parametrize("step", ["adopt_first", "adopt_second", "after_route", "enable", "finish"])
 def test_an_interrupted_adoption_resumes_at_the_next_start(layout, monkeypatch, step):
     _configure(layout, allowed_users=["101", "202"])
-    real = {name: getattr(ConnectorStore, name) for name in ("bind", "remember_route", "enable", "finish_adoption")}
-    calls = {"bind": 0}
+    _saved_chat(layout, "101", "astre", "astre-existing")
+    real = {name: getattr(ConnectorStore, name) for name in ("adopt_chat", "enable", "finish_adoption", "_write_json")}
+    seen = {"adopt": 0}
+
+    def adopt(self, *args, **kwargs):
+        seen["adopt"] += 1
+        if (step, seen["adopt"]) in (("adopt_first", 1), ("adopt_second", 2)):
+            raise OSError("injected interruption")
+        if step == "after_route" and seen["adopt"] == 1:
+            # The route is saved, then the registry write (binding + mark) fails.
+            def failing_write(path, data):
+                if path == self.registry_path and any(b["sender"] == "101" for b in data.get("bindings", ())):
+                    raise OSError("injected interruption")
+                return real["_write_json"](path, data)
+            monkeypatch.setattr(ConnectorStore, "_write_json", staticmethod(failing_write))
+            try:
+                return real["adopt_chat"](self, *args, **kwargs)
+            finally:
+                monkeypatch.setattr(ConnectorStore, "_write_json", staticmethod(real["_write_json"]))
+        return real["adopt_chat"](self, *args, **kwargs)
 
     def failing(name):
         def wrapper(self, *args, **kwargs):
-            if name == "bind":
-                calls["bind"] += 1
-                if (step == "bind_first" and calls["bind"] == 1) or (step == "bind_second" and calls["bind"] == 2):
-                    raise OSError("injected interruption")
-            elif step == {"remember_route": "remember", "enable": "enable", "finish_adoption": "finish"}[name]:
-                raise OSError("injected interruption")
-            return real[name](self, *args, **kwargs)
+            raise OSError("injected interruption")
         return wrapper
 
-    for name in real:
-        monkeypatch.setattr(ConnectorStore, name, failing(name))
-    first = adopt_telegram(layout, {})
-    assert "next start resumes" in first
+    monkeypatch.setattr(ConnectorStore, "adopt_chat", adopt)
+    if step in ("enable", "finish"):
+        monkeypatch.setattr(ConnectorStore, {"enable": "enable", "finish": "finish_adoption"}[step], failing(step))
+    assert "next start resumes" in adopt_telegram(layout, {})
     store = _store(layout)
-    [instance] = store.list_instances()
-    assert instance["adoption"] == "pending"
+    assert store.list_instances()[0]["adoption"] == "pending"
     for name, fn in real.items():
-        monkeypatch.setattr(ConnectorStore, name, fn)
+        monkeypatch.setattr(ConnectorStore, name, staticmethod(fn) if name == "_write_json" else fn)
     assert "owner chats: 101, 202" in adopt_telegram(layout, {})
     [instance] = store.list_instances()
     assert (instance["adoption"], instance["enabled"]) == ("done", True)
-    assert sorted(b["sender"] for b in store.list_bindings("telegram")) == ["101", "202"]
+    bindings = {b["sender"]: b for b in store.list_bindings("telegram")}
+    assert sorted(bindings) == ["101", "202"]
+    # Where the adapter left the chat survives every interruption.
+    route = store.routing_state("telegram", bindings["101"]["binding_id"])
+    assert (route["active_wolt"], route["active_session"]) == ("astre", "astre-existing")
     # Done is done: later starts change nothing.
     assert adopt_telegram(layout, {"TELEGRAM_ALLOWED_USERS": "101,202,303"}) is None
 
 
-def test_resuming_never_rebinds_a_user_it_already_bound(layout, monkeypatch):
+@pytest.mark.parametrize("change", ["narrowed", "removed"])
+def test_resuming_never_brings_back_what_the_owner_changed(layout, monkeypatch, change):
+    """Astre's round-2 review: an owner's withdrawal must survive a resumed carry-over."""
     _configure(layout, allowed_users=["101", "202"])
-    real_bind = ConnectorStore.bind
+    real = ConnectorStore.adopt_chat
 
     def second_fails(self, *args, **kwargs):
         if kwargs.get("sender") == "202":
             raise OSError("injected interruption")
-        return real_bind(self, *args, **kwargs)
+        return real(self, *args, **kwargs)
 
-    monkeypatch.setattr(ConnectorStore, "bind", second_fails)
+    monkeypatch.setattr(ConnectorStore, "adopt_chat", second_fails)
     adopt_telegram(layout, {})
-    monkeypatch.setattr(ConnectorStore, "bind", real_bind)
+    monkeypatch.setattr(ConnectorStore, "adopt_chat", real)
     store = _store(layout)
-    # The owner narrows the first chat before the next start.
+    if change == "narrowed":
+        store.bind("telegram", sender="101", conversation="101", default_wolt="softie")
+    else:
+        assert store.unbind("telegram", sender="101", conversation="101") is True
+    adopt_telegram(layout, {})
+    bindings = {b["sender"]: b for b in store.list_bindings("telegram")}
+    if change == "narrowed":
+        assert (bindings["101"]["default_wolt"], bindings["101"]["may_create"], bindings["101"]["any_wolt"]) == ("softie", False, False)
+    else:
+        assert "101" not in bindings
+    assert bindings["202"]["may_create"] is True
+
+
+def test_a_chat_the_owner_bound_first_is_left_as_it_is(layout):
+    _configure(layout, allowed_users=["101"])
+    store = _store(layout)
+    store.add_instance("telegram", "telegram", "123456", adoption="pending")
     store.bind("telegram", sender="101", conversation="101", default_wolt="softie")
     adopt_telegram(layout, {})
-    owner = next(b for b in store.list_bindings("telegram") if b["sender"] == "101")
-    assert (owner["default_wolt"], owner["may_create"], owner["any_wolt"]) == ("softie", False, False)
+    [binding] = store.list_bindings("telegram")
+    assert (binding["default_wolt"], binding["may_create"]) == ("softie", False)
+    assert store.list_instances()[0]["adoption"] == "done"
