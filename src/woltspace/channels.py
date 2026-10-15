@@ -72,17 +72,26 @@ def adopt_telegram(layout: RuntimeLayout, env: Mapping[str, str] | None = None) 
     """Carry an adapter-era Telegram setup over to the connector, once; what was done, or None.
 
     Runs at start, before the connectors are planned. Only when Telegram is
-    on the connector runtime, the adapter itself would have polled here
+    on the connector runtime and the adapter itself would have polled here
     (enabled, a token, and declared for this data root or this is the
-    platform entrypoint: never on ambient environment alone), and the
-    registry has no Telegram instance yet. Then: an instance for the bot
-    (its account is the bot id, the part of the token before the colon),
-    and for each `TELEGRAM_ALLOWED_USERS` id a binding of that user in their
-    own chat with the grants the adapter gave them: every chat wolt, wake,
-    start and stop sessions, /apps, voice transcription. Where the adapter
-    left that chat (its active wolt and session) is where the connector
-    picks up. Groups are not carried over: bind them by hand. Never raises
-    into a boot.
+    platform entrypoint: never on ambient environment alone).
+
+    Nothing is written until there is something to carry: at least one
+    allowed user and one chat wolt (a lodge set up before its first wolt
+    is adopted at the start after that wolt exists). Then, resumable at
+    every step: the bot is registered disabled and marked as the lodge's
+    own carry-over in progress (`adoption: pending`; its account is the
+    bot id, the part of the token before the colon); each allowed user
+    without a binding yet is bound in their own chat with the grants the
+    adapter gave them (every chat wolt, wake, start and stop sessions,
+    /apps, voice transcription) and picks up where the adapter left that
+    chat (its active wolt and session); the instance is enabled; the
+    carry-over is marked done. A start interrupted anywhere resumes the
+    missing steps and never rebinds a user it already bound, so an owner's
+    change to that binding stands. A Telegram instance the owner registered
+    (no `adoption` mark), or a finished carry-over, is never touched:
+    anyone allowed later is bound by hand. Groups are not carried over.
+    Never raises into a boot.
     """
     values = dict(os.environ if env is None else env)
     try:
@@ -102,20 +111,30 @@ def adopt_telegram(layout: RuntimeLayout, env: Mapping[str, str] | None = None) 
             return None
         connectors = _connectors_module(layout)
         store = connectors.ConnectorStore(layout.wolts_dir / ".space" / "connectors")
-        if any(i["channel"] == "telegram" for i in store.list_instances()):
-            return None
+        telegram = [i for i in store.list_instances() if i["channel"] == "telegram"]
+        pending = next(
+            (i for i in telegram if i["instance_id"] == TELEGRAM_INSTANCE and i.get("adoption") == "pending"),
+            None,
+        )
+        if telegram and pending is None:
+            return None             # the owner's own instance, or a finished carry-over
+        if pending is not None and pending["account"] != bot_id:
+            return "carry-over paused: the bot token changed while it was in progress; finish it with `woltspace connector`"
         allowed = values.get("TELEGRAM_ALLOWED_USERS") or settings.get("allowed_users") or ""
         if isinstance(allowed, (list, tuple)):
             allowed = ",".join(str(item) for item in allowed)
         users = [u.strip() for u in str(allowed).split(",") if u.strip().lstrip("-").isdigit()]
         wolts = store.lodge_wolts()
-        store.add_instance(TELEGRAM_INSTANCE, "telegram", bot_id)
-        bound = []
+        if not users or not wolts:
+            return None             # nothing to carry yet; adopted at a later start
+        if pending is None:
+            store.add_instance(TELEGRAM_INSTANCE, "telegram", bot_id, adoption="pending")
+        bound = {b["sender"] for b in store.list_bindings(TELEGRAM_INSTANCE) if b["conversation"] == b["sender"]}
         for user in users:
-            chat = _adapter_chat_state(layout, user)
-            wolt = chat.get("active_wolt") if chat.get("active_wolt") in wolts else (wolts[0] if wolts else None)
-            if wolt is None:
+            if user in bound:
                 continue
+            chat = _adapter_chat_state(layout, user)
+            wolt = chat.get("active_wolt") if chat.get("active_wolt") in wolts else wolts[0]
             binding = store.bind(
                 TELEGRAM_INSTANCE, sender=user, conversation=user, default_wolt=wolt,
                 may_wake=True, any_wolt=True, may_create=True, may_stop_own_sessions=True,
@@ -127,12 +146,11 @@ def adopt_telegram(layout: RuntimeLayout, env: Mapping[str, str] | None = None) 
                 TELEGRAM_INSTANCE, binding["binding_id"], active_wolt=wolt,
                 active_session=session if isinstance(session, str) and session else None,
             )
-            bound.append(user)
         store.enable(TELEGRAM_INSTANCE)
-    except Exception as exc:  # noqa: BLE001 - never block a boot; the connector plan names what is missing
-        return f"not carried over ({type(exc).__name__}: {exc})"
-    who = ", ".join(bound) if bound else "nobody (no TELEGRAM_ALLOWED_USERS, or no wolt yet)"
-    return f"carried the adapter's setup over to the connector: bot {bot_id}, owner chats: {who}"
+        store.finish_adoption(TELEGRAM_INSTANCE)
+    except Exception as exc:  # noqa: BLE001 - never block a boot; the next start resumes
+        return f"not carried over yet ({type(exc).__name__}: {exc}); the next start resumes"
+    return f"carried the adapter's setup over to the connector: bot {bot_id}, owner chats: {', '.join(users)}"
 
 
 def _adapter_chat_state(layout: RuntimeLayout, chat_id: str) -> dict:

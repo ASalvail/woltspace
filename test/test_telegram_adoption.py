@@ -103,3 +103,77 @@ def test_the_entrypoint_may_adopt_from_its_environment(layout):
            "TELEGRAM_ALLOWED_USERS": "101"}
     assert adopt_telegram(layout, env) is not None
     assert [b["sender"] for b in _store(layout).list_bindings("telegram")] == ["101"]
+
+
+def test_a_lodge_set_up_before_its_first_wolt_is_adopted_once_one_exists(tmp_path):
+    """Astre's rc1 review: no wolt yet must not leave an enabled instance with nobody bound."""
+    layout = RuntimeLayout(wolts_dir=tmp_path / "wolts", install_root=ROOT, host="127.0.0.1", port=7799, isolation="host")
+    _configure(layout, allowed_users="101")
+    assert adopt_telegram(layout, {}) is None
+    assert _store(layout).list_instances() == []          # nothing written yet
+    (layout.wolts_dir / "softie" / "wolt").mkdir(parents=True)
+    (layout.wolts_dir / "softie" / "wolt" / "wolt.json").write_text(json.dumps({"type": "raccoon"}))
+    assert adopt_telegram(layout, {}) is not None
+    store = _store(layout)
+    assert [b["sender"] for b in store.list_bindings("telegram")] == ["101"]
+    assert store.list_instances()[0]["enabled"] is True
+
+
+def test_no_allowed_user_writes_nothing(layout):
+    _configure(layout)
+    assert adopt_telegram(layout, {}) is None
+    assert _store(layout).list_instances() == []
+
+
+@pytest.mark.parametrize("step", ["bind_first", "bind_second", "remember", "enable", "finish"])
+def test_an_interrupted_adoption_resumes_at_the_next_start(layout, monkeypatch, step):
+    _configure(layout, allowed_users=["101", "202"])
+    real = {name: getattr(ConnectorStore, name) for name in ("bind", "remember_route", "enable", "finish_adoption")}
+    calls = {"bind": 0}
+
+    def failing(name):
+        def wrapper(self, *args, **kwargs):
+            if name == "bind":
+                calls["bind"] += 1
+                if (step == "bind_first" and calls["bind"] == 1) or (step == "bind_second" and calls["bind"] == 2):
+                    raise OSError("injected interruption")
+            elif step == {"remember_route": "remember", "enable": "enable", "finish_adoption": "finish"}[name]:
+                raise OSError("injected interruption")
+            return real[name](self, *args, **kwargs)
+        return wrapper
+
+    for name in real:
+        monkeypatch.setattr(ConnectorStore, name, failing(name))
+    first = adopt_telegram(layout, {})
+    assert "next start resumes" in first
+    store = _store(layout)
+    [instance] = store.list_instances()
+    assert instance["adoption"] == "pending"
+    for name, fn in real.items():
+        monkeypatch.setattr(ConnectorStore, name, fn)
+    assert "owner chats: 101, 202" in adopt_telegram(layout, {})
+    [instance] = store.list_instances()
+    assert (instance["adoption"], instance["enabled"]) == ("done", True)
+    assert sorted(b["sender"] for b in store.list_bindings("telegram")) == ["101", "202"]
+    # Done is done: later starts change nothing.
+    assert adopt_telegram(layout, {"TELEGRAM_ALLOWED_USERS": "101,202,303"}) is None
+
+
+def test_resuming_never_rebinds_a_user_it_already_bound(layout, monkeypatch):
+    _configure(layout, allowed_users=["101", "202"])
+    real_bind = ConnectorStore.bind
+
+    def second_fails(self, *args, **kwargs):
+        if kwargs.get("sender") == "202":
+            raise OSError("injected interruption")
+        return real_bind(self, *args, **kwargs)
+
+    monkeypatch.setattr(ConnectorStore, "bind", second_fails)
+    adopt_telegram(layout, {})
+    monkeypatch.setattr(ConnectorStore, "bind", real_bind)
+    store = _store(layout)
+    # The owner narrows the first chat before the next start.
+    store.bind("telegram", sender="101", conversation="101", default_wolt="softie")
+    adopt_telegram(layout, {})
+    owner = next(b for b in store.list_bindings("telegram") if b["sender"] == "101")
+    assert (owner["default_wolt"], owner["may_create"], owner["any_wolt"]) == ("softie", False, False)

@@ -777,11 +777,16 @@ class ConnectorStore:
             for instance_id, record in sorted(registry["instances"].items())
         ]
 
-    def add_instance(self, instance_id: str, channel: str, account: str) -> dict:
+    def add_instance(self, instance_id: str, channel: str, account: str, *, adoption: str | None = None) -> dict:
         """Register an instance, disabled: nothing routes to it until `enable`.
 
-        Registration only: this slice installs no code.
+        Registration only: this slice installs no code. `adoption` marks an
+        instance the lodge registered itself while carrying an adapter setup
+        over ("pending" until that is complete, then "done"); an instance
+        without it is the owner's, and the lodge never changes it.
         """
+        if adoption not in (None, "pending", "done"):
+            raise ConnectorError(400, "invalid_adoption")
         if not valid_id(instance_id, 64):
             raise ConnectorError(400, "invalid_instance_id")
         if not valid_id(channel, 32):
@@ -797,8 +802,20 @@ class ConnectorStore:
                 "generation": 0, "created": self.clock(), "disabled_at": self.clock(),
                 "paused_seconds": 0.0,
             }
+            if adoption is not None:
+                registry["instances"][instance_id]["adoption"] = adoption
             self._write_json(self.registry_path, registry)
             return {"instance_id": instance_id, **registry["instances"][instance_id]}
+
+    def finish_adoption(self, instance_id: str) -> None:
+        """Mark a lodge-registered instance's carry-over complete; never touches an owner's instance."""
+        with self._lock():
+            registry = self._registry()
+            instance = self._instance(registry, instance_id)
+            if instance.get("adoption") != "pending":
+                raise ConnectorError(409, "not_adopting")
+            instance["adoption"] = "done"
+            self._write_json(self.registry_path, registry)
 
     def _instance(self, registry: dict, instance_id: str) -> dict:
         try:
