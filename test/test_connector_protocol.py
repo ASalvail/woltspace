@@ -1668,8 +1668,9 @@ def _elsewhere(fn):
     assert not thread.is_alive()
 
 
-def test_a_late_receipt_from_an_older_attempt_is_ignored(lodge):
-    """Attempt 1 is slow; attempt 2 is claimed and finishes first; attempt 1's receipt is late."""
+def test_a_slow_attempt_keeps_the_event_and_a_newer_claim_acts_on_nothing(lodge):
+    """Attempt 1 is slow; attempt 2 is claimed meanwhile but cannot route beside it
+    (Astre's rc1 review: both acting meant a start and a paste); attempt 1's receipt stands."""
     who = _principal(lodge)
     outcomes = []
 
@@ -1685,9 +1686,9 @@ def test_a_late_receipt_from_an_older_attempt_is_ignored(lodge):
     lodge.store.router = slow_then_fast
     status, body = lodge.store.accept_event(who, _event())
     record = lodge.store._queue("tg-main").inbound["bot:1\x00e1"]
-    assert outcomes == ["slow started", "fast"]
-    assert (record["state"], record["attempts"], record["result"]) == ("handed_off", 2, {"routed": "delivered"})
-    assert body["routed"] == "delivered"
+    assert outcomes == ["slow started"]
+    assert (record["state"], record["attempts"], record["result"]) == ("handed_off", 1, {"routed": "late"})
+    assert body["routed"] == "late"
 
 
 async def test_an_ignore_disposition_answers_the_position_for_good(lodge):
@@ -1768,8 +1769,9 @@ async def test_message_map_is_scoped_by_conversation_and_keeps_parts_of_failed_a
 # ----------------------------------------- round 3: claim identity
 
 
-def test_an_owner_retry_during_an_old_dispatch_keeps_the_new_attempts_result(lodge):
-    """Astre's probe: old attempt in flight, owner retries, new attempt fails, old receipt arrives."""
+def test_an_owner_retry_during_an_old_dispatch_cannot_act_beside_it(lodge):
+    """Old attempt in flight, owner retries, the new attempt is claimed: it acts on
+    nothing while the old one routes, and the old attempt's effect is the receipt."""
     who = _principal(lodge)
     seen = []
 
@@ -1778,25 +1780,20 @@ def test_an_owner_retry_during_an_old_dispatch_keeps_the_new_attempts_result(lod
         assert lodge.store.retry_handoff("tg-main", "e1") is True
         lodge.store.router = lambda e: seen.append("new") or {"routed": "error", "error": "new attempt failed"}
         _elsewhere(lambda: lodge.store.lease(who, 1))
-        record = lodge.store._queue("tg-main").inbound["bot:1\x00e1"]
-        assert record["result"] == {"routed": "error", "error": "new attempt failed"}
         return {"routed": "delivered", "session": "OLD"}
 
     lodge.store.router = old_router
     lodge.store.accept_event(who, _event())
     record = lodge.store._queue("tg-main").inbound["bot:1\x00e1"]
-    assert seen == ["old started", "new"]
-    assert (record["state"], record["result"]) == ("accepted", {"routed": "error", "error": "new attempt failed"})
-    assert record["attempts"] == 1 and record["claim"]
-    # The budget was reset by the retry; the claim identity was not reused.
+    assert seen == ["old started"]
+    assert (record["state"], record["result"]["session"]) == ("handed_off", "OLD")
+    # Nothing is left for a later attempt.
     lodge.clock.advance(LIMITS.handoff_retry_seconds + 1)
-    lodge.store.router = lambda e: {"routed": "delivered", "session": "NEW"}
     lodge.store.lease(who, 1)
-    record = lodge.store._queue("tg-main").inbound["bot:1\x00e1"]
-    assert (record["state"], record["result"]["session"], record["attempts"]) == ("handed_off", "NEW", 2)
+    assert seen == ["old started"]
 
 
-def test_a_late_receipt_after_pause_and_resume_is_ignored(lodge):
+def test_a_pause_and_resume_during_an_attempt_does_not_let_a_new_claim_act(lodge):
     who = _principal(lodge)
     claims = []
 
@@ -1816,7 +1813,9 @@ def test_a_late_receipt_after_pause_and_resume_is_ignored(lodge):
     lodge.store.accept_event(who, _event())
     record = lodge.store._queue("tg-main").inbound["bot:1\x00e1"]
     assert len(claims) == 2 and claims[0] != claims[1]
-    assert (record["state"], record["result"]["session"], record["claim"]) == ("handed_off", "NEW", claims[1])
+    # The new claim could not route beside the running attempt; the running
+    # attempt's delivery is the receipt.
+    assert (record["state"], record["result"]["session"]) == ("handed_off", "OLD")
 
 
 def test_a_returned_claim_is_a_new_identity_when_made_again(lodge):

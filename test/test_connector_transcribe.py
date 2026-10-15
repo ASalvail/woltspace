@@ -3,6 +3,7 @@ Fake provider only; no real API call anywhere."""
 
 import fcntl
 import json
+import contextlib
 import os
 import sys
 from pathlib import Path
@@ -238,6 +239,28 @@ def test_pausing_the_instance_during_the_call_defers_and_never_drops(lodge):
     assert lodge.router(event)["routed"] == "delivered"
     assert "kept for later" in _pasted(lodge)
     assert len(lodge.provider.calls) == 1                 # the saved transcript, not a second call
+
+
+def test_a_pause_while_waiting_for_a_slot_defers_and_settles_nothing(lodge, monkeypatch):
+    """Paused after the slot is held but before the claim: no terminal skip, transcribed once back."""
+    event = _accepted(lodge)
+    real_slot = connector_transcribe.lodge_slot
+
+    @contextlib.contextmanager
+    def slot_then_pause(*args, **kwargs):
+        with real_slot(*args, **kwargs):
+            lodge.store.disable("tg-main")
+            yield
+
+    monkeypatch.setattr(connector_transcribe, "lodge_slot", slot_then_pause)
+    assert lodge.router(event)["routed"] == "deferred"
+    assert lodge.provider.calls == [] and lodge.sessions.pasted == []
+    assert lodge.store._queue("tg-main").transcriptions == {}
+    monkeypatch.setattr(connector_transcribe, "lodge_slot", real_slot)
+    lodge.store.enable("tg-main")
+    assert lodge.router(event)["routed"] == "delivered"
+    assert len(lodge.provider.calls) == 1
+    assert "not_allowed" not in _pasted(lodge)
 
 
 def test_no_free_slot_defers(lodge):

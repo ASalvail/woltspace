@@ -379,3 +379,60 @@ def test_claimed_uploads_of_a_waiting_event_outlive_the_upload_ttl(lodge):
     store.clock = lambda: 10 ** 9   # far past any TTL
     store.list_deliveries("tg-main")
     assert upload_id in store._queue("tg-main").uploads and source.exists()
+
+
+def test_overlapping_attempts_never_both_act_on_one_event(tmp_path):
+    """Astre's rc1 reproduction: attempt A is slow in its route decision; once the
+    retry interval passes another attempt is claimed. It must not start a session
+    (or paste) beside A, and A's own effect is the event's receipt."""
+    import threading
+
+    now = [1000.0]
+    store = ConnectorStore(tmp_path / "connectors", clock=lambda: now[0])
+    store.add_instance("one", "fake", "acct")
+    store.bind("one", sender="u", conversation="c", default_wolt="astre", may_create=True)
+    store.enable("one")
+    who = store.authenticate(store.issue_token("one"))
+    entered, release = threading.Event(), threading.Event()
+    started, pasted, calls = [], [], [0]
+
+    def resolve(wolt):
+        calls[0] += 1
+        if calls[0] == 1:
+            entered.set()
+            assert release.wait(5)
+            return "astre-new"
+        return None
+
+    def start(wolt, prompt, routing):
+        started.append(prompt)
+        return {"name": "astre-new"}
+
+    commands = Commands(store, start=start, live=lambda n: "running", resolve=lambda w: None, wolt_of=lambda n: "astre")
+    store.router = Router(
+        store, uploads_root=tmp_path, resolve=resolve, deliver=lambda n, t: pasted.append(t) or {"status": "delivered"},
+        wolt_of=lambda n: "astre", commands=commands, opening=lambda *a: "start-chat",
+    )
+    errors = []
+
+    def first():
+        try:
+            store.accept_event(who, {"event_id": "e", "sender": {"provider_id": "u"}, "conversation": {"provider_id": "c"}, "text": "hello"})
+        except Exception as exc:  # noqa: BLE001
+            errors.append(repr(exc))
+
+    thread = threading.Thread(target=first)
+    thread.start()
+    assert entered.wait(5)
+    now[0] += 31                 # past the retry interval: a second attempt is claimed
+    store.lease(who, 1)
+    release.set()
+    thread.join(5)
+    assert errors == []
+    assert (len(started), len(pasted)) == (0, 1)
+    record = store._queue("one").inbound[next(iter(store._queue("one").inbound))]
+    assert record["state"] == "handed_off" and record["result"]["routed"] == "delivered"
+    # Nothing is left for a later attempt to do again.
+    now[0] += 31
+    store.lease(who, 1)
+    assert (len(started), len(pasted)) == (0, 1)
