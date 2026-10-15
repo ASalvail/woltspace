@@ -80,7 +80,7 @@ here too, scoped to the instance's account and conversation, so reply
 routing survives a connector restart.
 
 Which runtime owns a channel (`telegram.runtime` in the lodge's
-woltspace.json: the in-process adapter by default, or the connector) is read
+woltspace.json: the connector by default, or the old in-process adapter) is read
 on every operation: the instance of a channel whose runtime is not the
 connector hands out nothing, accepts nothing and advances no cursor. A
 running connector process holds the channel's run lock
@@ -343,6 +343,7 @@ RUNTIMES = ("adapter", "connector")
 
 
 QUOTE_MAX_CHARS = 200
+CHAT_WOLT_TYPES = frozenset({"raccoon", "beaver", "otter", "rodent"})
 
 
 def _quote_of(delivery: dict) -> dict:
@@ -365,15 +366,16 @@ def may_start(binding: dict, wolt: str | None) -> bool:
 
 
 def default_channel_runtime(channel: str) -> str:
-    """Telegram keeps the in-process adapter until the owner switches; others only have the connector."""
-    return "adapter" if channel == "telegram" else "connector"
+    """The connector, for every channel; Telegram's old in-process adapter only when the owner says `adapter`."""
+    return "connector"
 
 
 def channel_runtime(config_path: Path | None, channel: str) -> str:
     """Which runtime owns `channel`: `<channel>.runtime` in the lodge's woltspace.json.
 
-    An unreadable file is the default, never the connector: the switch is an
-    owner statement, and a missing or broken one has made none.
+    A missing or unreadable file, or no setting, is the default (the
+    connector): only an owner statement brings the adapter back. Both
+    runtimes read this one rule, so they never disagree about who polls.
     """
     default = default_channel_runtime(channel)
     if config_path is None:
@@ -536,6 +538,34 @@ class ConnectorStore:
             return True
         return channel_runtime(self.runtime_config, channel) == "connector"
 
+    def lodge_wolts(self) -> list[str]:
+        """The lodge's chat wolts (rodents; the wolf and the dog are not chat targets), by name.
+
+        Read from the wolts folder this store lives in; none when the store
+        is not in the usual `wolts/.space/connectors` layout.
+        """
+        if self.root.parent.name != ".space":
+            return []
+        names = []
+        for manifest in sorted(self.root.parent.parent.glob("*/wolt/wolt.json")):
+            try:
+                data = json.loads(manifest.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            name = manifest.parent.parent.name
+            if isinstance(data, dict) and data.get("type", "rodent") in CHAT_WOLT_TYPES and valid_id(name, 64):
+                names.append(name)
+        return names
+
+    def _effective(self, binding: dict) -> dict:
+        """A copy of the binding with `any_wolt` resolved: every chat wolt of the lodge, now, is selectable."""
+        binding = dict(binding)
+        if binding.get("any_wolt"):
+            selectable = list(binding.get("selectable_wolts") or ())
+            selectable += [name for name in self.lodge_wolts() if name not in selectable]
+            binding["selectable_wolts"] = selectable
+        return binding
+
     # ----------------------------------------------------------------- files
 
     @property
@@ -606,7 +636,7 @@ class ConnectorStore:
         with self._lock():
             registry = self._registry()
             binding = next((b for b in registry["bindings"] if b["binding_id"] == binding_id), None)
-            return dict(binding) if binding is not None else None
+            return self._effective(binding) if binding is not None else None
 
     @contextlib.contextmanager
     def _transaction(self, *, dispatch: bool = True):
@@ -876,7 +906,7 @@ class ConnectorStore:
         selectable_wolts: tuple[str, ...] | list[str] = (), may_create: bool = False,
         may_stop_own_sessions: bool = False, create_per_hour: int | None = None,
         create_concurrent: int | None = None, may_transcribe: bool = False,
-        may_manage_apps: bool = False,
+        may_manage_apps: bool = False, any_wolt: bool = False,
     ) -> dict:
         """Allow one provider sender in one conversation; the owner's grant, typed.
 
@@ -891,7 +921,9 @@ class ConnectorStore:
         `may_transcribe` (voice notes are sent to OpenAI for transcription
         with the lodge's key, within the daily byte and request budget),
         `may_manage_apps` (`/apps`: list the lodge's apps, start and stop
-        any of them; lodge-wide, so an owner's grant).
+        any of them; lodge-wide, so an owner's grant), `any_wolt` (every chat
+        wolt the lodge has, read at each use, is selectable: the owner's own
+        chat, as the adapter treated it).
         Residual trust, stated plainly: a malicious connector can forge an
         allowed sender and use any grant turned on here.
         """
@@ -931,6 +963,7 @@ class ConnectorStore:
                 "may_stop_own_sessions": bool(may_stop_own_sessions),
                 "may_transcribe": bool(may_transcribe),
                 "may_manage_apps": bool(may_manage_apps),
+                "any_wolt": bool(any_wolt),
                 "create_per_hour": self.limits.create_per_hour if create_per_hour is None else create_per_hour,
                 "create_concurrent": self.limits.create_concurrent if create_concurrent is None else create_concurrent,
             }
@@ -1534,7 +1567,7 @@ class ConnectorStore:
                 "session": reply_session,
             }
             accepted = AcceptedEvent(
-                who.instance_id, who.channel, who.account, event["event_id"], dict(binding),
+                who.instance_id, who.channel, who.account, event["event_id"], self._effective(binding),
                 {"provider_id": event["sender"], "display": outbox.display_name(event["display"]) if event["display"] else ""},
                 {"provider_id": event["conversation"], "thread": event["thread"]},
                 event["text"],
@@ -1891,6 +1924,7 @@ class ConnectorStore:
         with self._lock():
             registry = self._registry()
             binding = next((b for b in registry["bindings"] if b["binding_id"] == binding_id), None)
+            binding = self._effective(binding) if binding is not None else None
             queue = self._queue(instance_id)
             existing = queue.operations.get(key)
             if existing is not None and existing["state"] != "reserved" or (
@@ -1957,6 +1991,7 @@ class ConnectorStore:
                 # same locked write that lets the effect happen.
                 registry = self._registry()
                 binding = next((b for b in registry["bindings"] if b["binding_id"] == record["binding_id"]), None)
+                binding = self._effective(binding) if binding is not None else None
                 instance = registry["instances"].get(instance_id)
                 allowed = (
                     binding is not None and instance is not None and instance.get("enabled")
@@ -2150,7 +2185,7 @@ class ConnectorStore:
                 return "gone", None
             if not instance.get("enabled") or not self.runtime_active(instance.get("channel", "")):
                 return "later", None
-            return "ok", dict(binding)
+            return "ok", self._effective(binding)
 
     def settle_transcription(self, instance_id: str, key: str, upload_id: str, claim: str, disposition: dict) -> dict:
         """Persist the terminal disposition of a claim: `{"text"}` or `{"reason"}`.

@@ -61,6 +61,90 @@ def telegram_runtime(layout: RuntimeLayout) -> str:
     return connectors.channel_runtime(layout.wolts_dir / "woltspace.json", "telegram")
 
 
+TELEGRAM_INSTANCE = "telegram"
+# The owner's own chat may start sessions as freely as the adapter let it;
+# these only stop a runaway.
+OWNER_CREATE_PER_HOUR = 60
+OWNER_CREATE_CONCURRENT = 20
+
+
+def adopt_telegram(layout: RuntimeLayout, env: Mapping[str, str] | None = None) -> str | None:
+    """Carry an adapter-era Telegram setup over to the connector, once; what was done, or None.
+
+    Runs at start, before the connectors are planned. Only when Telegram is
+    on the connector runtime, the adapter itself would have polled here
+    (enabled, a token, and declared for this data root or this is the
+    platform entrypoint: never on ambient environment alone), and the
+    registry has no Telegram instance yet. Then: an instance for the bot
+    (its account is the bot id, the part of the token before the colon),
+    and for each `TELEGRAM_ALLOWED_USERS` id a binding of that user in their
+    own chat with the grants the adapter gave them: every chat wolt, wake,
+    start and stop sessions, /apps, voice transcription. Where the adapter
+    left that chat (its active wolt and session) is where the connector
+    picks up. Groups are not carried over: bind them by hand. Never raises
+    into a boot.
+    """
+    values = dict(os.environ if env is None else env)
+    try:
+        if telegram_runtime(layout) != "connector":
+            return None
+        settings = channel_config(layout, "telegram", values)
+        configured = bool(settings.get("enabled", False))
+        raw_enabled = values.get("ENABLE_TELEGRAM_BOT")
+        from_env = _truthy(raw_enabled) if raw_enabled is not None else False
+        if (raw_enabled is not None and not from_env) or not (configured or from_env):
+            return None
+        if not configured and not _truthy(values.get("WOLTSPACE_ENTRYPOINT", "")):
+            return None
+        token = (values.get("TELEGRAM_BOT_TOKEN") or settings.get("token") or "").strip()
+        bot_id = token.split(":", 1)[0]
+        if not bot_id.isdigit():
+            return None
+        connectors = _connectors_module(layout)
+        store = connectors.ConnectorStore(layout.wolts_dir / ".space" / "connectors")
+        if any(i["channel"] == "telegram" for i in store.list_instances()):
+            return None
+        allowed = values.get("TELEGRAM_ALLOWED_USERS") or settings.get("allowed_users") or ""
+        if isinstance(allowed, (list, tuple)):
+            allowed = ",".join(str(item) for item in allowed)
+        users = [u.strip() for u in str(allowed).split(",") if u.strip().lstrip("-").isdigit()]
+        wolts = store.lodge_wolts()
+        store.add_instance(TELEGRAM_INSTANCE, "telegram", bot_id)
+        bound = []
+        for user in users:
+            chat = _adapter_chat_state(layout, user)
+            wolt = chat.get("active_wolt") if chat.get("active_wolt") in wolts else (wolts[0] if wolts else None)
+            if wolt is None:
+                continue
+            binding = store.bind(
+                TELEGRAM_INSTANCE, sender=user, conversation=user, default_wolt=wolt,
+                may_wake=True, any_wolt=True, may_create=True, may_stop_own_sessions=True,
+                may_manage_apps=True, may_transcribe=True,
+                create_per_hour=OWNER_CREATE_PER_HOUR, create_concurrent=OWNER_CREATE_CONCURRENT,
+            )
+            session = chat.get("active_session")
+            store.remember_route(
+                TELEGRAM_INSTANCE, binding["binding_id"], active_wolt=wolt,
+                active_session=session if isinstance(session, str) and session else None,
+            )
+            bound.append(user)
+        store.enable(TELEGRAM_INSTANCE)
+    except Exception as exc:  # noqa: BLE001 - never block a boot; the connector plan names what is missing
+        return f"not carried over ({type(exc).__name__}: {exc})"
+    who = ", ".join(bound) if bound else "nobody (no TELEGRAM_ALLOWED_USERS, or no wolt yet)"
+    return f"carried the adapter's setup over to the connector: bot {bot_id}, owner chats: {who}"
+
+
+def _adapter_chat_state(layout: RuntimeLayout, chat_id: str) -> dict:
+    """The adapter's saved state for one chat, or nothing."""
+    path = layout.wolts_dir / ".space" / "telegram" / "chats" / f"{chat_id}.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 # The environment a connector child gets besides what its plan names: enough
 # to find its interpreter and a home, nothing of the lodge's.
 _CHILD_BASE_ENV = ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL")
@@ -219,14 +303,12 @@ class TelegramConnector:
             return ConnectorPlan(self.name, False, "disabled", remedy=remedy)
 
         if telegram_runtime(layout) == "connector":
-            # The owner moved Telegram to the connector protocol: exactly one
-            # poller per bot, and it is not this adapter. Launching the
-            # connector process from here is the next slice's seam.
+            # Telegram runs on the connector protocol (the default): exactly
+            # one poller per bot, and it is not this adapter.
             return ConnectorPlan(
                 self.name, False, "telegram.runtime is connector: the adapter does not poll",
                 remedy=(
-                    "The lodge does not launch the Telegram connector yet (next slice). "
-                    "To use the adapter again: stop the lodge, then "
+                    "To use the old adapter again: stop the lodge, then "
                     "`woltspace connector runtime telegram adapter`."
                 ),
             )
