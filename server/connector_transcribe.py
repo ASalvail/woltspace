@@ -221,6 +221,8 @@ class Transcriber:
                 return claimed["done"]
             if claimed.get("busy"):
                 raise TranscriptionPending("another attempt is transcribing this file")
+            if claimed.get("paused"):
+                raise TranscriptionPending("the instance is paused")
             claim = claimed["claim"]
             data = read_anchored(
                 self.uploads_root, (event.channel, "uploads"), path.name, size,
