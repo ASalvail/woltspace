@@ -90,23 +90,19 @@ allowlists. Resolve any overriding `TELEGRAM_ALLOWED_USERS` or enablement settin
 in the lodge's existing configuration sources. Do not enable a connector until
 the token and allowlist are ready.
 
-Explain the brief connection interruption. For a native lodge, follow the
-stop/start lifecycle in the [update skill](../update/SKILL.md) and its linked
-manual instructions. Before stopping, record `woltspace status --json`, including
-the running lodge's host, port, and data root. Use the installed native CLI in
-the same lodge environment, substituting that recorded host and port below:
+Explain the brief connection interruption. For a native lodge, restart it with:
 
 ```bash
-woltspace stop
-woltspace start --host <recorded-host> --port <recorded-port>
-woltspace status --json
+woltspace restart
 ```
 
-Do not replace the recorded address with defaults. If the lodge is already
-stopped, skip stop and start with its configured host and port. There is no
-native `woltspace restart` command. For a container lodge, have the authorized
-host operator restart it through its existing container tooling; do not run
-native stop/start inside the container.
+It stops the lodge, starts it again on the same host and port, and reports
+health. If the lodge is already stopped, run `woltspace start` instead, adding
+`--host`/`--port` if this lodge does not use the defaults. A stopped lodge's
+address comes from its configuration or environment; `woltspace status` then
+shows only the default address. For a container lodge, have the authorized host operator restart
+it through its existing container tooling; do not run native lifecycle commands
+inside the container.
 
 Respect the session's restart permissions; if restart is forbidden, hand the
 prepared change to the owner or authorized operator. Verify the supervised
