@@ -805,7 +805,8 @@ async def post_notify(request: Request):
         )
     except SpeechError as e:
         # The words could not be made into audio; nothing was sent.
-        print(f"[notify] speech failed: {e}")
+        print(f"[notify] {time.strftime('%Y-%m-%dT%H:%M:%S%z')} speech failed: "
+              f"session={session or '-'}: {e}")
         return JSONResponse(
             {"ok": False, "error": str(e), "reason": e.reason},
             status_code=502 if e.reason == "speech_failed" else 400,

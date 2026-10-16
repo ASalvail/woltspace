@@ -32,6 +32,10 @@ class _Service:
             service.requests.append(request)
             if error is not None:
                 raise error
+            if callable(answer):
+                return answer()  # a fresh answer for every request, retries included
+            if isinstance(answer, list):
+                return answer.pop(0) if len(answer) > 1 else answer[0]
             return answer if answer is not None else httpx.Response(200, content=OGG)
 
         class Client(httpx.AsyncClient):
@@ -194,11 +198,12 @@ async def test_a_network_failure_names_its_kind(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_a_download_cut_short_leaves_no_file(monkeypatch, tmp_path):
-    _Service(monkeypatch, httpx.Response(200, stream=_CutShort()))
+    service = _Service(monkeypatch, lambda: httpx.Response(200, stream=_CutShort()))
 
     error = await _failure(tmp_path)
 
     assert str(error) == "could not reach the speech service: ReadError"
+    assert len(service.requests) == 2  # tried once more before giving up
 
 
 @pytest.mark.parametrize("build, words", [
@@ -246,3 +251,54 @@ async def test_an_unknown_format_is_refused_without_a_request(monkeypatch, tmp_p
 
     assert str(error) == "unknown speech format: wav"
     assert service.requests == []
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_request_is_tried_once_more(monkeypatch, tmp_path):
+    """The service stalls now and then (a ReadTimeout), and works on the next try."""
+    calls = []
+
+    def answer():
+        calls.append(1)
+        if len(calls) == 1:
+            raise httpx.ReadTimeout("stalled")
+        return httpx.Response(200, content=OGG)
+
+    service = _Service(monkeypatch, answer)
+    target = tmp_path / ("c" * 32)
+
+    assert await synthesize("hello", "opus", target, **SETTINGS) == len(OGG)
+    assert target.read_bytes() == OGG
+    assert len(service.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_server_error_is_retried(monkeypatch, tmp_path):
+    service = _Service(monkeypatch, [httpx.Response(503), httpx.Response(200, content=OGG)])
+    assert await synthesize("hello", "opus", tmp_path / ("a" * 32), **SETTINGS) == len(OGG)
+    assert len(service.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_is_not_retried(monkeypatch, tmp_path):
+    service = _Service(monkeypatch, lambda: httpx.Response(429))
+    await _failure(tmp_path)
+    assert len(service.requests) == 1
+
+
+def test_a_stall_is_cut_off_well_inside_a_two_minute_caller():
+    """Two tries at the read timeout must finish before the CLI's own two minutes."""
+    assert speech.SPEECH_TIMEOUT.read * speech.SPEECH_ATTEMPTS < 120
+
+
+@pytest.mark.asyncio
+async def test_a_retry_after_partial_audio_writes_a_clean_file(monkeypatch, tmp_path):
+    """The first try writes some audio and drops; the second must not trip over
+    the leftover or append to it."""
+    answers = [httpx.Response(200, stream=_CutShort()), httpx.Response(200, content=OGG + b"tail")]
+    service = _Service(monkeypatch, lambda: answers.pop(0))
+    target = tmp_path / ("c" * 32)
+
+    assert await synthesize("hello", "opus", target, **SETTINGS) == len(OGG) + 4
+    assert target.read_bytes() == OGG + b"tail"
+    assert len(service.requests) == 2

@@ -810,6 +810,21 @@ def test_speak_flag_sends_the_words_without_the_name_prefix(tmp_path):
     assert result.stdout.rstrip("\n").endswith("[spoken]")
 
 
+def test_speak_reports_a_voice_note_the_lodge_sent_as_text(tmp_path):
+    """The speech service failed after its retry: the words went as text, and that is a send."""
+    reply = {"ok": True, "adapter": "telegram",
+             "speech_failed": "could not reach the speech service: ReadTimeout"}
+    env, capture, box = _lodge_answering(tmp_path, reply)
+
+    result = _run(["--speak"], env, "The build is green.\n")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.rstrip("\n").endswith("[sent as text]")
+    assert ("notify: the voice note failed (could not reach the speech service: "
+            "ReadTimeout); the lodge sent the text instead") in result.stderr
+    assert _entries(box) == []
+
+
 def test_a_file_send_still_has_no_kind_key(tmp_path):
     env, capture, box = _file_environment(tmp_path)
     source = tmp_path / "a.html"
