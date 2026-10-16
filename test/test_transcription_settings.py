@@ -220,3 +220,14 @@ def test_the_cli_never_carries_a_key_to_a_new_server(tmp_path, monkeypatch, caps
     # Another server again: refused without a key choice.
     assert cli.main(["transcription", "set", "--base-url", "https://other.example/v1"]) == 1
     assert load_settings(path).base_url == "https://stt.example/v2"
+
+
+@pytest.mark.parametrize("base_url", ["https://example.test:99999/v1", "http://[::1/v1", "not a url"])
+def test_the_cli_reports_a_malformed_url_without_a_traceback(tmp_path, monkeypatch, capsys, base_url):
+    from woltspace import cli
+
+    monkeypatch.setattr(cli.RuntimeLayout, "from_env",
+                        classmethod(lambda cls, *a, **k: type("L", (), {"wolts_dir": tmp_path, "install_root": ROOT})()))
+    assert cli.main(["transcription", "set", "--base-url", base_url, "--no-key"]) == 1
+    assert capsys.readouterr().err.startswith("woltspace transcription: ")
+    assert not (tmp_path / "woltspace.json").exists()

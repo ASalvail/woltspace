@@ -643,6 +643,8 @@ def _transcription_set(args) -> int:
         if args.base_url is not None:
             from urllib.parse import urlsplit
 
+            module.check_base_url(args.base_url.strip().rstrip("/"))  # a bad URL is a plain error
+
             def authority(url):
                 parts = urlsplit(url.strip())
                 return (parts.scheme, (parts.hostname or "").lower(), parts.port)
