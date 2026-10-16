@@ -111,6 +111,65 @@ def test_unusable_settings_are_misconfigured_with_no_call(lodge):
     _transcriber(lodge, broken)
     lodge.router(_accepted(lodge))
     assert "not transcribed (misconfigured)" in _pasted(lodge) and lodge.provider.calls == []
+    queue = lodge.store._queue("tg-main")
+    assert queue.transcribe_budget.get("requests", 0) == 0 and queue.transcribe_budget.get("bytes", 0) == 0
+    assert all(entry.get("attempts", 0) == 0 for entry in queue.transcriptions.values())
+
+
+@pytest.mark.parametrize("base_url,trusts_env", [
+    ("http://127.0.0.1:8080/v1", False), ("http://localhost:8080/v1", False), ("https://api.openai.com/v1", True),
+])
+def test_a_local_server_is_never_reached_through_an_ambient_proxy(monkeypatch, base_url, trusts_env):
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.example:3128")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:3128")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    seen = {}
+    real = httpx.AsyncClient
+
+    def client(**kw):
+        seen["trust_env"] = kw.get("trust_env", True)
+        kw.pop("trust_env", None)
+        return real(transport=httpx.MockTransport(
+            lambda r: httpx.Response(200, stream=httpx.ByteStream(b'{"text": "ok"}'))), trust_env=False, **kw)
+
+    monkeypatch.setattr(connector_transcribe.httpx, "AsyncClient", client)
+    settings = TranscriptionSettings.parse({"base_url": base_url, "key_env": ""})
+    assert openai_transcribe(b"x", "voice.ogg", "audio/ogg", "k", settings) == {"text": "ok"}
+    assert seen["trust_env"] is trusts_env
+
+
+def test_a_loopback_call_with_a_proxy_set_reaches_the_local_server(monkeypatch):
+    """End to end: a real local server answers, though HTTP_PROXY points elsewhere."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    hits = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            hits.append(self.path)
+            self.rfile.read(int(self.headers.get("content-length", 0)))
+            body = b'{"text": "from local"}'
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_a):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")      # nothing listens: a proxied call fails
+        monkeypatch.delenv("NO_PROXY", raising=False)
+        settings = TranscriptionSettings.parse(
+            {"base_url": f"http://127.0.0.1:{server.server_port}/v1", "model": "m", "key_env": ""})
+        assert openai_transcribe(b"x", "voice.ogg", "audio/ogg", "secret", settings) == {"text": "from local"}
+        assert hits == ["/v1/audio/transcriptions"]
+    finally:
+        server.shutdown()
 
 
 def test_the_router_reads_woltspace_json_on_every_call(tmp_path):
@@ -135,9 +194,29 @@ def test_the_cli_sets_shows_and_clears(tmp_path, monkeypatch, capsys):
     assert cli.main(["transcription", "show", "--json"]) == 0
     shown = json.loads(capsys.readouterr().out)["transcription"]
     assert shown == {"api": "transcriptions", "base_url": "http://127.0.0.1:8080/v1", "model": "large-v3", "key_env": ""}
-    assert cli.main(["transcription", "set", "--base-url", "http://10.0.0.2/v1"]) == 1
+    assert cli.main(["transcription", "set", "--base-url", "http://10.0.0.2/v1", "--no-key"]) == 1
     assert "only for a server on this machine" in capsys.readouterr().err
     assert cli.main(["transcription", "set", "--model", "small"]) == 0          # merges
     assert load_settings(tmp_path / "woltspace.json").base_url == "http://127.0.0.1:8080/v1"
     assert cli.main(["transcription", "clear"]) == 0
     assert load_settings(tmp_path / "woltspace.json") == TranscriptionSettings()
+
+
+def test_the_cli_never_carries_a_key_to_a_new_server(tmp_path, monkeypatch, capsys):
+    from woltspace import cli
+
+    monkeypatch.setattr(cli.RuntimeLayout, "from_env",
+                        classmethod(lambda cls, *a, **k: type("L", (), {"wolts_dir": tmp_path, "install_root": ROOT})()))
+    path = tmp_path / "woltspace.json"
+    # From the defaults (OpenAI + OPENAI_API_KEY), a new host must name its key.
+    assert cli.main(["transcription", "set", "--base-url", "https://stt.example/v1"]) == 1
+    assert "OPENAI_API_KEY is not sent" in capsys.readouterr().err
+    assert load_settings(path) == TranscriptionSettings()
+    assert cli.main(["transcription", "set", "--base-url", "https://stt.example/v1", "--key-env", "STT_KEY"]) == 0
+    assert load_settings(path).key_env == "STT_KEY"
+    # Same server, another path or model: the key stays.
+    assert cli.main(["transcription", "set", "--base-url", "https://stt.example/v2", "--model", "m2"]) == 0
+    assert load_settings(path).key_env == "STT_KEY"
+    # Another server again: refused without a key choice.
+    assert cli.main(["transcription", "set", "--base-url", "https://other.example/v1"]) == 1
+    assert load_settings(path).base_url == "https://stt.example/v2"

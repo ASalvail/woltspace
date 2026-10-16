@@ -95,6 +95,12 @@ class TranscriptionSettings:
     https, or http to this machine only (a local server), so a key and audio
     never cross a network in clear. `key_env` names the environment variable
     holding the key; empty means the server needs none.
+
+    Trust boundary: this is the owner's configuration. Whoever can write
+    `woltspace.json` chooses where audio goes and which of the lodge's
+    environment variables is sent as the Bearer key. That is no new power:
+    the same OS user can already read the lodge's environment. The CLI
+    refuses a new endpoint that would silently keep the old key.
     """
 
     api: str = "transcriptions"
@@ -213,8 +219,12 @@ async def _call(data: bytes, filename: str, content_type: str, key: str | None,
     headers = {"Accept-Encoding": "identity"}
     if key:
         headers["Authorization"] = f"Bearer {key}"
+    # A server on this machine is reached directly: an ambient HTTP(S)_PROXY
+    # would otherwise carry its clear-text audio and key off the machine.
+    local = _loopback(urlsplit(settings.base_url).hostname or "")
     async with httpx.AsyncClient(
         follow_redirects=False, timeout=httpx.Timeout(CALL_DEADLINE_SECONDS, connect=10.0),
+        trust_env=not local,
     ) as client:
         async with client.stream(
             "POST", settings.endpoint,
@@ -340,7 +350,7 @@ class Transcriber:
         try:
             settings = self.settings()
         except SettingsInvalid:
-            return None, None, True
+            return None, None, False
         if self.key is not None:
             key = self.key()
         else:
@@ -367,6 +377,7 @@ class Transcriber:
         with lodge_slot(self.store.root, wait=self.slot_wait):
             claimed = self.store.claim_transcription(
                 event.instance_id, key, upload_id, size, key_present=key_present,
+                configured=settings is not None,
             )
             if claimed.get("stopped"):
                 raise TranscriptionStopped("the event is over")
@@ -381,9 +392,7 @@ class Transcriber:
                 self.uploads_root, (event.channel, "uploads"), path.name, size,
                 self.store.limits.transcribe_max_bytes,
             )
-            if settings is None:
-                outcome = {"reason": "misconfigured"}
-            elif data is None:
+            if data is None:
                 outcome = {"reason": "unreadable"}
             else:
                 name = "voice.ogg" if extension in (".ogg", ".oga") else f"audio{extension}"

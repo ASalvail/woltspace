@@ -641,6 +641,21 @@ def _transcription_set(args) -> int:
     try:
         current = module.load_settings(path).as_config()
         if args.base_url is not None:
+            from urllib.parse import urlsplit
+
+            def authority(url):
+                parts = urlsplit(url.strip())
+                return (parts.scheme, (parts.hostname or "").lower(), parts.port)
+
+            if (authority(args.base_url) != authority(current["base_url"])
+                    and args.key_env is None and not args.no_key):
+                print(
+                    "woltspace transcription: a new server needs its key named: pass "
+                    "--key-env NAME (the variable holding that server's key) or --no-key, "
+                    f"so {current['key_env'] or 'no key'} is not sent to it by accident.",
+                    file=sys.stderr,
+                )
+                return 1
             current["base_url"] = args.base_url
         if args.model is not None:
             current["model"] = args.model
