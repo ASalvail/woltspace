@@ -1,7 +1,6 @@
 """Woltspace server — FastAPI replacement for server.js."""
 
 import asyncio
-import hashlib
 import json
 import os
 import re
@@ -69,7 +68,9 @@ from sessions import (
     wolt_harness, ResumeUnavailable, ResumeFailed, HarnessNotInstalled,
     stored_resume_id, recover_resume_id, taken_resume_ids, claim_resume_id,
 )
-from session_expiry import get_idle_timeout, get_pane_activity, set_idle_timeout
+from session_expiry import (
+    HOLD_MAX_SECONDS, get_idle_timeout, hold_active, last_use, public_hold, set_idle_timeout,
+)
 from session_runtime import RuntimeHandle, get_runtime
 from session_targets import SessionTarget
 from execution_policy import AutoGrantStore, POLICY_VERSION
@@ -664,7 +665,9 @@ async def post_current(request: Request):
     body = await request.json()
     url = body.get("url")
     if url:
-        set_current_url(url, session, body.get("port", 7777))
+        # set_viewport writes the record under the session's flock, which a rest
+        # holds while it stops tmux: never wait for it on the event loop.
+        await asyncio.to_thread(set_current_url, url, session, body.get("port", 7777))
         log_view(url, body.get("title"))
     return {"url": get_current_url(session)}
 
@@ -756,6 +759,23 @@ async def views_history():
 
 # --- Notify ---
 
+def _touch_origin(name: str) -> None:
+    """A session that talks is in use: its own notify, message or spawn stamps it.
+
+    Only last_activity, only on a running record, through the locked touch();
+    never the status, so a resting sender stays resting. The name comes from
+    the caller, on the same trust as /notify's session and /current.
+    """
+    if not name or sanitize_session(name) != name or name == "main":
+        return
+    from sessions import SessionRegistry
+    try:
+        SessionRegistry(WOLTS_DIR).touch(name)
+    except Exception as exc:
+        # Stamping use never fails the send it rides on.
+        print(f"[sessions] could not stamp use on {name}: {exc}")
+
+
 @app.post("/notify")
 async def post_notify(request: Request):
     body = await request.json()
@@ -784,6 +804,7 @@ async def post_notify(request: Request):
         )
         print(f"[notify] → {result.get('adapter')} | {message[:80]}")
         bot_log("notify_sent", {"session": session, **result, "message": message})
+        await asyncio.to_thread(_touch_origin, session)
         return {"ok": True, **result}
     except NoNotificationTarget as e:
         # Not a server fault: no chat has been connected yet. 409 so a caller
@@ -850,8 +871,10 @@ async def _deliver_or_resume(safe: str, text: str, body: dict):
         from_session=body.get("from_session", "") or "",
     )
     status = result.get("status")
+    sender = body.get("from_session", "") or ""
     if status == "delivered":
         print(f"[message] → {safe}: {text[:80]}")
+        await asyncio.to_thread(_touch_origin, sender)
         return {"ok": True, **result}
     if status in {"session-dead", "agent-gone"}:
         from sessions import SessionRegistry
@@ -866,6 +889,7 @@ async def _deliver_or_resume(safe: str, text: str, body: dict):
         try:
             resumed = await asyncio.to_thread(resume_session, safe, prompt)
             print(f"[message] resumed → {safe}: {text[:80]}")
+            await asyncio.to_thread(_touch_origin, sender)
             return {"ok": True, **resumed, "status": "resumed", "session": safe}
         except (ValueError, ResumeUnavailable, ResumeFailed, subprocess.CalledProcessError) as exc:
             return JSONResponse(
@@ -914,19 +938,19 @@ async def session_describe(session_id: str, request: Request):
     return described
 
 
-@app.post("/sessions/{session_id}/message")
-async def session_message(session_id: str, request: Request):
-    """Deliver to a running session, or resume a resting one on contact."""
-    safe = sanitize_session(session_id)
-    body = await request.json()
-    text = body.get("text")
-    if not text:
-        return JSONResponse({"error": "text required"}, status_code=400)
-    return await _deliver_or_resume(safe, text, body)
+_HOLD_REASON_MAX = 200
 
 
-def _rest_session_locked(safe: str, expected_digest: str):
-    """Verify and stop one session without blocking the server event loop."""
+def _hold_reason(value) -> str:
+    """One line, no control characters, like a session description."""
+    if not isinstance(value, str):
+        return ""
+    text = " ".join(value.split())
+    text = "".join(c for c in text if not unicodedata.category(c).startswith("C"))
+    return " ".join(text.split())
+
+
+def _hold_locked(safe: str, seconds: int | None, reason: str):
     from sessions import SessionRegistry
     registry = SessionRegistry(WOLTS_DIR)
     data = registry.get(safe, check_alive=False)
@@ -938,22 +962,131 @@ def _rest_session_locked(safe: str, expected_digest: str):
         if data is None:
             return JSONResponse({"error": "session not found"}, status_code=404)
         if data.get("status") != "running":
-            return {"ok": True, "status": data.get("status"), "session": safe}
-        # Resting must be reversible: stamp a recoverable id, or refuse.
-        # (we already hold this session's lock, so persist with the raw write)
-        if not claim_resume_id(registry, data, lambda d: registry._write(wolt, safe, d)):
-            return JSONResponse({"error": "session has no conversation to resume; not resting it"}, status_code=409)
-        try:
-            pane = get_runtime().capture(RuntimeHandle.from_record(data), start=None)
-        except Exception:
-            return JSONResponse({"error": "session activity could not be verified"}, status_code=409)
-        current_digest = hashlib.sha256(pane.encode("utf-8")).hexdigest()
-        if current_digest != expected_digest:
-            return JSONResponse({"error": "session became active; rest aborted"}, status_code=409)
-        get_runtime().stop(RuntimeHandle.from_record(data))
+            return JSONResponse({"error": f"session is {data.get('status') or 'not running'}; only a running session can hold"},
+                                status_code=409)
         now = int(time.time())
+        data["hold"] = {"until": None if seconds is None else now + seconds, "reason": reason, "since": now}
+        data["last_activity"] = now  # taking a hold is use
+        registry._write(wolt, safe, data)
+    return {"ok": True, "session": safe, "hold": data["hold"]}
+
+
+def _release_hold_locked(safe: str):
+    from sessions import SessionRegistry
+    registry = SessionRegistry(WOLTS_DIR)
+    data = registry.get(safe, check_alive=False)
+    if data is None:
+        return JSONResponse({"error": "session not found"}, status_code=404)
+    wolt = data.get("wolt", "")
+    with registry._lock(wolt, safe):
+        data = registry.get(safe, wolt=wolt, check_alive=False)
+        if data is None:
+            return JSONResponse({"error": "session not found"}, status_code=404)
+        if "hold" in data:
+            # A raw write: releasing is not use, so an idle session rests on the next sweep.
+            data.pop("hold")
+            registry._write(wolt, safe, data)
+    return {"ok": True, "session": safe, "hold": None}
+
+
+@app.post("/sessions/{session_id}/hold")
+async def hold_session(session_id: str, request: Request):
+    """Keep a running session from resting while a background task runs in it.
+
+    Body: {"seconds": N | null, "reason": "..."}; null holds until released.
+    """
+    safe = sanitize_session(session_id)
+    if not safe or safe != session_id:
+        return JSONResponse({"error": "invalid session id"}, status_code=400)
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return JSONResponse({"error": "JSON object body required"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "JSON object body required"}, status_code=400)
+    if "seconds" not in body:
+        return JSONResponse({"error": "seconds required: a whole number of seconds, or null for forever"}, status_code=400)
+    seconds = body["seconds"]
+    if seconds is not None and (not isinstance(seconds, int) or isinstance(seconds, bool)
+                                or not 0 < seconds <= HOLD_MAX_SECONDS):
+        return JSONResponse({"error": "seconds must be a positive whole number, or null for forever"}, status_code=400)
+    reason = _hold_reason(body.get("reason"))
+    if not reason:
+        return JSONResponse({"error": "reason required: name the task that is running"}, status_code=400)
+    if len(reason) > _HOLD_REASON_MAX:
+        return JSONResponse({"error": f"reason must be {_HOLD_REASON_MAX} characters or fewer"}, status_code=400)
+    return await asyncio.to_thread(_hold_locked, safe, seconds, reason)
+
+
+@app.delete("/sessions/{session_id}/hold")
+async def release_hold(session_id: str):
+    """Drop a session's hold. It rests at the next sweep only if nobody is using it."""
+    safe = sanitize_session(session_id)
+    if not safe or safe != session_id:
+        return JSONResponse({"error": "invalid session id"}, status_code=400)
+    return await asyncio.to_thread(_release_hold_locked, safe)
+
+
+@app.post("/sessions/{session_id}/message")
+async def session_message(session_id: str, request: Request):
+    """Deliver to a running session, or resume a resting one on contact."""
+    safe = sanitize_session(session_id)
+    body = await request.json()
+    text = body.get("text")
+    if not text:
+        return JSONResponse({"error": "text required"}, status_code=400)
+    return await _deliver_or_resume(safe, text, body)
+
+
+def _rest_session_locked(safe: str, idle_since: int):
+    """Verify and stop one idle session without blocking the server event loop.
+
+    The authority judges the rule itself, under the session lock: the session
+    is running, can come back, holds nothing, and nobody has used it since
+    idle_since or for the whole window.
+    """
+    from sessions import SessionRegistry, stamp_resume_id
+    registry = SessionRegistry(WOLTS_DIR)
+    data = registry.get(safe, check_alive=False)
+    if data is None:
+        return JSONResponse({"error": "session not found"}, status_code=404)
+    wolt = data.get("wolt", "")
+    # Resting must be reversible: recover a missing id first. Before the session
+    # lock, never inside it: claim_resume_id holds the lodge-wide recovery lock,
+    # which resume_session and the id poller take before the session lock.
+    if data.get("status") == "running" and not stored_resume_id(data):
+        claim_resume_id(registry, data, lambda d: stamp_resume_id(
+            registry, wolt, safe, d["harness_session_id"]))
+    with registry._lock(wolt, safe):
+        data = registry.get(safe, wolt=wolt, check_alive=False)
+        if data is None:
+            return JSONResponse({"error": "session not found"}, status_code=404)
+        if data.get("status") != "running":
+            return {"ok": True, "status": data.get("status"), "session": safe}
+        if not stored_resume_id(data):
+            return JSONResponse({"error": "session has no conversation to resume; not resting it"}, status_code=409)
+        now = int(time.time())
+        if hold_active(data, now):
+            return JSONResponse({"error": "session is held; not resting it"}, status_code=409)
+        try:
+            used = last_use(data, get_runtime().last_keys())
+        except Exception:
+            used = None
+        if used is None:
+            return JSONResponse({"error": "session activity could not be verified"}, status_code=409)
+        if used > idle_since:
+            return JSONResponse({"error": "session was used since; rest aborted"}, status_code=409)
+        # The authority judges the quiet window itself, never the caller. This
+        # also closes the same-second gap: use in the second the vulture
+        # looked is "now", far inside any window.
+        timeout = get_idle_timeout()
+        if timeout is None or now - used < timeout:
+            return JSONResponse({"error": "session is not idle long enough; rest aborted"}, status_code=409)
+        if not get_runtime().stop(RuntimeHandle.from_record(data)):
+            return JSONResponse({"error": "session could not be stopped; still running"}, status_code=409)
         data["status"] = "resting"
         data["rested_at"] = now
+        data["rest_reason"] = "idle"
         registry._write(wolt, safe, data)
         return {"ok": True, "status": "resting", "session": safe, "rested_at": now}
 
@@ -968,10 +1101,12 @@ async def rest_session(session_id: str, request: Request):
         body = await request.json()
     except Exception:
         return JSONResponse({"error": "JSON object body required"}, status_code=400)
-    expected_digest = body.get("pane_digest") if isinstance(body, dict) else None
-    if not isinstance(expected_digest, str) or len(expected_digest) != 64:
-        return JSONResponse({"error": "pane_digest required"}, status_code=400)
-    return await asyncio.to_thread(_rest_session_locked, safe, expected_digest)
+    # The last use the caller judged idle; a newer one aborts.
+    idle_since = body.get("idle_since") if isinstance(body, dict) else None
+    if (not isinstance(idle_since, int) or isinstance(idle_since, bool)
+            or not 0 < idle_since <= time.time()):
+        return JSONResponse({"error": "idle_since required"}, status_code=400)
+    return await asyncio.to_thread(_rest_session_locked, safe, idle_since)
 
 
 @app.post("/wolts/{name}/message")
@@ -1139,6 +1274,7 @@ async def session_new_lodge(request: Request):
         )
         # Site auto-start + viewport URL handled by start_session()
         print(f"[sessions/lodge] spawned {result['name']} for {wolt}")
+        await asyncio.to_thread(_touch_origin, body.get("from_session", "") or "")
         return result
     except PermissionError as e:
         return JSONResponse({"error": str(e)}, status_code=403)
@@ -1217,6 +1353,24 @@ async def session_new_slack(request: Request):
 
 # --- Sessions list ---
 
+def _show_hold(session: dict, now: int) -> bool:
+    """Leave only a hold in force on a session row; one that has ended waits
+    for the next write to drop it. Returns whether the session holds."""
+    held = hold_active(session, now)
+    hold = session.pop("hold", None)
+    if held:
+        session["hold"] = public_hold(hold)
+    return held
+
+
+def _last_keys() -> dict[str, int]:
+    """tmux's last client input per session; empty when tmux cannot say."""
+    try:
+        return get_runtime().last_keys()
+    except Exception:
+        return {}
+
+
 @app.get("/sessions")
 async def list_sessions(view: str = ""):
     from sessions import SessionRegistry
@@ -1227,14 +1381,19 @@ async def list_sessions(view: str = ""):
     else:
         sessions = reg.list()
     timeout = get_idle_timeout()
-    observations = get_pane_activity() if timeout is not None else {}
+    keys = await asyncio.to_thread(_last_keys) if timeout is not None else {}
     now = int(time.time())
     for session in sessions:
         session["idle_timeout_seconds"] = timeout
-        observed = observations.get(session.get("name", ""), {}).get("unchanged_since")
-        if timeout is not None and isinstance(observed, int) and session.get("status") == "running":
-            session["idle_seconds"] = max(0, now - observed)
-            session["closes_in_seconds"] = max(0, timeout - session["idle_seconds"])
+        held = _show_hold(session, now)
+        if session.get("status") != "running":
+            continue
+        used = last_use(session, keys)
+        if timeout is not None and used is not None:
+            session["idle_seconds"] = max(0, now - used)
+            # A held session does not close; it rests only after its hold ends.
+            if not held:
+                session["closes_in_seconds"] = max(0, timeout - session["idle_seconds"])
     sessions.sort(key=lambda s: (0 if s.get("status") == "running" else 1, -(s.get("created_at") or 0)))
     return payload if view == "lodge" else sessions
 
@@ -1251,6 +1410,7 @@ async def get_session(name: str):
     )
     if session is None:
         return JSONResponse({"error": "not found"}, status_code=404)
+    _show_hold(session, int(time.time()))
     return session
 
 

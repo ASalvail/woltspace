@@ -53,6 +53,7 @@ from harnesses import (
 )
 from skills_sync import wolt_skills_delivery
 from sites import ensure_site
+from session_expiry import hold_active, public_hold
 from session_runtime import RuntimeHandle, get_runtime
 from session_targets import SessionTarget, normalize_session_target
 from execution_policy import (
@@ -120,6 +121,9 @@ def _read_lodge_record(path: Path, wolt: str) -> dict | None:
     for field in ("title", "summary"):
         if raw.get(field):
             record[field] = raw[field]
+    # Only a hold in force; one that ends while cached is dropped by the route.
+    if hold_active(raw, int(time.time())):
+        record["hold"] = public_hold(raw["hold"])
     record["openable"] = bool(
         raw.get("harness_session_id") or raw.get("claude_session_id")
     )
@@ -230,6 +234,11 @@ class SessionRegistry:
         # lies to whoever reads it next.
         if normalized.get("status") != "orphaned":
             normalized.pop("orphaned_reason", None)
+        # Same rule for a hold: it covered a task running in this session, and
+        # that task died with it. Every write that leaves running (rest, death,
+        # stop, finish, orphaned) drops it, so a woken session never inherits one.
+        if normalized.get("status") != "running":
+            normalized.pop("hold", None)
         tmp.write_text(json.dumps(normalized, indent=2) + "\n")
         tmp.rename(path)
 
@@ -409,16 +418,21 @@ class SessionRegistry:
         return data
 
     def touch(self, name: str, *, wolt: str = None) -> bool:
-        """Bump last_activity timestamp. Returns True if session exists."""
+        """Stamp last_activity on a running session. Returns True if stamped.
+
+        Under the session lock, and only while running: a touch racing a rest
+        must never write running back over resting while tmux is gone.
+        """
         if not wolt:
             wolt = self._find_wolt(name)
         if not wolt:
             return False
-        data = self._read(wolt, name)
-        if data is None:
-            return False
-        data["last_activity"] = int(time.time())
-        self._write(wolt, name, data)
+        with self._lock(wolt, name):
+            data = self._read(wolt, name)
+            if data is None or data.get("status") != "running":
+                return False
+            data["last_activity"] = int(time.time())
+            self._write(wolt, name, data)
         return True
 
     def finish(self, name: str, exit_code: int, *, wolt: str = None) -> dict | None:
@@ -1435,6 +1449,21 @@ def claim_resume_id(registry: "SessionRegistry", data: dict, write) -> str:
     return recovered
 
 
+def stamp_resume_id(registry: "SessionRegistry", wolt: str, name: str, resume_id: str) -> None:
+    """Persist a recovered conversation id and nothing else.
+
+    A raw write under the session lock, never update(): update() stamps
+    last_activity, and a recovered id is not use. Call it outside the session
+    lock (claim_resume_id's write callback runs under the recovery lock, which
+    is always taken first).
+    """
+    with registry._lock(wolt, name):
+        current = registry._read(wolt, name)
+        if current is not None and not stored_resume_id(current):
+            current["harness_session_id"] = resume_id
+            registry._write(wolt, name, current)
+
+
 def recover_resume_id(data: dict, taken: set[str]) -> str:
     """The stored id, or one recovered from the harness's own files, or "".
 
@@ -1852,6 +1881,34 @@ def start_session(
 # Session resume — shared entry point for bot + API
 # ---------------------------------------------------------------------------
 
+def _paste_into_live_agent(registry: "SessionRegistry", wolt: str, name: str,
+                           seen_status: str, harness: str, prompt: str) -> bool:
+    """Deliver a resume prompt to the agent found running, under the session lock.
+
+    The look that found the agent was not locked. A rest takes this lock, stops
+    the runtime and writes `resting`; a paste after that sends the message into
+    a dead pane and writes `running` over a stopped session. So re-read under
+    the lock and paste only while the record still has the status we saw and
+    the agent is still there (the shape deliver_message has). False when the
+    session changed under us: the caller wakes it instead.
+    """
+    with registry._lock(wolt, name):
+        current = registry._read(wolt, name)
+        if current is None or current.get("status") != seen_status:
+            return False
+        target = resolve_agent_handle(current, harness, include_launching=False)
+        if target is None:
+            return False
+        if prompt:
+            _tmux_paste(target, _guard_paste_text(harness, prompt),
+                        settle=get_harness(harness).get("paste_settle", 0.0))
+        current["status"] = "running"
+        current["runtime"] = target.to_record()
+        current["last_activity"] = int(time.time())  # a message is use
+        registry._write(wolt, name, current)
+    return True
+
+
 def resume_session(name: str, prompt: str = "") -> dict:
     """Resume an existing Claude Code session.
 
@@ -1915,26 +1972,42 @@ def resume_session(name: str, prompt: str = "") -> dict:
         # deliver_message path, which preserves newlines for paste-aware TUIs so
         # the multi-line attributed message renders intact — hence the flatten
         # lives at the call site, not in _guard_paste_text.
-        if prompt:
-            ready = _await_input_ready(target, harness)
-            if ready is None:
-                raise ResumeFailed(
-                    f"session '{name}': the {harness} agent is still booting — it "
-                    f"was not taking input after {INPUT_READY_TIMEOUT}s, so the "
-                    f"message was not sent"
-                )
-            target = ready
-            _tmux_paste(target, _guard_paste_text(harness, prompt.replace("\n", " ")),
-                        settle=get_harness(harness).get("paste_settle", 0.0))
-        registry.update(
-            name,
-            wolt=wolt,
-            status="running",
-            runtime=target.to_record(),
-        )
-        detail = ("agent booting, nothing to send" if booting and not prompt
-                  else "agent running, message sent")
-        return {"name": name, "url": session_url, "status": "delivered", "detail": detail}
+        if booting and not prompt:
+            # Nothing to paste, and nothing to relaunch: the agent is on its way.
+            registry.update(name, wolt=wolt, status="running", runtime=target.to_record())
+            return {"name": name, "url": session_url, "status": "delivered",
+                    "detail": "agent booting, nothing to send"}
+        # Wait for the agent to take input before the session lock, never under
+        # it: the wait can run INPUT_READY_TIMEOUT, and a rest takes the same
+        # lock. _paste_into_live_agent finds the pane again under the lock.
+        if prompt and _await_input_ready(target, harness) is None:
+            raise ResumeFailed(
+                f"session '{name}': the {harness} agent is still booting — it "
+                f"was not taking input after {INPUT_READY_TIMEOUT}s, so the "
+                f"message was not sent"
+            )
+        if _paste_into_live_agent(registry, wolt, name, data.get("status"), harness,
+                                  prompt.replace("\n", " ")):
+            return {"name": name, "url": session_url, "status": "delivered",
+                    "detail": "agent running, message sent"}
+        # A rest (or a stop) took the lock between our look and the paste and
+        # stopped the runtime. Look again, and wake the session the way a
+        # resting one wakes: the message goes in as the resume prompt. If the
+        # pane has an agent again, or a launching one (someone else woke it in
+        # the meantime), leave it alone: relaunching would paste the resume
+        # command into an agent that is booting.
+        data = registry.get(name, wolt=wolt, check_alive=False)
+        if data is None:
+            raise ValueError(f"session '{name}' not found in registry")
+        tmux_alive = _tmux_alive(data)
+        target = _runtime_handle(data)
+        agent_running = False
+        if tmux_alive and resolve_agent_handle(data, harness, include_launching=True) is not None:
+            raise ResumeFailed(
+                f"session '{name}' changed while the message was on its way "
+                f"(now {data.get('status')!r} with its agent running or "
+                f"booting); nothing was sent — retry"
+            )
 
     # A record whose workdir does not exist on this host was written by a
     # different runtime (container vs native share a migrated data root).
