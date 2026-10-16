@@ -224,10 +224,25 @@ async def test_text_past_the_speech_limit_is_refused_and_the_limit_itself_is_spo
 
 
 @pytest.mark.asyncio
-async def test_a_speech_failure_sends_nothing_and_leaves_nothing(lodge):
-    lodge.speech_error = notify.SpeechError("speech_failed", "the speech service answered HTTP 429")
+async def test_a_speech_failure_still_sends_the_words_as_text(lodge):
+    """The service failing (after its retry) must not cost the human the message."""
+    lodge.speech_error = notify.SpeechError("speech_failed", "could not reach the speech service: ReadTimeout")
 
-    with pytest.raises(notify.SpeechError, match="HTTP 429"):
+    result = await notify.send_notification("test-session", "hi\n", None, (), WORDS)
+
+    (sent,) = lodge.sent
+    assert sent.message.attachments == ()
+    assert sent.message.text == "hi\n\n(voice note failed; sent as text)"
+    assert result["speech_failed"] == "could not reach the speech service: ReadTimeout"
+    assert "attachments" not in result
+    assert _left_in_the_outbox(lodge) == []
+
+
+@pytest.mark.asyncio
+async def test_a_speech_refusal_other_than_failure_still_sends_nothing(lodge):
+    lodge.speech_error = notify.SpeechError("speech_too_large", "the spoken audio is over 5 bytes")
+
+    with pytest.raises(notify.SpeechError, match="over 5 bytes"):
         await notify.send_notification("test-session", "hi\n", None, (), WORDS)
 
     assert lodge.sent == []

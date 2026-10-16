@@ -7,8 +7,10 @@ from pathlib import Path
 import httpx
 
 SPEECH_URL = "https://api.openai.com/v1/audio/speech"
-# The first byte of audio can take a while for a long text.
-SPEECH_TIMEOUT = httpx.Timeout(30.0, read=120.0)
+# A healthy answer starts within seconds; a stalled one is retried rather than
+# waited on, and two tries stay well inside a caller's two-minute patience.
+SPEECH_TIMEOUT = httpx.Timeout(30.0, read=30.0)
+SPEECH_ATTEMPTS = 2
 DEFAULT_SPEECH_MODEL = "gpt-4o-mini-tts"
 DEFAULT_SPEECH_VOICE = "alloy"
 # For each format a sender may declare: the name the audio travels under, and its type.
@@ -22,9 +24,11 @@ _MAX_DETAIL_CHARS = 200
 class SpeechError(RuntimeError):
     """The text could not be turned into audio. `reason` is machine-readable."""
 
-    def __init__(self, reason: str, message: str):
+    def __init__(self, reason: str, message: str, *, transient: bool = False):
         super().__init__(message)
         self.reason = reason
+        # The service stalled or dropped the line; the same request may well work again.
+        self.transient = transient
 
 
 def write_failure(exc: OSError) -> RuntimeError:
@@ -77,7 +81,24 @@ async def synthesize(
     A failure leaves no file behind, and a file already at `target` is left alone.
     `max_bytes` stops the download as soon as the audio outgrows what the
     sender can carry, instead of measuring it once it is all on disk.
+    A stalled or dropped request is tried once more before it fails.
     """
+    for attempt in range(1, SPEECH_ATTEMPTS + 1):
+        try:
+            return await _synthesize_once(
+                text, speech_format, target, api_key=api_key, model=model, voice=voice,
+                max_bytes=max_bytes,
+            )
+        except SpeechError as exc:
+            if not exc.transient or attempt == SPEECH_ATTEMPTS:
+                raise
+    raise AssertionError("unreachable")
+
+
+async def _synthesize_once(
+    text: str, speech_format: str, target: Path, *, api_key: str, model: str, voice: str,
+    max_bytes: int | None = None,
+) -> int:
     if speech_format not in SPEECH_FILES:
         raise SpeechError("speech_failed", f"unknown speech format: {speech_format}")
     size, head, created, complete = 0, b"", False, False
@@ -96,6 +117,7 @@ async def synthesize(
                     raise SpeechError(
                         "speech_failed",
                         _refusal(response.status_code, await response.aread(), api_key),
+                        transient=response.status_code >= 500,
                     )
                 descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 created = True
@@ -119,6 +141,7 @@ async def synthesize(
     except httpx.HTTPError as exc:
         raise SpeechError(
             "speech_failed", f"could not reach the speech service: {type(exc).__name__}",
+            transient=True,
         ) from None
     except OSError as exc:
         raise write_failure(exc) from None

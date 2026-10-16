@@ -291,6 +291,15 @@ def main(argv: list[str] | None = None) -> int:
         print("notify: failed: invalid or empty API response", file=sys.stderr)
         return 1
     if result.get("ok"):
+        if kind == "speak" and result.get("speech_failed"):
+            # The lodge could not make the audio and sent the words as text instead.
+            print(f"[notify] → {result.get('adapter', '?')}: {message} [sent as text]")
+            print(
+                f"notify: the voice note failed ({result['speech_failed']}); "
+                "the lodge sent the text instead",
+                file=sys.stderr,
+            )
+            return 0
         problem = _not_as_asked(kind, result.get("attachments"))
         if problem:
             unstage()

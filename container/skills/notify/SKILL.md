@@ -119,8 +119,12 @@ technical as text.
   flags go before or after the route flags.
 - Like a file, a voice note and a spoken message go only to the lodge's own
   chats. Another chat gets text only, and nothing is spoken for it.
+- If the speech service fails (the lodge tries it twice), the lodge sends your
+  words as text with a short "voice note failed" line, and `notify` says
+  `the lodge sent the text instead`. The user has your words; do not send them
+  again.
 - If it fails, send the same message again as text. The error says why: no
-  `OPENAI_API_KEY` in the lodge's `.env`, the speech service refused, or the
+  `OPENAI_API_KEY` in the lodge's `.env`, the audio was too large, or the
   user has voice messages blocked. If it says the text was delivered, the user
   already has your words; do not send them twice.
 - Each `--speak` is one OpenAI API request, billed to the lodge's key, and the

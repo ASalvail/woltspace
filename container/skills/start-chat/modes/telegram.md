@@ -30,7 +30,7 @@ and reads well aloud, add `--speak` to the same notify command. The lodge reads
 your message aloud and sends it as a voice note, with the text as its caption.
 Write it for the ear: plain sentences, no markdown, no lists, no code, no paths
 or links. Send anything long or technical as text. If `--speak` fails, send the
-same message without it.
+same message without it, unless notify says the lodge already sent the text.
 
 **When you start**: one-liner ack. "on it — reviewing the loop" or "got it, digging in."
 

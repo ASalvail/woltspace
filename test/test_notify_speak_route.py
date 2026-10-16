@@ -65,7 +65,8 @@ def test_speech_errors_answer_with_their_reason(monkeypatch, capsys, reason, sta
         "ok": False, "error": "the speech service answered HTTP 429", "reason": reason,
     }
     log.assert_not_called()
-    assert "[notify] speech failed: the speech service answered HTTP 429" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "speech failed: session=s: the speech service answered HTTP 429" in out
 
 
 @pytest.mark.parametrize("reason", ["speak_invalid", "speak_too_long", "speech_unsupported"])

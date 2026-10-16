@@ -7,6 +7,7 @@ Falls back to session registry lookup, then Telegram default.
 import json
 import logging
 import mimetypes
+import time
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
@@ -305,10 +306,23 @@ async def _send(
             "one of them; send it to your own chat, or send text only",
         )
 
+    speech_failure = None
     if speech is not None:
         # Only now that there is somewhere to send it: every spoken message is
         # an OpenAI request billed to the lodge's key, and its words leave the lodge.
-        attachments = (await _spoken(speech, sender, adapter),)
+        try:
+            attachments = (await _spoken(speech, sender, adapter),)
+        except SpeechError as exc:
+            if exc.reason != "speech_failed":
+                raise
+            # The service failed even after a retry. The words still reach the
+            # human, as text, rather than nothing at all.
+            speech_failure = str(exc)
+            print(
+                f"[notify] {time.strftime('%Y-%m-%dT%H:%M:%S%z')} speech failed, "
+                f"sending text instead: session={session or '-'} {adapter}={chat_id}: {exc}"
+            )
+            message = f"{message.rstrip()}\n\n(voice note failed; sent as text)"
 
     for attachment in attachments:
         if sender.max_attachment_bytes == 0:
@@ -351,6 +365,8 @@ async def _send(
             | ({"kind": "voice"} if a.kind == "voice" else {})
             for a in attachments
         ]
+    if speech_failure:
+        result["speech_failed"] = speech_failure
     return result
 
 
