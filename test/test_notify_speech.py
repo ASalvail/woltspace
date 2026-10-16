@@ -289,3 +289,16 @@ async def test_a_refusal_is_not_retried(monkeypatch, tmp_path):
 def test_a_stall_is_cut_off_well_inside_a_two_minute_caller():
     """Two tries at the read timeout must finish before the CLI's own two minutes."""
     assert speech.SPEECH_TIMEOUT.read * speech.SPEECH_ATTEMPTS < 120
+
+
+@pytest.mark.asyncio
+async def test_a_retry_after_partial_audio_writes_a_clean_file(monkeypatch, tmp_path):
+    """The first try writes some audio and drops; the second must not trip over
+    the leftover or append to it."""
+    answers = [httpx.Response(200, stream=_CutShort()), httpx.Response(200, content=OGG + b"tail")]
+    service = _Service(monkeypatch, lambda: answers.pop(0))
+    target = tmp_path / ("c" * 32)
+
+    assert await synthesize("hello", "opus", target, **SETTINGS) == len(OGG) + 4
+    assert target.read_bytes() == OGG + b"tail"
+    assert len(service.requests) == 2
