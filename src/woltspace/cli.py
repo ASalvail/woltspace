@@ -240,7 +240,10 @@ def _session(args) -> int:
         print(f"bundled session client not found: {client}", file=sys.stderr)
         return 2
     os.environ.setdefault("WOLTSPACE_API", layout.endpoint)
-    os.execv(str(client), [str(client), "session", *args.session_args])
+    # The bundled client uses an env-based woltspace-python shebang, but a
+    # native terminal need not have the bundle bin directory on PATH. Reuse
+    # the interpreter running this CLI instead of rediscovering one.
+    os.execv(sys.executable, [sys.executable, str(client), "session", *args.session_args])
     return 0
 
 
