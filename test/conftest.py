@@ -10,7 +10,13 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "container" / "lib"))
+# The platform modules. Put on sys.path only when missing: tests hand
+# os.pathsep.join(sys.path) to child processes as PYTHONPATH, and an insert on
+# every fixture use grew that one variable past the kernel's 128 KiB limit for
+# a single string (E2BIG).
+LIB_DIR = str(Path(__file__).resolve().parent.parent / "container" / "lib")
+if LIB_DIR not in sys.path:
+    sys.path.insert(0, LIB_DIR)
 from env_compat import get_env  # noqa: E402
 
 
@@ -155,7 +161,8 @@ def claude_trust_home(tmp_path_factory, monkeypatch):
     can read the file back.
     """
     import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "container" / "lib"))
+    if LIB_DIR not in sys.path:
+        sys.path.insert(0, LIB_DIR)
     import trust
 
     home = tmp_path_factory.mktemp("claude-home")
@@ -230,7 +237,8 @@ def tmux_session():
 def tmp_registry(tmp_path):
     """Create a temporary session registry with a temp wolts_dir."""
     import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "container" / "lib"))
+    if LIB_DIR not in sys.path:
+        sys.path.insert(0, LIB_DIR)
     from sessions import SessionRegistry
     # Per-wolt model: registry uses WOLTS_DIR as root, sessions land in
     # wolts_dir/{wolt}/.state/sessions/{name}.json
@@ -325,7 +333,8 @@ def routed_test_session(test_chat_id, shadow_wolt):
     Ensures notify probes go to the test group, never the main chat.
     """
     import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "container" / "lib"))
+    if LIB_DIR not in sys.path:
+        sys.path.insert(0, LIB_DIR)
     from sessions import SessionRegistry
 
     wolts_dir = Path(get_env("WOLTSPACE_WOLTS_DIR", "/workspace/wolts"))
@@ -537,7 +546,8 @@ def agent_comes_up(monkeypatch):
     itself is covered by TestResumeVerification in test_session_resume.py.
     """
     import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "container" / "lib"))
+    if LIB_DIR not in sys.path:
+        sys.path.insert(0, LIB_DIR)
     import sessions
 
     seen: list[tuple] = []
@@ -560,7 +570,8 @@ def fake_runtime(monkeypatch):
     walk in the same call.
     """
     import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "container" / "lib"))
+    if LIB_DIR not in sys.path:
+        sys.path.insert(0, LIB_DIR)
     import session_runtime
 
     runtime = FakeSessionRuntime(panes=[("%1", "100", True)], agents={"%1"})
@@ -591,7 +602,8 @@ class LiveSessionRuntime(FakeSessionRuntime):
 @pytest.fixture
 def live_runtime():
     import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "container" / "lib"))
+    if LIB_DIR not in sys.path:
+        sys.path.insert(0, LIB_DIR)
     import session_runtime
 
     runtime = LiveSessionRuntime()
