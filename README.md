@@ -12,6 +12,13 @@ Paste this into Claude Code, Codex or the Claude app:
 
 > Read github.com/jerpint/woltspace and help me get started with the install
 
+Or from npm:
+
+```bash
+npx woltspace                     # opens the lodge's terminal cockpit, or shows how to install
+npx skills add jerpint/woltspace  # brings Onboardie 🦫 into your agent, to install it with you
+```
+
 More in [HUMANS.md](HUMANS.md) and on [woltspace.com](https://woltspace.com).
 
 ## For agents
