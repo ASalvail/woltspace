@@ -5,6 +5,10 @@ description: Push a message, a file or a voice note back to the user on Telegram
 
 # Notify — Push Messages to the User
 
+WhatsApp is available through the official Agent Platform for text-only
+messages. Use `notify --whatsapp 'user:<digits>'` with the exact participant
+identifier from a recent inbound message. Files and audio are unsupported.
+
 Sessions can send messages back to the user at any time. Use this when you finish something worth reporting, hit a blocker that needs input, or find something the user should know about mid-task.
 
 ## Usage
