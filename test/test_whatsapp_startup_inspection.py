@@ -73,6 +73,8 @@ def test_real_prepare_scopes_directory_trust_and_keeps_prompt_policy(
         adapter="whatsapp", chat_id=startup.PARTICIPANT, whatsapp_account=startup.ACCOUNT,
     )
     command = sessions.prepare_session_command("synthetic-startup", "spawn", startup.PROMPT)
+    import shlex
+    assert startup.PROMPT in shlex.split(command)[-1]
     assert "--dangerously-bypass-approvals-and-sandbox" not in command
     config = private_codex / "config.toml"
     if directory_trust == "preserve":
@@ -136,8 +138,65 @@ def test_startup_capture_uses_visible_frame_without_scrollback(monkeypatch):
     assert "-S" not in calls[0]
 
 
+def test_snapshot_redacts_credentials_but_retains_synthetic_ui():
+    from scripts import whatsapp_startup_inspection as startup
+    text = '''Synthetic UI: model connection failed; press Enter to retry.
+WHATSAPP_AGENT_KEY=short-private-key
+"access_token": "short-private-token", "refresh_token": "private-refresh"
+Authorization: Bearer private-bearer
+Bearer bare-bearer-value
+eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature
+sk-proj-privateexample123456789
+user_code=ABCD-EFGH
+-----BEGIN PRIVATE KEY-----
+private-pem-content
+-----END PRIVATE KEY-----
+'''
+    clean = startup._redact_pane(text)
+    assert "Synthetic UI: model connection failed" in clean
+    for value in ("short-private-key", "short-private-token", "private-refresh",
+                  "private-bearer", "bare-bearer-value", "eyJhbGci", "sk-proj-",
+                  "ABCD-EFGH", "private-pem-content"):
+        assert value not in clean
+    assert len(startup._redact_pane("x" * 20000).encode()) <= 8192
+
+
+def test_snapshot_targets_only_verified_exact_pane(monkeypatch, tmp_path):
+    from scripts import whatsapp_startup_inspection as startup
+    record = {"status": "failed", "exit_code": 2, "harness_session_id": "synthetic-id",
+              "runtime": {"pane_id": "%7", "tmux_session_name": "synthetic-session"}}
+    monkeypatch.setattr(startup.model, "_record_for_test", lambda *_: record)
+    monkeypatch.setattr(startup, "_verify_record", lambda *_: True)
+    calls = []
+    def tmux(_env, *args):
+        calls.append(args)
+        return (0, "%7", "") if args[0] == "list-panes" else (
+            0, "Synthetic model UI\nAPI_KEY=private-test-value", "",
+        )
+    monkeypatch.setattr(startup.model, "_tmux_value", tmux)
+    boot_log = tmp_path / ".space/logs/session-boot.log"
+    boot_log.parent.mkdir(parents=True)
+    boot_log.write_text("[synthetic-time] spawn session: synthetic\n"
+                        "[synthetic-time] deliver-prompt synthetic: False\n"
+                        "raw-synthetic-exception must not leave the parser\n")
+    snapshot = startup._capture_snapshot("synthetic", tmp_path, {}, tmp_path, "normal", None)
+    assert calls == [("list-panes", "-t", "synthetic-session", "-F", "#{pane_id}"),
+                     ("capture-pane", "-p", "-t", "%7")]
+    assert snapshot["pane_status"] == "captured"
+    assert snapshot["harness_exit_code"] == 2
+    assert snapshot["harness_rollout_observed"] is True
+    assert snapshot["wrapper_started"] is True
+    assert snapshot["deferred_prompt_hook_ran"] is True
+    assert "raw-synthetic-exception" not in str(snapshot)
+    assert "private-test-value" not in str(snapshot)
+    monkeypatch.setattr(startup, "_verify_record", lambda *_: False)
+    calls.clear()
+    assert startup._capture_snapshot("synthetic", tmp_path, {}, tmp_path, "normal", None)["pane_status"] == "unavailable"
+    assert calls == []
+
+
 @pytest.mark.parametrize("scenario", [
-    "success", "normal_success", "wrong_payload", "timeout", "trust_prompt", "spawn_failure", "cleanup_failure",
+    "success", "normal_success", "snapshot_success", "snapshot_timeout", "wrong_payload", "timeout", "trust_prompt", "spawn_failure", "cleanup_failure",
 ])
 def test_full_offline_startup_orchestration(tmp_path, scenario):
     # Fresh interpreter ensures real server/session imports bind to only the
@@ -167,6 +226,8 @@ model._verify_private_tmux = lambda *_: None
 model._harness_process_status = lambda *_: True
 model._harness_readiness_status = lambda *_: "unsupported"
 model._capture_boot_symptom = lambda *_, **__: "trust_or_approval" if scenario == "trust_prompt" else "none_detected"
+model._tmux_value = lambda env, *args: (0, "%1", "") if args[0] == "list-panes" else (
+    0, "Synthetic model UI is waiting\nAPI_KEY=private-snapshot-value", "")
 real_cleanup = model._cleanup_resources
 def cleanup(*args):
     return real_cleanup(*args, stop_session_fn=lambda _: {"status": "stopped"},
@@ -191,13 +252,15 @@ def fake_start():
     registry.update(record["name"], wolt="wa-test", runtime={
         "kind": "tmux", "tmux_session_name": "synthetic", "pane_id": "%1",
     })
-    if scenario not in {"timeout", "trust_prompt"}:
+    if scenario not in {"timeout", "snapshot_timeout", "trust_prompt"}:
         def cli():
             env = dict(os.environ)
             env["WOLTSPACE_WOLT_SESSION"] = record["name"]
+            from session_runtime import _session_env_value
+            env["PATH"] = _session_env_value("PATH", env["PATH"])
             message = "wrong-synthetic-body" if scenario == "wrong_payload" else startup.BODY
             result = subprocess.run(
-                [sys.executable, str(startup.ROOT / "container/bin/notify"),
+                [str(startup.ROOT / "container/bin/notify"),
                  "--whatsapp", startup.PARTICIPANT], input=message,
                 env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, timeout=10,
@@ -213,8 +276,9 @@ with tempfile.TemporaryDirectory(prefix=".wsi-offline-", dir=startup.ROOT.parent
     model.PRIVATE_TMUX_BASE = Path(sockets)
     try:
         result = model._run_model_test("codex", diag, startup_runner=lambda *args:
-            startup._run_startup_session(*args, timeout_seconds=1 if scenario == "timeout" else 5,
-                directory_trust="normal" if scenario == "normal_success" else "preserve"))
+            startup._run_startup_session(*args, timeout_seconds=1 if scenario in {"timeout", "snapshot_timeout"} else 5,
+                directory_trust="normal" if scenario == "normal_success" else "preserve",
+                capture_snapshot=scenario.startswith("snapshot_")))
     except Exception:
         result = 2
     for thread in cli_threads:
@@ -223,13 +287,14 @@ with tempfile.TemporaryDirectory(prefix=".wsi-offline-", dir=startup.ROOT.parent
 record = diag.as_record()
 assert model._valid_diagnostic_record(record)
 assert "bot.whatsapp_adapter" not in sys.modules
-if scenario in {"success", "normal_success"}:
+if scenario in {"success", "normal_success", "snapshot_success"}:
     assert result == 0
     assert record["notify_attempt"] == "sent"
     assert record["checks"]["notify"] == "passed"
     assert record["checks"]["cleanup"] == "passed"
     assert cli_results == [0]
-    assert not list(private.glob("startup-*"))
+    if scenario != "snapshot_success":
+        assert not list(private.glob("startup-*"))
 elif scenario == "cleanup_failure":
     assert result == 2 and record["category"] == "cleanup_failed"
     assert record["notify_attempt"] == "sent"
@@ -238,19 +303,33 @@ else:
     assert result == 2
     assert record["category"] == {
         "wrong_payload": "notify_rejected", "timeout": "run_timeout",
+        "snapshot_timeout": "run_timeout",
         "trust_prompt": "trust_or_approval_prompt",
         "spawn_failure": "session_not_started",
     }[scenario]
     assert record["checks"]["notify"] != "passed"
     assert record["notify_attempt"] == ("rejected" if scenario == "wrong_payload" else "not_seen")
     assert record["checks"]["cleanup"] == "passed"
-if scenario not in {"success", "normal_success"}:
+if scenario not in {"success", "normal_success", "snapshot_success"}:
     paths = list(private.glob("startup-*/failure.json"))
     assert len(paths) == 1
     data = json.loads(paths[0].read_text())
     assert model._valid_diagnostic_record(data)
     assert all(term not in str(data) for term in (startup.PARTICIPANT, startup.BODY, startup.PROMPT))
     assert not list(paths[0].parent.rglob("*.log"))
+if scenario.startswith("snapshot_"):
+    snapshots = list(private.glob("startup-*/startup-snapshot.json"))
+    assert len(snapshots) == 1
+    snapshot = json.loads(snapshots[0].read_text())
+    assert snapshot["pane_status"] == "captured"
+    assert "Synthetic model UI" in snapshot["pane_text"]
+    assert "private-snapshot-value" not in str(snapshot)
+    assert snapshot["notify_requests"] == (1 if scenario == "snapshot_success" else 0)
+    assert snapshot["notify_last_status"] == (200 if scenario == "snapshot_success" else None)
+    assert snapshots[0].stat().st_mode & 0o777 == 0o600
+    assert not list(snapshots[0].parent.rglob("*.log"))
+    assert {p.name for p in snapshots[0].parent.iterdir()} == (
+        {"startup-snapshot.json"} if scenario == "snapshot_success" else {"startup-snapshot.json", "failure.json"})
 print("offline_startup_ok")
 '''
     env = dict(os.environ)

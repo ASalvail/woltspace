@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import json
 import os
+import re
 import sys
 import threading
 import time
@@ -26,6 +28,112 @@ PROMPT = (
     "does not contact WhatsApp. Do nothing else."
 )
 MAX_SECONDS = 180
+SNAPSHOT_NAME = "startup-snapshot.json"
+
+
+def _redact_pane(text):
+    """Redact in memory before retaining bounded synthetic UI text."""
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+    text = re.sub(r"-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----",
+                  "[REDACTED PRIVATE KEY]", text)
+    # Whole-line removal also covers multiple JSON fields and quoted values.
+    text = re.sub(
+        r"(?im)^.*\b(?:[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|KEY|USER_CODE|CREDENTIAL)[A-Z0-9_]*|"
+        r"authorization|api[ _-]?key|private[ _-]?key|device[ _-]?code|login[ _-]?code|"
+        r"verification[ _-]?code)\b\s*[\"']?\s*(?:=|:|\bis\b).*$",
+        "[REDACTED CREDENTIAL LINE]", text,
+    )
+    text = re.sub(r"(?i)\bBearer\s+\S+", "Bearer [REDACTED]", text)
+    text = re.sub(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b", "[REDACTED JWT]", text)
+    text = re.sub(r"\b(?:sk-|gh[pousr]_|github_pat_)[A-Za-z0-9_-]{8,}\b", "[REDACTED KEY]", text)
+    text = re.sub(r"(?i)(https?://)[^\s/@:]+:[^\s/@]+@", r"\1[REDACTED]@", text)
+    text = re.sub(r"[A-Za-z0-9._~+/-]{32,}={0,2}", "[REDACTED OPAQUE VALUE]", text)
+    text = "".join(c for c in text if c.isprintable() or c in "\n\t")
+    return text.encode("utf-8")[:8192].decode("utf-8", errors="ignore")
+
+
+class _NotifyCounter:
+    """Count only /notify request/response metadata, never bodies."""
+    def __init__(self, app):
+        self.app, self.count, self.status = app, 0, None
+        self.lock = threading.Lock()
+
+    async def __call__(self, scope, receive, send):
+        notify = scope.get("type") == "http" and scope.get("path") == "/notify"
+        if notify:
+            with self.lock:
+                self.count += 1
+        async def counted_send(message):
+            if notify and message.get("type") == "http.response.start":
+                with self.lock:
+                    status = message.get("status")
+                    self.status = status if type(status) is int and 100 <= status <= 599 else None
+            await send(message)
+        await self.app(scope, receive, counted_send)
+
+
+def _capture_snapshot(session, wolts_dir, env, tmux_root, directory_trust, counter):
+    """Capture only the registry's verified exact pane before cleanup."""
+    snapshot = {
+        "schema": 1, "directory_trust": directory_trust, "synthetic_prompt": PROMPT,
+        "pane_status": "unavailable", "pane_text": "",
+        "boot_input_delivery": "cli_argument_consumption_unconfirmed",
+        "wrapper_started": False, "deferred_prompt_hook_ran": False,
+        "harness_registry_status": "unknown", "harness_exit_code": None,
+        "harness_rollout_observed": False,
+        "notify_requests": 0, "notify_last_status": None,
+    }
+    if counter is not None:
+        with counter.lock:
+            snapshot["notify_requests"] = min(counter.count, 10000)
+            snapshot["notify_last_status"] = counter.status
+    try:
+        record = model._record_for_test(session, wolts_dir) if session else None
+        if not record:
+            return snapshot
+        status = record.get("status")
+        if status in {"running", "completed", "failed", "stopped", "resting"}:
+            snapshot["harness_registry_status"] = status
+        code = record.get("exit_code")
+        if type(code) is int and -255 <= code <= 255:
+            snapshot["harness_exit_code"] = code
+        snapshot["harness_rollout_observed"] = bool(record.get("harness_session_id"))
+        # Only this private synthetic root's log is inspected, and only fixed
+        # markers for the known session leave memory. No log text is retained.
+        boot_log = wolts_dir / ".space" / "logs" / "session-boot.log"
+        try:
+            if (boot_log.is_file() and not boot_log.is_symlink()
+                    and boot_log.resolve().is_relative_to(wolts_dir.resolve())):
+                with boot_log.open(encoding="utf-8", errors="replace") as source:
+                    markers = source.read(65536)
+                snapshot["wrapper_started"] = f"] spawn session: {session}\n" in markers
+                snapshot["deferred_prompt_hook_ran"] = f"] deliver-prompt {session}:" in markers
+        except OSError:
+            pass
+        if not _verify_record(session, wolts_dir, env, tmux_root):
+            return snapshot
+        runtime = record["runtime"]
+        pane, target = runtime.get("pane_id", ""), runtime.get("tmux_session_name", "")
+        if not re.fullmatch(r"%[0-9]+", pane) or not target:
+            return snapshot
+        status, panes, _ = model._tmux_value(env, "list-panes", "-t", target, "-F", "#{pane_id}")
+        if status or pane not in panes.splitlines():
+            return snapshot
+        status, text, _ = model._tmux_value(env, "capture-pane", "-p", "-t", pane)
+        if not status:
+            snapshot.update(pane_status="captured", pane_text=_redact_pane(text))
+    except Exception:
+        pass  # Never retain or emit exception objects, owner logs or environments.
+    return snapshot
+
+
+def _write_snapshot(run_root, snapshot):
+    fd = os.open(run_root / SNAPSHOT_NAME,
+                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as out:
+        os.fchmod(out.fileno(), 0o600)
+        json.dump(snapshot, out, ensure_ascii=False)
+        out.write("\n")
 
 
 def _status_line(diagnostics):
@@ -105,7 +213,7 @@ def _directory_trust_environment(env: dict, run_root: Path, mode: str) -> None:
 
 def _run_startup_session(
     harness, inherited, auth_variable, auth_path, run_root, tmux_root, diagnostics,
-    *, timeout_seconds=120, directory_trust="preserve",
+    *, timeout_seconds=120, directory_trust="preserve", capture_snapshot=False,
 ):
     """Real local server/session machinery; every outbound sender is mocked."""
     if harness != "codex" or not 1 <= timeout_seconds <= MAX_SECONDS:
@@ -130,6 +238,7 @@ def _run_startup_session(
     server_errors = []
     dispatch_done = threading.Event()
     gate = None
+    counter = None
     fd = os.open(run_root / "runner.log", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     log = os.fdopen(fd, "w", encoding="utf-8", buffering=1)
     os.environ.clear()
@@ -177,8 +286,9 @@ def _run_startup_session(
             # a malformed route cannot fall back to a live Telegram/Slack sender.
             notify_module._send = local_send
             notify_module.dotenv_env = lambda _name: ""
+            counter = _NotifyCounter(server_app.app)
             server = uvicorn.Server(uvicorn.Config(
-                server_app.app, host="127.0.0.1", port=port, log_level="error",
+                counter, host="127.0.0.1", port=port, log_level="error",
                 access_log=False, log_config=None, lifespan="off",
             ))
 
@@ -228,6 +338,9 @@ def _run_startup_session(
             diagnostics.fail()
         raise
     finally:
+        # Capture while the pane still exists, then write only sanitized data
+        # after scoped cleanup. The snapshot never contains auth file contents.
+        snapshot = _capture_snapshot(session, wolts_dir, env, tmux_root, directory_trust, counter) if capture_snapshot else None
         diagnostics.enter("cleanup")
         with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
             cleanup_ok = model._cleanup_resources(server, thread, listener, session, env, tmux_root)
@@ -242,6 +355,16 @@ def _run_startup_session(
         sys.path[:] = old_path
         log.close()
         model._remove_raw_log(run_root)
+        if snapshot is not None:
+            if counter is not None:
+                with counter.lock:
+                    snapshot["notify_requests"] = min(counter.count, 10000)
+                    snapshot["notify_last_status"] = counter.status
+            try:
+                _write_snapshot(run_root, snapshot)
+                diagnostics.private_snapshot_written = True
+            except OSError:
+                pass
 
 
 def main():
@@ -250,6 +373,7 @@ def main():
     parser.add_argument("--harness", choices=("codex",), required=True)
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument("--directory-trust", choices=("preserve", "normal"), default="preserve")
+    parser.add_argument("--capture-snapshot", action="store_true")
     args = parser.parse_args()
     if not args.run or not 1 <= args.timeout <= MAX_SECONDS:
         parser.error("--run and a timeout between 1 and 180 seconds are required")
@@ -260,6 +384,7 @@ def main():
             "codex", diagnostics,
             startup_runner=lambda *items: _run_startup_session(
                 *items, timeout_seconds=args.timeout, directory_trust=args.directory_trust,
+                capture_snapshot=args.capture_snapshot,
             ),
         )
         if result:
@@ -267,6 +392,9 @@ def main():
         else:
             model._say("Startup inspection cleanup=passed.")
         model._say(_status_line(diagnostics))
+        if args.capture_snapshot:
+            model._say("Startup inspection snapshot=" + (
+                "saved." if getattr(diagnostics, "private_snapshot_written", False) else "unavailable."))
         return result
     except KeyboardInterrupt:
         model._say("Startup inspection interrupted; isolated cleanup was attempted.")
@@ -276,6 +404,9 @@ def main():
             diagnostics.fail()
         model._say(model._diagnostic_line(diagnostics))
         model._say(_status_line(diagnostics))
+        if args.capture_snapshot:
+            model._say("Startup inspection snapshot=" + (
+                "saved." if getattr(diagnostics, "private_snapshot_written", False) else "unavailable."))
         return 2
 
 

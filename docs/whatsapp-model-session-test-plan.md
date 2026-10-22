@@ -68,6 +68,27 @@ The comparison mode, prepared for review before another launch, is:
 .venv/bin/python scripts/whatsapp_startup_inspection.py --run --harness codex --timeout 120 --directory-trust normal
 ```
 
+For the next implementation review, the proposed bounded UI capture adds
+`--capture-snapshot` to that command. This opt-in captures the verified exact
+registry pane on the private tmux socket immediately before cleanup. ANSI
+control sequences, bearer/JWT/key patterns, credential assignment lines,
+private-key blocks and long opaque values are redacted in process; the
+remaining synthetic UI/error text is limited to 8192 UTF-8 bytes. No owner
+auth/key file is opened. The fixed synthetic prompt is included. A small
+ASGI wrapper records only `/notify` request count and final HTTP status, never
+request/response bodies. Private boot-log inspection emits only known-session
+wrapper/prompt-hook booleans; registry status/exit code and whether a rollout
+ID was observed are included without the ID. Prompt transport is marked
+`cli_argument_consumption_unconfirmed`: the command builder supplies the input,
+but there is no acknowledgment that the model consumed it.
+
+After cleanup, only the redacted `startup-snapshot.json` (mode 0600, within the
+ignored private run directory) and any sanitized failure record are retained.
+The snapshot is private review material, never printed automatically or added
+to a PR. Remove it after the diagnostic review no longer needs it. Raw pane
+text exists only transiently in memory; raw logs are removed as before. This
+mode is prepared for review, not yet launched.
+
 The default `--directory-trust preserve` keeps directory prompts visible.
 `normal` omits `WOLTSPACE_PRESERVE_TRUST_PROMPTS` and uses normal platform
 preparation for only the fresh synthetic directory. Both modes retain explicit

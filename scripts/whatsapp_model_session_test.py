@@ -856,7 +856,7 @@ def _cleanup_resources(
 
 def _finalize_run_root(run_root: Path, cleanup_ok: bool,
                        tmux_root: Path | None = None,
-                       *, preserve_failure: bool = False) -> bool:
+                       *, preserve_failure: bool = False, preserve_snapshot: bool = False) -> bool:
     """After verified cleanup keep only a sanitized failure record, if any."""
     if cleanup_ok:
         try:
@@ -867,18 +867,24 @@ def _finalize_run_root(run_root: Path, cleanup_ok: bool,
                         or tmux_root.resolve().name != run_root.name):
                     raise RuntimeError("refusing to remove unexpected tmux directory")
                 shutil.rmtree(tmux_root)
-            if preserve_failure:
+            if preserve_failure or preserve_snapshot:
+                retained = ({"failure.json"} if preserve_failure else set())
+                if preserve_snapshot:
+                    retained.add("startup-snapshot.json")
+                for name in retained:
+                    record = run_root / name
+                    if (record.is_symlink() or not record.is_file()
+                            or record.stat().st_uid != os.getuid()
+                            or stat.S_IMODE(record.stat().st_mode) != 0o600
+                            or record.stat().st_size > 32768):
+                        raise RuntimeError("private diagnostic artifact validation failed")
                 for child in run_root.iterdir():
-                    if child.name == "failure.json":
+                    if child.name in retained:
                         continue
                     if child.is_dir() and not child.is_symlink():
                         shutil.rmtree(child)
                     else:
                         child.unlink(missing_ok=True)
-                record = run_root / "failure.json"
-                if (not record.is_file() or record.is_symlink()
-                        or stat.S_IMODE(record.stat().st_mode) != 0o600):
-                    raise RuntimeError("sanitized failure record validation failed")
                 return True
             shutil.rmtree(run_root)
             if not run_root.exists():
@@ -997,6 +1003,8 @@ def _run_model_test(harness: str, diagnostics: RunDiagnostics | None = None,
             finalized = _finalize_run_root(
                 run_root, cleanup_ok, tmux_root,
                 preserve_failure=bool(diagnostics.category) and cleanup_ok,
+                preserve_snapshot=startup_runner is not None and bool(
+                    getattr(diagnostics, "private_snapshot_written", False)),
             )
             if not finalized:
                 diagnostics.enter("cleanup")
