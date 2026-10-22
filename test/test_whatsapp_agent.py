@@ -335,3 +335,80 @@ def test_successful_session_start_with_ack_timeout_does_not_claim_start_failed(m
     assert len(starts) == 1
     assert routes["user:1"]["session"] == "session-new"
     assert sends == ["Session started: https://lodge/session-new"]
+
+
+def test_route_persistence_failure_after_session_start_does_not_invite_retry(monkeypatch, tmp_path):
+    adapter = _load_adapter(monkeypatch, tmp_path)
+    starts = []
+    def start(prompt, *, wolt, routing):
+        starts.append((prompt, wolt, routing))
+        return {"name": "session-persisted-nowhere", "url": "https://lodge/session"}
+    monkeypatch.setattr(adapter, "start_claude_session", start)
+    monkeypatch.setattr(adapter, "eligible_wolts", lambda: {"beaver": {}})
+    monkeypatch.setattr(adapter, "atomic_json", lambda *args: (_ for _ in ()).throw(OSError("disk full")))
+    replies = []
+    monkeypatch.setattr(adapter, "api", lambda method, path, body: replies.append(body["text"]["body"]) or (200, {}))
+    routes = {"user:1": {"wolt": "beaver"}}
+    adapter.handle({"id": "m", "from": "user:1", "timestamp": "100", "type": "text",
+                    "text": {"body": "do this once"}}, routes, 100)
+    assert len(starts) == 1
+    assert routes["user:1"]["session"] == "session-persisted-nowhere"
+    assert len(replies) == 1
+    assert "session started" in replies[0].lower()
+    assert "before sending another message" in replies[0].lower()
+    assert "try again" not in replies[0].lower()
+
+
+def test_ambiguous_session_start_timeout_does_not_invite_blind_resubmission(monkeypatch, tmp_path):
+    adapter = _load_adapter(monkeypatch, tmp_path)
+    monkeypatch.setattr(adapter, "eligible_wolts", lambda: {"beaver": {}})
+    monkeypatch.setattr(adapter, "start_claude_session", lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError()))
+    replies = []
+    monkeypatch.setattr(adapter, "api", lambda method, path, body: replies.append(body["text"]["body"]) or (200, {}))
+    adapter.handle({"id": "m", "from": "user:1", "timestamp": "100", "type": "text",
+                    "text": {"body": "do this once"}}, {"user:1": {"wolt": "beaver"}}, 100)
+    assert len(replies) == 1
+    assert "could not confirm" in replies[0].lower()
+    assert "check your sessions" in replies[0].lower()
+    assert "try again" not in replies[0].lower()
+
+
+def test_adapter_removes_whatsapp_token_from_its_environment(monkeypatch, tmp_path):
+    adapter = _load_adapter(monkeypatch, tmp_path)
+    sentinel = "synthetic-whatsapp-secret"
+    monkeypatch.setenv("WHATSAPP_AGENT_TOKEN", sentinel)
+    importlib.reload(adapter)
+    assert adapter.TOKEN == sentinel
+    assert "WHATSAPP_AGENT_TOKEN" not in __import__("os").environ
+
+
+def test_repeated_cancellation_closes_late_file_lock(monkeypatch, tmp_path):
+    import threading
+    import woltspace.whatsapp_rate_limit as limiter
+
+    acquired = threading.Event()
+    release_worker = threading.Event()
+    closed = threading.Event()
+    class Lock:
+        def close(self):
+            closed.set()
+    def slow_acquire(*args, **kwargs):
+        acquired.set()
+        release_worker.wait(2)
+        return Lock()
+    monkeypatch.setattr(limiter, "acquire_slot", slow_acquire)
+
+    async def run():
+        from woltspace.whatsapp_rate_limit import async_request_slot
+        waiting = asyncio.create_task(
+            async_request_slot(tmp_path, "key", 12, "send").__aenter__()
+        )
+        assert await asyncio.to_thread(acquired.wait, 2)
+        waiting.cancel()
+        await asyncio.sleep(0.02)
+        waiting.cancel()
+        with __import__("pytest").raises(asyncio.CancelledError):
+            await waiting
+        release_worker.set()
+        assert await asyncio.to_thread(closed.wait, 2)
+    asyncio.run(run())

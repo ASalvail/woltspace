@@ -449,13 +449,17 @@ class TmuxSessionRuntime:
         # `export_both` fills in the other spelling of every renamed
         # variable, so a session inherits `WOLT_NAME` even when this process
         # was only handed `WOLTSPACE_WOLT_NAME` (and the reverse).
-        source = export_both(os.environ)
+        source = export_both({
+            key: value for key, value in os.environ.items()
+            if key != "WHATSAPP_AGENT_TOKEN"
+        })
         values = [
             shlex.quote(f"{key}={_session_env_value(key, source[key])}")
             for key in _SESSION_ENV_KEYS
             if source.get(key) not in (None, "")
         ]
-        return f"env {' '.join(values)} {command}" if values else command
+        prefix = "env -u WHATSAPP_AGENT_TOKEN"
+        return f"{prefix} {' '.join(values)} {command}" if values else f"{prefix} {command}"
 
     def spawn(self, session_id: str, cwd: str, command: str) -> RuntimeHandle:
         """Create one named tmux session and return its exact initial pane.
@@ -474,6 +478,8 @@ class TmuxSessionRuntime:
                 "-P",
                 "-F",
                 "#{pane_id}",
+                "-e",
+                "WHATSAPP_AGENT_TOKEN=",
                 "-s",
                 session_id,
                 "-c",
@@ -509,6 +515,8 @@ class TmuxSessionRuntime:
                 "-P",
                 "-F",
                 "#{pane_id}",
+                "-e",
+                "WHATSAPP_AGENT_TOKEN=",
                 "-t",
                 f"={handle.tmux_session_name}",
                 "-c",

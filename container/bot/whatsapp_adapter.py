@@ -25,7 +25,7 @@ from woltspace.whatsapp_rate_limit import pace_request, request_slot
 
 log = logging.getLogger("whatsapp")
 API = "https://api.whatsapp.com/agent/v1"
-TOKEN = os.environ["WHATSAPP_AGENT_TOKEN"]
+TOKEN = os.environ.pop("WHATSAPP_AGENT_TOKEN")
 WOLTS_DIR = Path(os.environ.get("WOLTSPACE_WOLTS_DIR", "/workspace/wolts"))
 WOLT_NAME = os.environ.get("WOLTSPACE_WOLT_NAME", "wolt")
 STATE = space_dir(WOLTS_DIR) / "whatsapp"
@@ -190,25 +190,57 @@ def handle(item: dict, routes: dict, activation: int) -> None:
     routing = {"adapter": "whatsapp", "chat_id": sender, "whatsapp_account": ACCOUNT}
     started_session = False
     link = ""
-    try:
-        if route.get("session"):
+    if route.get("session"):
+        try:
             result = message_session(route["session"], prompt)
             if not result.get("ok"):
                 raise RuntimeError("session did not accept message")
-        else:
-            session = start_claude_session(prompt, wolt=route["wolt"], routing=routing)
-            route["session"] = session.get("name")
-            routes[sender] = route
-            atomic_json(ROUTES, routes)
-            started_session = True
-            link = session.get("url", "")
-    except Exception:
-        log.error("Could not start or resume the WhatsApp session")
+        except Exception as exc:
+            log.error("Could not confirm WhatsApp message dispatch (%s)", type(exc).__name__)
+            try:
+                api("POST", "/messages", {"messaging_product": "whatsapp", "to": sender,
+                     "type": "text", "text": {"body": "I could not confirm delivery to the session. Check the session before sending this message again."}})
+            except Exception:
+                log.error("Could not send the WhatsApp dispatch status reply")
+        return
+
+    # The session start can have an ambiguous outcome if the control plane
+    # fails after creating it. Never ask the owner to blindly resubmit.
+    try:
+        session = start_claude_session(prompt, wolt=route["wolt"], routing=routing)
+    except Exception as exc:
+        log.error("Could not confirm WhatsApp session start (%s)", type(exc).__name__)
         try:
             api("POST", "/messages", {"messaging_product": "whatsapp", "to": sender,
-                 "type": "text", "text": {"body": "I could not start a session. Please try again."}})
+                 "type": "text", "text": {"body": "I could not confirm whether a session started. Check your sessions before sending this message again."}})
         except Exception:
-            log.error("Could not send the WhatsApp session failure reply")
+            log.error("Could not send the WhatsApp session status reply")
+        return
+    if not isinstance(session, dict) or not isinstance(session.get("name"), str) or not session["name"]:
+        log.error("WhatsApp session start returned no session name")
+        try:
+            api("POST", "/messages", {"messaging_product": "whatsapp", "to": sender,
+                 "type": "text", "text": {"body": "I could not confirm whether a session started. Check your sessions before sending this message again."}})
+        except Exception:
+            log.error("Could not send the WhatsApp session status reply")
+        return
+
+    # Session creation succeeded. Route persistence is a separate outcome; if
+    # it fails, keep the in-memory route and report the tracking problem without
+    # claiming the session failed or inviting blind resubmission.
+    route["session"] = session["name"]
+    routes[sender] = route
+    started_session = True
+    link = session.get("url", "")
+    try:
+        atomic_json(ROUTES, routes)
+    except Exception as exc:
+        log.error("WhatsApp session started but route persistence failed (%s)", type(exc).__name__)
+        try:
+            api("POST", "/messages", {"messaging_product": "whatsapp", "to": sender,
+                 "type": "text", "text": {"body": "The session started, but I could not save its reply route. Check your sessions before sending another message here."}})
+        except Exception:
+            log.error("Could not send the WhatsApp route status reply")
         return
     # Starting/resuming the session is the dispatch. A failed acknowledgement
     # must not invite a duplicate message and duplicate instructions.

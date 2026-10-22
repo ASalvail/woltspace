@@ -42,6 +42,18 @@ def acquire_slot(state_dir: Path, token: str, limit: int, namespace: str,
         raise
 
 
+def _close_acquired_lock(task: asyncio.Task) -> None:
+    """Consume a detached acquisition result and release any late lock."""
+    try:
+        lock = task.result()
+    except BaseException:
+        return
+    try:
+        lock.close()
+    except OSError:
+        pass
+
+
 @contextmanager
 def request_slot(state_dir: Path, token: str, limit: int, namespace: str,
                  *, clock=time.time, sleep=time.sleep):
@@ -62,14 +74,9 @@ async def async_request_slot(state_dir: Path, token: str, limit: int, namespace:
     try:
         lock = await asyncio.shield(acquisition)
     except asyncio.CancelledError:
-        # The worker thread cannot be cancelled. Wait for its eventual result
-        # and close the descriptor so cancellation cannot orphan the file lock.
-        try:
-            lock = await asyncio.shield(acquisition)
-        except Exception:
-            pass
-        else:
-            lock.close()
+        # The worker thread cannot be cancelled. Detach cleanup from this
+        # context manager so repeated cancellation cannot abandon its result.
+        acquisition.add_done_callback(_close_acquired_lock)
         raise
     try:
         yield
