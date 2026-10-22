@@ -65,7 +65,11 @@ implementation review. After review, its proposed command from this checkout is:
 This starts one real Codex session through the supported `sessions.start_session`
 path, with explicit `prompt` execution policy, existing authorized login,
 private HOME/CODEX_HOME, platform skills and the short private tmux socket.
-It does not grant Auto or answer dialogs. The prompt is fixed synthetic text
+It does not grant Auto or answer dialogs. It sets
+`WOLTSPACE_PRESERVE_TRUST_PROMPTS=1` in the private session environment
+so the normal platform trust writer does not pre-accept a directory dialog.
+The setting is forwarded through tmux to the real bootstrap process.
+The prompt is fixed synthetic text
 asking for one `startup-inspection-ok` notification. The actual notify CLI
 posts to the private local server; the entire sender boundary is replaced
 with an exact-message/session/account gate and local mocked sender. No

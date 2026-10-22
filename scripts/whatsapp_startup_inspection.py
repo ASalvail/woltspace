@@ -100,6 +100,9 @@ def _run_startup_session(
         run_root, wolts_dir, harness, auth_variable, auth_path,
         "127.0.0.1", port, inherited, tmux_root,
     )
+    # The platform normally pre-accepts directory trust independently of tool
+    # approval policy. This inspection must observe those prompts instead.
+    env["WOLTSPACE_PRESERVE_TRUST_PROMPTS"] = "1"
     old_env, old_path = os.environ.copy(), list(sys.path)
     old_env.pop("WHATSAPP_AGENT_TOKEN", None)
     session = ""

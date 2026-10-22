@@ -33,6 +33,39 @@ def test_startup_uses_supported_session_creation_with_prompt_policy(monkeypatch)
     assert calls[0]["routing"]["chat_id"] == startup.PARTICIPANT
 
 
+def test_real_prepare_preserves_trust_prompts_and_prompt_policy(tmp_path, monkeypatch):
+    from scripts import whatsapp_startup_inspection as startup
+    import sessions
+    import harnesses
+    from session_runtime import TmuxSessionRuntime
+
+    wolts = tmp_path / "wolts"
+    wolts.mkdir()
+    wolt = startup.model._create_synthetic_wolt(wolts, "codex")
+    monkeypatch.setattr(sessions, "WOLTS_DIR", wolts)
+    monkeypatch.setenv("WOLTSPACE_WOLTS_DIR", str(wolts))
+    monkeypatch.setenv("WOLTS_DIR", str(wolts))
+    monkeypatch.setenv("WOLTSPACE_DIR", str(ROOT))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "private-codex"))
+    monkeypatch.setenv("WOLTSPACE_PRESERVE_TRUST_PROMPTS", "1")
+    monkeypatch.setattr(harnesses, "codex_supports_no_daemon", lambda: False)
+    def no_trust_write(*_):
+        raise AssertionError("trust dialog must not be pre-accepted")
+    monkeypatch.setattr(sessions, "ensure_codex_dir_trusted", no_trust_write)
+    sessions.SessionRegistry(wolts).create(
+        "synthetic-startup", wolt="wa-test", harness="codex", dir=str(wolt),
+        execution_policy={"mode": "prompt", "isolation": "host"},
+        adapter="whatsapp", chat_id=startup.PARTICIPANT, whatsapp_account=startup.ACCOUNT,
+    )
+    command = sessions.prepare_session_command("synthetic-startup", "spawn", startup.PROMPT)
+    assert "--dangerously-bypass-approvals-and-sandbox" not in command
+    assert not (tmp_path / "private-codex" / "config.toml").exists()
+    # This is the actual launch envelope passed to tmux, which must carry the
+    # opt-in to run-session.sh/session-reg in the separate bootstrap process.
+    launch = TmuxSessionRuntime._launch_command("synthetic-command")
+    assert "WOLTSPACE_PRESERVE_TRUST_PROMPTS=1" in launch
+
+
 @pytest.mark.parametrize("scenario", [
     "success", "wrong_payload", "timeout", "trust_prompt", "spawn_failure", "cleanup_failure",
 ])
@@ -69,6 +102,7 @@ model._cleanup_resources = cleanup
 cli_threads = []
 cli_results = []
 def fake_start():
+    assert os.environ.get("WOLTSPACE_PRESERVE_TRUST_PROMPTS") == "1"
     if scenario == "spawn_failure":
         raise RuntimeError("private-raw-start-error synthetic-secret")
     # Supported registry path and real notify routing, without tmux/model spawn.
