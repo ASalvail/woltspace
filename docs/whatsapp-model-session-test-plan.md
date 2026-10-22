@@ -89,11 +89,31 @@ The failure record includes only the harness name, primary stage/category and
 those statuses. It never contains a prompt, participant/session ID,
 credential, exception text, or pane/log contents. Raw runner and session boot
 logs are removed after cleanup attempts.
-The runner classifies captured boot symptoms in memory; source text is never
-printed or stored. After verified cleanup, the private run directory retains
+Schema 2 also records a fixed `notify_attempt` state (`not_seen`,
+`dispatch_wait`, `reserved`, `route_verified`, `send_in_flight`, `sent`,
+`rejected`, or `ambiguous`); it distinguishes no notify invocation from one
+that reached the sender but did not finish before timeout. It separately
+records `harness_process` (`not_checked`, `present`, `absent`, `unknown`),
+`harness_readiness` (`not_checked`, `ready_marker_seen`, `prompt_detected`,
+`not_ready`, `unknown`, `unsupported`), and `boot_symptom` from a fixed
+allowlist. Process presence is not harness readiness. Codex currently has no
+configured versioned TUI-ready marker, so its readiness is `unsupported`; a
+running Codex process alone does not mark `harness_boot` passed.
+
+The runner classifies captured boot symptoms in memory as `auth_or_config`,
+`bootstrap_missing`, `trust_or_approval`, `waiting_for_input`, or
+`none_detected`; capture failure is `capture_unavailable`. Source text is
+never printed or stored. Trust/approval and explicit interactive prompts stop
+the run with fixed categories instead of waiting through the full timeout.
+After verified cleanup, the private run directory retains
 only the mode-`0600` `failure.json`. If cleanup cannot be verified, it retains
 `.cleanup-required` and private cleanup state, removes `runner.log`, and writes
 the same sanitized record.
+
+Offline fault-injection coverage exercises no notify invocation, route
+rejection, a sender that remains in flight, completed send, and synthetic
+auth/bootstrap/trust/approval/waiting pane text. These checks validate the
+diagnostic states and redaction only; they do not diagnose a prior live run.
 
 The test allows one exact `🦦 wa-test: <nonce>` payload from the selected
 participant after checking the session registry, account fingerprint, and

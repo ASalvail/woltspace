@@ -60,7 +60,57 @@ def test_boot_symptom_classifier_returns_only_allowlisted_categories():
     assert model_test._classify_boot_symptom(
         "notify: command not found; secret=synthetic"
     ) == "bootstrap_missing"
-    assert model_test._classify_boot_symptom("ordinary model output") == "harness_boot_unconfirmed"
+    assert model_test._classify_boot_symptom(
+        "Do you trust this workspace? participant=opaque"
+    ) == "trust_or_approval"
+    assert model_test._classify_boot_symptom(
+        "Permission request: approve this command? secret=synthetic"
+    ) == "trust_or_approval"
+    assert model_test._classify_boot_symptom(
+        "Onboarding requires trust before continuing; participant=opaque"
+    ) == "trust_or_approval"
+    assert model_test._classify_boot_symptom(
+        "Press Enter to continue; participant=opaque"
+    ) == "waiting_for_input"
+    assert model_test._classify_boot_symptom("ordinary model output") == "none_detected"
+
+
+@pytest.mark.parametrize(
+    ("text", "category", "symptom"),
+    [
+        ("Not logged in; private token=synthetic", "auth_or_config", "auth_or_config"),
+        ("notify: command not found; prompt=private", "bootstrap_missing", "bootstrap_missing"),
+        ("Trust this workspace? participant=opaque", "trust_or_approval_prompt", "trust_or_approval"),
+        ("Onboarding: approve this command? secret=synthetic", "trust_or_approval_prompt", "trust_or_approval"),
+        ("Press Enter to continue; prompt=private", "waiting_for_input", "waiting_for_input"),
+    ],
+)
+def test_actionable_boot_symptoms_record_only_fixed_categories(text, category, symptom):
+    diagnostics = model_test.RunDiagnostics("codex")
+    assert model_test._handle_boot_symptom(
+        diagnostics, model_test._classify_boot_symptom(text),
+    )
+    record = diagnostics.as_record()
+    assert record["category"] == category
+    assert record["boot_symptom"] == symptom
+    assert record["harness_readiness"] == "prompt_detected"
+    assert model_test._valid_diagnostic_record(record)
+    assert all(value not in str(record) for value in (
+        "synthetic", "private", "opaque", "participant", "prompt=",
+    ))
+
+
+def test_codex_process_presence_is_not_readiness(monkeypatch):
+    assert model_test._harness_readiness_status("synthetic-session", "codex") == "unsupported"
+    diagnostics = model_test.RunDiagnostics("codex")
+    diagnostics.set_harness_process("present")
+    diagnostics.set_harness_readiness("unsupported")
+    diagnostics.set_boot_symptom("none_detected")
+    record = diagnostics.as_record()
+    assert record["harness_process"] == "present"
+    assert record["harness_readiness"] == "unsupported"
+    assert record["boot_symptom"] == "none_detected"
+    assert record["checks"]["harness_boot"] == "pending"
 
 
 def test_failure_record_has_only_sanitized_schema_and_private_mode(tmp_path):
@@ -74,7 +124,7 @@ def test_failure_record_has_only_sanitized_schema_and_private_mode(tmp_path):
     data = __import__("json").loads(text)
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert data == {
-        "schema": 1,
+        "schema": 2,
         "harness": "codex",
         "stage": "harness_boot",
         "category": "auth_or_config",
@@ -85,11 +135,20 @@ def test_failure_record_has_only_sanitized_schema_and_private_mode(tmp_path):
             "harness_boot": "failed", "session_ack": "pending",
             "notify": "pending", "cleanup": "not_reached",
         },
+        "notify_attempt": "not_seen",
+        "harness_process": "not_checked",
+        "harness_readiness": "not_checked",
+        "boot_symptom": "not_checked",
     }
     assert all(term not in text for term in (
         "synthetic-whatsapp-secret", "participant=", "private prompt",
         "raw exception", "opaque",
     ))
+    assert model_test._valid_diagnostic_record(data)
+    data["notify_attempt"] = "raw prompt text"
+    assert not model_test._valid_diagnostic_record(data)
+    data["notify_attempt"] = []
+    assert not model_test._valid_diagnostic_record(data)
 
 
 def test_codex_preflight_checks_real_bootstrap_files_and_offline_cli(
@@ -356,6 +415,69 @@ def test_notify_gate_allows_only_one_exact_payload_after_route_verification():
     assert gate.verified_session == "s1"
 
 
+def test_notify_gate_records_attempt_transitions_without_sensitive_values():
+    class RecordingDiagnostics(model_test.RunDiagnostics):
+        def __init__(self):
+            super().__init__("codex")
+            self.transitions = []
+
+        def set_notify_attempt(self, state):
+            self.transitions.append(state)
+            super().set_notify_attempt(state)
+
+    diagnostics = RecordingDiagnostics()
+    gate = model_test.OneNonceSendGate(
+        "🦦 wa-test: expected-nonce", lambda *_: "session-safe", _completed_event(),
+        diagnostics=diagnostics,
+    )
+    attempts = []
+
+    async def sender():
+        attempts.append(diagnostics.as_record()["notify_attempt"])
+        return {"ok": True}
+
+    asyncio.run(gate.send(
+        "private-session", "opaque-participant", "🦦 wa-test: expected-nonce",
+        {"chat_id": "opaque-participant"}, sender,
+    ))
+    assert attempts == ["send_in_flight"]
+    assert diagnostics.as_record()["notify_attempt"] == "sent"
+    assert diagnostics.transitions == [
+        "dispatch_wait", "reserved", "route_verified", "send_in_flight", "sent",
+    ]
+    assert all(value not in str(diagnostics.as_record()) for value in (
+        "expected-nonce", "opaque-participant", "private-session",
+    ))
+
+
+def test_notify_gate_distinguishes_not_seen_from_blocked_send():
+    diagnostics = model_test.RunDiagnostics("codex")
+    assert diagnostics.as_record()["notify_attempt"] == "not_seen"
+    gate = model_test.OneNonceSendGate(
+        "🦦 wa-test: expected-nonce", lambda *_: "session-safe", _completed_event(),
+        diagnostics=diagnostics,
+    )
+    started = asyncio.Event()
+
+    async def blocked_sender():
+        started.set()
+        await asyncio.Event().wait()
+
+    async def run():
+        task = asyncio.create_task(gate.send(
+            "private-session", "opaque-participant", "🦦 wa-test: expected-nonce",
+            {"chat_id": "opaque-participant"}, blocked_sender,
+        ))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        assert diagnostics.as_record()["notify_attempt"] == "send_in_flight"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+    assert diagnostics.as_record()["notify_attempt"] == "ambiguous"
+
+
 @pytest.mark.parametrize("mode", ["rejected", "timeout"])
 def test_notify_failure_record_hides_synthetic_participant_prompt_and_exception(
     mode, tmp_path,
@@ -373,6 +495,7 @@ def test_notify_failure_record_hides_synthetic_participant_prompt_and_exception(
 
     gate = model_test.OneNonceSendGate(
         "🦦 wa-test: expected-nonce", lambda *_: "session-private", event,
+        diagnostics=diagnostics,
     )
     message = "wrong-payload" if mode == "rejected" else "🦦 wa-test: expected-nonce"
 
@@ -395,6 +518,9 @@ def test_notify_failure_record_hides_synthetic_participant_prompt_and_exception(
     assert not raw_log.exists()
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert sender_calls == ([] if mode == "rejected" else [True])
+    assert __import__("json").loads(path.read_text())["notify_attempt"] == (
+        "rejected" if mode == "rejected" else "ambiguous"
+    )
     assert model_test._diagnostic_line(diagnostics) == (
         f"Run stopped: stage=notify category={category}."
     )
@@ -562,7 +688,7 @@ def test_real_send_notification_waits_for_dispatch_route_persistence(
         pending = asyncio.create_task(notify.send_notification("s1", expected))
         await asyncio.sleep(0.02)
         assert not pending.done()
-        assert gate.status == "ready"
+        assert gate.status == "dispatch_wait"
         assert attempts == []
         route_persisted["value"] = True
         dispatch_done.set()

@@ -44,12 +44,22 @@ _DIAGNOSTIC_STAGES = (
     "notify", "cleanup",
 )
 _DIAGNOSTIC_STATUSES = {"pending", "passed", "failed", "not_reached"}
+_NOTIFY_ATTEMPT_STATES = {
+    "not_seen", "dispatch_wait", "reserved", "route_verified",
+    "send_in_flight", "sent", "rejected", "ambiguous",
+}
+_PROCESS_STATES = {"not_checked", "present", "absent", "unknown"}
+_READINESS_STATES = {
+    "not_checked", "ready_marker_seen", "prompt_detected", "not_ready",
+    "unknown", "unsupported",
+}
 _FAILURE_CATEGORIES = {
     "preflight_failed", "executable_missing", "version_probe_failed",
     "help_probe_failed", "bootstrap_missing", "server_start_failed",
     "selection_not_confirmed", "adapter_reply_failed", "session_not_started", "auth_or_config",
     "harness_boot_unconfirmed", "notify_rejected", "notify_ambiguous",
-    "run_timeout", "cleanup_failed", "internal_error",
+    "trust_or_approval_prompt", "waiting_for_input", "run_timeout",
+    "cleanup_failed", "internal_error",
 }
 
 
@@ -57,52 +67,94 @@ class RunDiagnostics:
     """Fixed-schema status only; never stores exception, prompt, or identity text."""
 
     def __init__(self, harness: str):
+        self._lock = threading.RLock()
         self.harness = harness if harness in {"claude", "codex"} else "unknown"
         self.stage = "preflight"
         self.failure_stage = ""
         self.category = ""
         self.checks = {name: "pending" for name in _DIAGNOSTIC_STAGES}
         self.checks["cleanup"] = "not_reached"
+        self.notify_attempt = "not_seen"
+        self.harness_process = "not_checked"
+        self.harness_readiness = "not_checked"
+        self.boot_symptom = "not_checked"
 
     def enter(self, stage: str) -> None:
-        if stage in _DIAGNOSTIC_STAGES:
-            self.stage = stage
+        with self._lock:
+            if stage in _DIAGNOSTIC_STAGES:
+                self.stage = stage
 
     def passed(self, stage: str) -> None:
-        if stage in _DIAGNOSTIC_STAGES:
-            self.checks[stage] = "passed"
+        with self._lock:
+            if stage in _DIAGNOSTIC_STAGES:
+                self.checks[stage] = "passed"
+
+    def set_check(self, stage: str, state: str) -> None:
+        with self._lock:
+            if stage in _DIAGNOSTIC_STAGES and state in _DIAGNOSTIC_STATUSES:
+                self.checks[stage] = state
+
+    def set_notify_attempt(self, state: str) -> None:
+        with self._lock:
+            if state in _NOTIFY_ATTEMPT_STATES:
+                self.notify_attempt = state
+
+    def set_harness_process(self, state: str) -> None:
+        with self._lock:
+            if state in _PROCESS_STATES:
+                self.harness_process = state
+
+    def set_harness_readiness(self, state: str) -> None:
+        with self._lock:
+            if state in _READINESS_STATES:
+                self.harness_readiness = state
+
+    def set_boot_symptom(self, state: str) -> None:
+        with self._lock:
+            if state in _BOOT_SYMPTOMS:
+                self.boot_symptom = state
 
     def fail(self, category: str | None = None) -> None:
-        if not self.failure_stage:
-            self.failure_stage = self.stage
-        if self.stage in _DIAGNOSTIC_STAGES:
-            self.checks[self.stage] = "failed"
-        if category in _FAILURE_CATEGORIES and not self.category:
-            self.category = category
-        elif not self.category:
-            self.category = {
-                "preflight": "preflight_failed",
-                "server_health": "server_start_failed",
-                "inbound_selection": "selection_not_confirmed",
-                "selection_reply": "adapter_reply_failed",
-                "challenge_dispatch": "session_not_started",
-                "session_spawn": "session_not_started",
-                "harness_boot": "harness_boot_unconfirmed",
-                "session_ack": "internal_error",
-                "notify": "notify_rejected",
-                "cleanup": "cleanup_failed",
-            }.get(self.stage, "internal_error")
+        with self._lock:
+            if not self.failure_stage:
+                self.failure_stage = self.stage
+            if self.stage in _DIAGNOSTIC_STAGES:
+                self.checks[self.stage] = "failed"
+            if category in _FAILURE_CATEGORIES and not self.category:
+                self.category = category
+            elif not self.category:
+                self.category = {
+                    "preflight": "preflight_failed",
+                    "server_health": "server_start_failed",
+                    "inbound_selection": "selection_not_confirmed",
+                    "selection_reply": "adapter_reply_failed",
+                    "challenge_dispatch": "session_not_started",
+                    "session_spawn": "session_not_started",
+                    "harness_boot": "harness_boot_unconfirmed",
+                    "session_ack": "internal_error",
+                    "notify": "notify_rejected",
+                    "cleanup": "cleanup_failed",
+                }.get(self.stage, "internal_error")
 
     def as_record(self) -> dict[str, Any]:
-        return {
-            "schema": 1,
-            "harness": self.harness,
-            "stage": self.failure_stage or self.stage,
-            "category": self.category or "internal_error",
-            "checks": {name: self.checks[name] for name in _DIAGNOSTIC_STAGES},
-        }
+        with self._lock:
+            return {
+                "schema": 2,
+                "harness": self.harness,
+                "stage": self.failure_stage or self.stage,
+                "category": self.category or "internal_error",
+                "checks": {name: self.checks[name] for name in _DIAGNOSTIC_STAGES},
+                "notify_attempt": self.notify_attempt,
+                "harness_process": self.harness_process,
+                "harness_readiness": self.harness_readiness,
+                "boot_symptom": self.boot_symptom,
+            }
 
 
+_BOOT_SYMPTOMS = {
+    "auth_or_config", "bootstrap_missing", "trust_or_approval",
+    "waiting_for_input", "none_detected", "capture_unavailable",
+}
 _BOOT_PATTERNS = (
     ("auth_or_config", re.compile(
         r"not logged in|login required|run codex login|authentication required|"
@@ -112,6 +164,15 @@ _BOOT_PATTERNS = (
         r"command not found|no such file or directory|notify: not found|"
         r"skill.{0,40}(not found|unavailable)|unknown skill", re.I,
     )),
+    ("trust_or_approval", re.compile(
+        r"trust(ed)? .{0,60}(folder|workspace|project)|"
+        r"(approve|approval).{0,60}(workspace|permission|request|command)|"
+        r"permission.{0,60}(approval|allow|request)|onboard(ing)?|allow .{0,40}\?", re.I,
+    )),
+    ("waiting_for_input", re.compile(
+        r"press (enter|return)|waiting for (input|your)|type .* to continue|"
+        r"continue\?\s*$|waiting for approval", re.I | re.M,
+    )),
 )
 
 
@@ -120,14 +181,17 @@ def _classify_boot_symptom(text: str) -> str:
     for category, pattern in _BOOT_PATTERNS:
         if pattern.search(text):
             return category
-    return "harness_boot_unconfirmed"
+    return "none_detected"
 
 
 def _write_failure_record(run_root: Path, diagnostics: RunDiagnostics) -> Path:
     """Atomically store only the allowlisted status schema with mode 0600."""
     path = run_root / "failure.json"
     temp = run_root / ".failure.json.tmp"
-    payload = json.dumps(diagnostics.as_record(), sort_keys=True, separators=(",", ":")) + "\n"
+    record = diagnostics.as_record()
+    if not _valid_diagnostic_record(record):
+        raise ValueError("diagnostic record failed its fixed-schema check")
+    payload = json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
     fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as out:
@@ -139,6 +203,31 @@ def _write_failure_record(run_root: Path, diagnostics: RunDiagnostics) -> Path:
     finally:
         temp.unlink(missing_ok=True)
     return path
+
+
+def _valid_diagnostic_record(record: Any) -> bool:
+    """Validate the bounded versioned schema before it reaches disk."""
+    def enum(value: Any, choices) -> bool:
+        return isinstance(value, str) and value in choices
+
+    return bool(
+        isinstance(record, dict)
+        and set(record) == {
+            "schema", "harness", "stage", "category", "checks",
+            "notify_attempt", "harness_process", "harness_readiness", "boot_symptom",
+        }
+        and record.get("schema") == 2
+        and enum(record.get("harness"), {"claude", "codex", "unknown"})
+        and enum(record.get("stage"), _DIAGNOSTIC_STAGES)
+        and enum(record.get("category"), _FAILURE_CATEGORIES)
+        and isinstance(record.get("checks"), dict)
+        and set(record["checks"]) == set(_DIAGNOSTIC_STAGES)
+        and all(enum(value, _DIAGNOSTIC_STATUSES) for value in record["checks"].values())
+        and enum(record.get("notify_attempt"), _NOTIFY_ATTEMPT_STATES)
+        and enum(record.get("harness_process"), _PROCESS_STATES)
+        and enum(record.get("harness_readiness"), _READINESS_STATES)
+        and enum(record.get("boot_symptom"), _BOOT_SYMPTOMS | {"not_checked"})
+    )
 
 
 def _remove_raw_log(run_root: Path) -> None:
@@ -170,14 +259,14 @@ def _track_adapter_replies(real_api, diagnostics: RunDiagnostics):
         try:
             result = real_api(method, path, payload)
         except Exception:
-            diagnostics.checks[stage] = "failed"
+            diagnostics.set_check(stage, "failed")
             if stage == "selection_reply":
                 diagnostics.fail("adapter_reply_failed")
             raise
         if isinstance(result, tuple) and result and isinstance(result[0], int) and 200 <= result[0] < 300:
             diagnostics.passed(stage)
         else:
-            diagnostics.checks[stage] = "failed"
+            diagnostics.set_check(stage, "failed")
             if stage == "selection_reply":
                 diagnostics.fail("adapter_reply_failed")
         return result
@@ -189,10 +278,62 @@ def _capture_boot_symptom(env: dict[str, str], session: str) -> str:
     try:
         status, text, _ = _tmux_value(env, "capture-pane", "-p", "-t", session, "-S", "-80")
     except Exception:
-        return "harness_boot_unconfirmed"
+        return "capture_unavailable"
     if status:
-        return "harness_boot_unconfirmed"
+        return "capture_unavailable"
     return _classify_boot_symptom(text)
+
+
+def _handle_boot_symptom(diagnostics: RunDiagnostics, symptom: str) -> bool:
+    """Record an allowlisted boot symptom; return true for actionable prompts."""
+    diagnostics.set_boot_symptom(symptom)
+    if symptom in {"auth_or_config", "bootstrap_missing"}:
+        diagnostics.set_harness_readiness("prompt_detected")
+        diagnostics.enter("harness_boot")
+        diagnostics.fail(symptom)
+        return True
+    if symptom in {"trust_or_approval", "waiting_for_input"}:
+        diagnostics.set_harness_readiness("prompt_detected")
+        diagnostics.enter("harness_boot")
+        diagnostics.fail(
+            "trust_or_approval_prompt" if symptom == "trust_or_approval"
+            else "waiting_for_input",
+        )
+        return True
+    return False
+
+
+def _harness_readiness_status(session: str, harness: str) -> str:
+    """Report configured TUI readiness evidence, never process presence as readiness."""
+    try:
+        from harnesses import get_harness
+        marker = get_harness(harness).get("tui_ready_marker")
+    except Exception:
+        return "unknown"
+    # Codex currently has no documented, versioned ready marker. Do not infer
+    # model readiness from a live process or a raw terminal.
+    if not marker:
+        return "unsupported"
+    try:
+        from sessions import SessionRegistry
+        record = SessionRegistry().get(session, check_alive=False)
+        if not record:
+            return "unknown"
+        pane = _capture_boot_symptom_text(record)
+    except Exception:
+        return "unknown"
+    if pane is None:
+        return "unknown"
+    return "ready_marker_seen" if marker in pane else "not_ready"
+
+
+def _capture_boot_symptom_text(record: dict) -> str | None:
+    """Capture a pane transiently for readiness matching; caller never persists text."""
+    try:
+        from session_runtime import get_runtime
+        return get_runtime().capture(record, start="-80")
+    except Exception:
+        return None
 
 
 def _harness_process_status(session: str, harness: str) -> bool | None:
@@ -570,7 +711,8 @@ class OneNonceSendGate:
     """Allow one precisely formatted notify send after authoritative checks."""
 
     def __init__(self, expected_payload: str, verify, dispatch_done: threading.Event,
-                 wait_seconds: float = DISPATCH_WAIT_SECONDS):
+                 wait_seconds: float = DISPATCH_WAIT_SECONDS,
+                 diagnostics: RunDiagnostics | None = None):
         self.expected_payload = expected_payload
         self.verify = verify
         self.dispatch_done = dispatch_done
@@ -579,6 +721,12 @@ class OneNonceSendGate:
         self.status = "ready"
         self.verified_session = ""
         self.failure = ""
+        self.diagnostics = diagnostics
+
+    def _set_status(self, state: str) -> None:
+        self.status = state
+        if self.diagnostics is not None:
+            self.diagnostics.set_notify_attempt(state)
 
     async def send(self, session: str, participant: str, message: str,
                    routing: dict | None, sender):
@@ -586,21 +734,25 @@ class OneNonceSendGate:
         # start_session and before it atomically saves adapter.ROUTES. Wait on
         # a thread event without blocking this server's asyncio loop or holding
         # the gate/phase locks. The dispatch thread always sets it in finally.
+        with self._lock:
+            if self.status != "ready":
+                raise RuntimeError("the single WhatsApp test send is already reserved")
+            self._set_status("dispatch_wait")
         dispatch_finished = await asyncio.to_thread(
             self.dispatch_done.wait, self.wait_seconds,
         )
         with self._lock:
-            if self.status != "ready":
+            if self.status != "dispatch_wait":
                 raise RuntimeError("the single WhatsApp test send is already reserved")
             # Reserve after bounded dispatch synchronization but before route
             # validation and definitely before any network I/O.
-            self.status = "reserved"
+            self._set_status("reserved")
             if not dispatch_finished:
-                self.status = "rejected"
+                self._set_status("rejected")
                 self.failure = "the inbound dispatch did not finish in time"
                 raise RuntimeError(self.failure)
             if message != self.expected_payload:
-                self.status = "rejected"
+                self._set_status("rejected")
                 self.failure = "the notify payload did not match the exact nonce"
                 raise RuntimeError(self.failure)
             try:
@@ -608,19 +760,21 @@ class OneNonceSendGate:
             except Exception:
                 verified = ""
             if not verified:
-                self.status = "rejected"
+                self._set_status("rejected")
                 self.failure = "the test session route was not verified"
                 raise RuntimeError(self.failure)
             self.verified_session = verified
+            self._set_status("route_verified")
+        self._set_status("send_in_flight")
         try:
             result = await sender()
         except BaseException:
             with self._lock:
-                self.status = "ambiguous"
+                self._set_status("ambiguous")
                 self.failure = "the single WhatsApp send had an ambiguous outcome"
             raise
         with self._lock:
-            self.status = "sent"
+            self._set_status("sent")
         return result
 
 
@@ -924,6 +1078,7 @@ def _run_model_session(
 
             send_gate = OneNonceSendGate(
                 _expected_notify_payload(nonce), verify_send_route, dispatch_done,
+                diagnostics=diagnostics,
             )
             notify._send = _wrap_notify_send(notify._send, send_gate)
 
@@ -1020,17 +1175,28 @@ def _run_model_session(
                         diagnostics.passed("session_spawn")
                     if diagnostics.checks["harness_boot"] != "passed":
                         diagnostics.enter("harness_boot")
+                        process_status = _harness_process_status(session_name, harness)
+                        diagnostics.set_harness_process(
+                            "present" if process_status is True else
+                            "absent" if process_status is False else "unknown",
+                        )
                         symptom = _capture_boot_symptom(env, session_name)
-                        if symptom in {"auth_or_config", "bootstrap_missing"}:
-                            diagnostics.fail(symptom)
-                            raise RuntimeError("the isolated harness reported a boot prerequisite error")
-                        if _harness_process_status(session_name, harness) is True:
+                        if _handle_boot_symptom(diagnostics, symptom):
+                            raise RuntimeError("the isolated harness has an actionable boot prompt")
+                        readiness = _harness_readiness_status(session_name, harness)
+                        diagnostics.set_harness_readiness(readiness)
+                        if readiness == "ready_marker_seen":
                             diagnostics.passed("harness_boot")
+                    else:
+                        process_status = _harness_process_status(session_name, harness)
+                        diagnostics.set_harness_process(
+                            "present" if process_status is True else
+                            "absent" if process_status is False else "unknown",
+                        )
                 if send_gate.verified_session:
                     # The send gate may verify first if the model notifies
                     # before this polling loop observes the persisted route.
                     verified_session = send_gate.verified_session
-                    diagnostics.passed("harness_boot")
                     diagnostics.enter("notify")
                     diagnostics.passed("notify")
                 if (send_gate.status == "sent" and send_gate.verified_session
@@ -1049,7 +1215,8 @@ def _run_model_session(
                 elif not phase["prompted"]:
                     diagnostics.enter("challenge_dispatch")
                     diagnostics.fail("session_not_started")
-                elif diagnostics.checks["session_spawn"] == "passed" and diagnostics.checks["harness_boot"] != "passed":
+                elif (diagnostics.checks["session_spawn"] == "passed"
+                      and diagnostics.harness_process == "absent"):
                     diagnostics.enter("harness_boot")
                     diagnostics.fail("harness_boot_unconfirmed")
                 else:
