@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import contextlib
 import hashlib
+import io
 import json
 import os
 import secrets
@@ -23,6 +24,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+import re
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +38,170 @@ TEST_WOLT = "wa-test"
 TIMEOUT_SECONDS = 300
 DISPATCH_WAIT_SECONDS = 45
 _PATHS = (ROOT, ROOT / "container", ROOT / "container" / "lib", ROOT / "src")
+_DIAGNOSTIC_STAGES = (
+    "preflight", "server_health", "inbound_selection", "selection_reply",
+    "challenge_dispatch", "session_spawn", "harness_boot", "session_ack",
+    "notify", "cleanup",
+)
+_DIAGNOSTIC_STATUSES = {"pending", "passed", "failed", "not_reached"}
+_FAILURE_CATEGORIES = {
+    "preflight_failed", "executable_missing", "version_probe_failed",
+    "help_probe_failed", "bootstrap_missing", "server_start_failed",
+    "selection_not_confirmed", "adapter_reply_failed", "session_not_started", "auth_or_config",
+    "harness_boot_unconfirmed", "notify_rejected", "notify_ambiguous",
+    "run_timeout", "cleanup_failed", "internal_error",
+}
+
+
+class RunDiagnostics:
+    """Fixed-schema status only; never stores exception, prompt, or identity text."""
+
+    def __init__(self, harness: str):
+        self.harness = harness if harness in {"claude", "codex"} else "unknown"
+        self.stage = "preflight"
+        self.failure_stage = ""
+        self.category = ""
+        self.checks = {name: "pending" for name in _DIAGNOSTIC_STAGES}
+        self.checks["cleanup"] = "not_reached"
+
+    def enter(self, stage: str) -> None:
+        if stage in _DIAGNOSTIC_STAGES:
+            self.stage = stage
+
+    def passed(self, stage: str) -> None:
+        if stage in _DIAGNOSTIC_STAGES:
+            self.checks[stage] = "passed"
+
+    def fail(self, category: str | None = None) -> None:
+        if not self.failure_stage:
+            self.failure_stage = self.stage
+        if self.stage in _DIAGNOSTIC_STAGES:
+            self.checks[self.stage] = "failed"
+        if category in _FAILURE_CATEGORIES and not self.category:
+            self.category = category
+        elif not self.category:
+            self.category = {
+                "preflight": "preflight_failed",
+                "server_health": "server_start_failed",
+                "inbound_selection": "selection_not_confirmed",
+                "selection_reply": "adapter_reply_failed",
+                "challenge_dispatch": "session_not_started",
+                "session_spawn": "session_not_started",
+                "harness_boot": "harness_boot_unconfirmed",
+                "session_ack": "internal_error",
+                "notify": "notify_rejected",
+                "cleanup": "cleanup_failed",
+            }.get(self.stage, "internal_error")
+
+    def as_record(self) -> dict[str, Any]:
+        return {
+            "schema": 1,
+            "harness": self.harness,
+            "stage": self.failure_stage or self.stage,
+            "category": self.category or "internal_error",
+            "checks": {name: self.checks[name] for name in _DIAGNOSTIC_STAGES},
+        }
+
+
+_BOOT_PATTERNS = (
+    ("auth_or_config", re.compile(
+        r"not logged in|login required|run codex login|authentication required|"
+        r"unauthorized|invalid config|failed to load config|api key required", re.I,
+    )),
+    ("bootstrap_missing", re.compile(
+        r"command not found|no such file or directory|notify: not found|"
+        r"skill.{0,40}(not found|unavailable)|unknown skill", re.I,
+    )),
+)
+
+
+def _classify_boot_symptom(text: str) -> str:
+    """Map private pane text to one fixed category; never return source text."""
+    for category, pattern in _BOOT_PATTERNS:
+        if pattern.search(text):
+            return category
+    return "harness_boot_unconfirmed"
+
+
+def _write_failure_record(run_root: Path, diagnostics: RunDiagnostics) -> Path:
+    """Atomically store only the allowlisted status schema with mode 0600."""
+    path = run_root / "failure.json"
+    temp = run_root / ".failure.json.tmp"
+    payload = json.dumps(diagnostics.as_record(), sort_keys=True, separators=(",", ":")) + "\n"
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            out.write(payload)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temp, path)
+        os.chmod(path, 0o600)
+    finally:
+        temp.unlink(missing_ok=True)
+    return path
+
+
+def _remove_raw_log(run_root: Path) -> None:
+    for path in run_root.rglob("*.log"):
+        try:
+            if not path.is_symlink() and path.is_file():
+                path.unlink()
+        except OSError:
+            pass
+
+
+def _diagnostic_line(diagnostics: RunDiagnostics) -> str:
+    stage = diagnostics.failure_stage or diagnostics.stage
+    category = diagnostics.category if diagnostics.category in _FAILURE_CATEGORIES else "internal_error"
+    return f"Run stopped: stage={stage} category={category}."
+
+
+def _track_adapter_replies(real_api, diagnostics: RunDiagnostics):
+    """Track only success/failure of the two expected adapter control replies."""
+    def tracked(method: str, path: str, payload: dict | None = None):
+        body = ((payload or {}).get("text") or {}).get("body", "")
+        if method == "POST" and path == "/messages" and body.startswith("Selected wa-test."):
+            stage = "selection_reply"
+        elif method == "POST" and path == "/messages" and body.startswith("Session started:"):
+            stage = "session_ack"
+        else:
+            return real_api(method, path, payload)
+        diagnostics.enter(stage)
+        try:
+            result = real_api(method, path, payload)
+        except Exception:
+            diagnostics.checks[stage] = "failed"
+            if stage == "selection_reply":
+                diagnostics.fail("adapter_reply_failed")
+            raise
+        if isinstance(result, tuple) and result and isinstance(result[0], int) and 200 <= result[0] < 300:
+            diagnostics.passed(stage)
+        else:
+            diagnostics.checks[stage] = "failed"
+            if stage == "selection_reply":
+                diagnostics.fail("adapter_reply_failed")
+        return result
+    return tracked
+
+
+def _capture_boot_symptom(env: dict[str, str], session: str) -> str:
+    """Classify the private tmux pane without returning or persisting its text."""
+    try:
+        status, text, _ = _tmux_value(env, "capture-pane", "-p", "-t", session, "-S", "-80")
+    except Exception:
+        return "harness_boot_unconfirmed"
+    if status:
+        return "harness_boot_unconfirmed"
+    return _classify_boot_symptom(text)
+
+
+def _harness_process_status(session: str, harness: str) -> bool | None:
+    """Use the real session runtime's process-tree probe; never return argv."""
+    try:
+        from sessions import session_has_agent_process
+        return session_has_agent_process(session, harness=harness)
+    except Exception:
+        return None
 
 
 def _say(message: str) -> None:
@@ -132,11 +298,122 @@ def _private_environment(
     for key in ("LANG", "LC_ALL"):
         if inherited.get(key):
             env[key] = inherited[key]
-    env[auth_variable] = str(auth_path)
+    if auth_variable == "CODEX_HOME":
+        # Keep Codex rollouts and config writes inside this run. The preflight
+        # adds only an opaque symlink to the owner's existing auth.json.
+        env[auth_variable] = str(run_root / "codex-home")
+    else:
+        env[auth_variable] = str(auth_path)
     # Never pass terminal multiplexing state from the owner's current shell.
     for key in ("TMUX", "TMUX_PANE", "WHATSAPP_AGENT_TOKEN"):
         env.pop(key, None)
     return env
+
+
+def _preflight_harness(
+    harness: str, env: dict[str, str], auth_path: Path, wolt_dir: Path,
+    diagnostics: RunDiagnostics,
+) -> None:
+    """Check offline CLI, launch wrapper, notify path and seeded skills."""
+    diagnostics.enter("preflight")
+    if not auth_path.is_dir() or not os.access(auth_path, os.R_OK | os.X_OK):
+        diagnostics.fail("preflight_failed")
+        raise RuntimeError("selected harness login directory is unavailable")
+    if (harness == "codex" and (
+            Path(env.get("CODEX_HOME", "")).resolve() == auth_path.resolve()
+            or env.get("WOLTSPACE_ISOLATION") != "host")):
+        diagnostics.fail("preflight_failed")
+        raise RuntimeError("isolated Codex and existing login paths are not separated")
+    if harness == "codex":
+        source_auth = auth_path / "auth.json"
+        private_codex_home = Path(env["CODEX_HOME"])
+        try:
+            source_auth_stat = source_auth.stat()
+        except OSError:
+            diagnostics.fail("auth_or_config")
+            raise RuntimeError("Codex auth file is unavailable") from None
+        if not stat.S_ISREG(source_auth_stat.st_mode) or not os.access(source_auth, os.R_OK):
+            diagnostics.fail("auth_or_config")
+            raise RuntimeError("Codex auth file is unavailable")
+        if not private_codex_home.resolve().is_relative_to(
+                (wolt_dir.parent.parent).resolve()):
+            diagnostics.fail("preflight_failed")
+            raise RuntimeError("private Codex state is outside the test root")
+        private_codex_home.mkdir(mode=0o700)
+        os.chmod(private_codex_home, 0o700)
+        (private_codex_home / "auth.json").symlink_to(source_auth.resolve())
+
+    old_path = list(sys.path)
+    sys.path[:0] = [str(p) for p in _PATHS]
+    try:
+        from harnesses import get_harness
+        from skills_sync import seed_wolt_skills
+
+        entry = get_harness(harness)
+        wrapper = Path(entry["wrapper"])
+        if not wrapper.is_file() or not os.access(wrapper, os.X_OK):
+            diagnostics.fail("executable_missing")
+            raise RuntimeError("selected harness wrapper is unavailable")
+
+        bin_dir = ROOT / "container" / "bin"
+        required = (bin_dir / "run-session.sh", bin_dir / "session-reg", bin_dir / "notify")
+        if (any(not p.is_file() or not os.access(p, os.X_OK) for p in required)
+                or not shutil.which("bash", path=env.get("PATH"))):
+            diagnostics.fail("bootstrap_missing")
+            raise RuntimeError("session bootstrap executable is unavailable")
+        session_path = os.pathsep.join((str(bin_dir), env.get("PATH", os.defpath)))
+        notify_path = shutil.which("notify", path=session_path)
+        if notify_path != str(bin_dir / "notify"):
+            diagnostics.fail("bootstrap_missing")
+            raise RuntimeError("notify is not resolvable from the session path")
+
+        # Match start_session's platform-skill bootstrap against this private
+        # synthetic wolt. It copies only checkout skills into the test root.
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            seed_wolt_skills(ROOT, wolt_dir)
+        skill_dir = wolt_dir / ".agents" / "skills"
+        if not ((skill_dir / "woltspace-start-chat" / "SKILL.md").is_file()
+                and (skill_dir / "woltspace-notify" / "SKILL.md").is_file()):
+            diagnostics.fail("bootstrap_missing")
+            raise RuntimeError("Codex platform skills were not prepared for the test wolt")
+
+        binary = shutil.which(harness, path=env.get("PATH"))
+        if not binary:
+            diagnostics.fail("executable_missing")
+            raise RuntimeError("selected harness executable is unavailable")
+        # The preflight home is disposable and CODEX_HOME is deliberately
+        # omitted: --version/--help must not inspect the owner's auth directory.
+        safe_env = {
+            key: env[key] for key in (
+                "PATH", "HOME", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+                "XDG_STATE_HOME", "XDG_CACHE_HOME", "LANG", "LC_ALL",
+            ) if env.get(key)
+        }
+        safe_env.pop("WHATSAPP_AGENT_TOKEN", None)
+        for args, category in ((("--version",), "version_probe_failed"),
+                               (("--help",), "help_probe_failed")):
+            try:
+                result = subprocess.run(
+                    [binary, *args], env=safe_env, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=15, check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                diagnostics.fail(category)
+                raise RuntimeError("selected harness offline preflight failed") from None
+            if result.returncode:
+                diagnostics.fail(category)
+                raise RuntimeError("selected harness offline preflight failed")
+        diagnostics.passed("preflight")
+    except RuntimeError:
+        if not diagnostics.category:
+            diagnostics.fail()
+        raise
+    except Exception:
+        diagnostics.fail("bootstrap_missing")
+        raise RuntimeError("isolated harness bootstrap preflight failed") from None
+    finally:
+        sys.path[:] = old_path
 
 
 def _create_synthetic_wolt(wolts_dir: Path, harness: str) -> Path:
@@ -391,8 +668,9 @@ def _cleanup_resources(
 
 
 def _finalize_run_root(run_root: Path, cleanup_ok: bool,
-                       tmux_root: Path | None = None) -> bool:
-    """Delete only after verified cleanup; retain a marked root otherwise."""
+                       tmux_root: Path | None = None,
+                       *, preserve_failure: bool = False) -> bool:
+    """After verified cleanup keep only a sanitized failure record, if any."""
     if cleanup_ok:
         try:
             if tmux_root is not None:
@@ -402,6 +680,19 @@ def _finalize_run_root(run_root: Path, cleanup_ok: bool,
                         or tmux_root.resolve().name != run_root.name):
                     raise RuntimeError("refusing to remove unexpected tmux directory")
                 shutil.rmtree(tmux_root)
+            if preserve_failure:
+                for child in run_root.iterdir():
+                    if child.name == "failure.json":
+                        continue
+                    if child.is_dir() and not child.is_symlink():
+                        shutil.rmtree(child)
+                    else:
+                        child.unlink(missing_ok=True)
+                record = run_root / "failure.json"
+                if (not record.is_file() or record.is_symlink()
+                        or stat.S_IMODE(record.stat().st_mode) != 0o600):
+                    raise RuntimeError("sanitized failure record validation failed")
+                return True
             shutil.rmtree(run_root)
             if not run_root.exists():
                 return True
@@ -447,55 +738,77 @@ def _wrap_notify_send(real_send, gate: OneNonceSendGate):
     return guarded_send
 
 
-def _run_model_test(harness: str) -> int:
+def _run_model_test(harness: str, diagnostics: RunDiagnostics | None = None) -> int:
+    diagnostics = diagnostics or RunDiagnostics(harness)
     owner_test._check_private_dir()
     inherited = {key: value for key, value in os.environ.items()
                  if key != "WHATSAPP_AGENT_TOKEN"}
-    auth_variable, auth_path = _auth_path(harness, inherited)
     run_root = Path(tempfile.mkdtemp(prefix="model-", dir=owner_test.PRIVATE))
     secret = {"value": ""}
     tmux_root = None
+    cleanup_ok = True
     old_env = os.environ.copy()
     old_env.pop("WHATSAPP_AGENT_TOKEN", None)
     old_path = list(sys.path)
     try:
         os.chmod(run_root, 0o700)
+        diagnostics.enter("preflight")
+        auth_variable, auth_path = _auth_path(harness, inherited)
         # Bound and validate the private tmux socket path before key access,
         # adapter initialization, or any API polling.
         tmux_root = _prepare_private_tmux_dir(run_root)
-        secret["value"] = owner_test._read_token()
-        return _run_model_session(
-            harness, inherited, auth_variable, auth_path, run_root, secret, tmux_root,
+        wolts_dir = run_root / "wolts"
+        wolts_dir.mkdir(mode=0o700)
+        wolt_dir = _create_synthetic_wolt(wolts_dir, harness)
+        preflight_env = _private_environment(
+            run_root, wolts_dir, harness, auth_variable, auth_path,
+            "127.0.0.1", 1, inherited, tmux_root,
         )
+        _preflight_harness(harness, preflight_env, auth_path, wolt_dir, diagnostics)
+        # The executable, host authentication path, skills, wrappers, and
+        # notify command are checked before the private WhatsApp key is read.
+        secret["value"] = owner_test._read_token()
+        result = _run_model_session(
+            harness, inherited, auth_variable, auth_path, run_root, secret, tmux_root,
+            diagnostics,
+        )
+        return 2 if diagnostics.category else result
+    except BaseException:
+        diagnostics.fail()
+        raise
     finally:
         secret["value"] = ""
         os.environ.clear()
         os.environ.update(old_env)
         sys.path[:] = old_path
-        if run_root.exists() and not (run_root / ".cleanup-required").exists():
-            if tmux_root is None:
-                shutil.rmtree(run_root, ignore_errors=True)
-            else:
-                # Failures before the server lifecycle begins can remove their
-                # empty per-run socket directory. Never remove a live socket.
-                socket_path = tmux_root / f"tmux-{os.getuid()}" / "default"
-                if not socket_path.exists():
-                    try:
-                        shutil.rmtree(tmux_root)
-                        shutil.rmtree(run_root)
-                    except OSError:
-                        (run_root / ".cleanup-required").touch(mode=0o600, exist_ok=True)
-                else:
-                    (run_root / ".cleanup-required").touch(mode=0o600, exist_ok=True)
+        if run_root.exists():
+            _remove_raw_log(run_root)
+            if diagnostics.category:
+                try:
+                    _write_failure_record(run_root, diagnostics)
+                except OSError:
+                    cleanup_ok = False
+            cleanup_ok = cleanup_ok and diagnostics.checks["cleanup"] != "failed"
+            finalized = _finalize_run_root(
+                run_root, cleanup_ok, tmux_root,
+                preserve_failure=bool(diagnostics.category) and cleanup_ok,
+            )
+            if not finalized:
+                diagnostics.enter("cleanup")
+                diagnostics.fail("cleanup_failed")
+                try:
+                    _write_failure_record(run_root, diagnostics)
+                except OSError:
+                    pass
 
 
 def _run_model_session(
     harness: str, inherited: dict[str, str], auth_variable: str,
     auth_path: Path, run_root: Path, secret: dict[str, str], tmux_root: Path,
+    diagnostics: RunDiagnostics,
 ) -> int:
     wolts_dir = run_root / "wolts"
-    wolts_dir.mkdir(mode=0o700)
-    _create_synthetic_wolt(wolts_dir, harness)
+    wolt_dir = wolts_dir / TEST_WOLT
     listener, port = _bind_local_socket()
     host = "127.0.0.1"
     env = _private_environment(
@@ -547,9 +860,11 @@ def _run_model_session(
 
             server_thread = threading.Thread(target=serve, name="wa-model-test-api", daemon=True)
             server_thread.start()
+            diagnostics.enter("server_health")
             _wait_for_server(
                 env["WOLTSPACE_API"], wolts_dir, server_thread, server_errors,
             )
+            diagnostics.passed("server_health")
 
             # Import the real adapter against a placeholder so the actual key
             # never enters os.environ, even transiently.
@@ -566,6 +881,7 @@ def _run_model_session(
             adapter.CURSOR = adapter.STATE / f"cursor-{account}.json"
             adapter.ROUTES = adapter.STATE / f"routes-{account}.json"
             adapter.LOCK = adapter.STATE / f"poll-{account}.lock"
+            adapter.api = _track_adapter_replies(adapter.api, diagnostics)
             activation = int(time.time())
             state = {"offset": 0, "activation": activation, "processed": []}
             adapter.atomic_json(adapter.CURSOR, state)
@@ -615,6 +931,7 @@ def _run_model_session(
                 text = (item.get("text") or {}).get("body", "")
                 participant = item.get("from", "")
                 if text.strip() == f"wolt {TEST_WOLT}":
+                    diagnostics.enter("inbound_selection")
                     with phase_lock:
                         if phase["selected"]:
                             phase["unexpected"] = True
@@ -624,6 +941,7 @@ def _run_model_session(
                     with phase_lock:
                         if current_routes.get(participant, {}).get("wolt") == TEST_WOLT:
                             phase["selected"] = True
+                            diagnostics.passed("inbound_selection")
                         else:
                             phase["unexpected"] = True
                     return
@@ -639,8 +957,15 @@ def _run_model_session(
                     # Mark before dispatch: a thrown/ambiguous start must not
                     # allow another model session from a duplicate phrase.
                     phase["prompted"] = True
+                diagnostics.enter("challenge_dispatch")
                 try:
                     adapter.handle(item, current_routes, started_at)
+                    route = current_routes.get(participant, {})
+                    if route.get("session"):
+                        diagnostics.passed("challenge_dispatch")
+                        diagnostics.enter("session_spawn")
+                    else:
+                        diagnostics.fail("session_not_started")
                 finally:
                     # The notify server may already be waiting for route
                     # persistence. Signal only after handle fully returns.
@@ -650,6 +975,7 @@ def _run_model_session(
             _say("In WhatsApp, send `wolt wa-test` and wait for the selection confirmation.")
             _say(f"Then send exactly: `{challenge}`")
             _say("The test sends no automatic retry after an ambiguous outbound timeout.")
+            diagnostics.enter("inbound_selection")
             deadline = time.monotonic() + TIMEOUT_SECONDS
             delivered = False
             while time.monotonic() < deadline:
@@ -658,46 +984,94 @@ def _run_model_session(
                     dispatch=dispatch_test_message,
                 )
                 routes = adapter.load(adapter.ROUTES)
+                if diagnostics.category:
+                    raise RuntimeError("an isolated startup or control reply check failed")
                 if phase["unexpected"]:
                     raise RuntimeError("an unexpected WhatsApp message arrived; it was not dispatched")
                 if send_gate.failure:
+                    diagnostics.enter("notify")
+                    diagnostics.fail(
+                        "notify_ambiguous" if send_gate.status == "ambiguous"
+                        else "notify_rejected",
+                    )
                     raise RuntimeError("the single notify attempt was rejected or ambiguous")
                 # Participant IDs are opaque; discover them only in memory.
                 matching = next((route for route in routes.values()
                                  if route.get("wolt") == TEST_WOLT), None)
-                if matching and matching.get("session") and matching["session"] != verified_session:
+                if matching and matching.get("session"):
                     session_name = matching["session"]
-                    record = _record_for_test(session_name, wolts_dir)
-                    if not record or record.get("adapter") != "whatsapp":
-                        raise RuntimeError("the test session route was not persisted")
-                    if record.get("whatsapp_account") != account:
-                        raise RuntimeError("the test session account binding did not match")
-                    if record.get("chat_id") != next(
-                        participant for participant, route in routes.items()
-                        if route is matching
-                    ):
-                        raise RuntimeError("the test session participant binding did not match")
-                    _verify_private_tmux(env, tmux_root, session_name)
-                    verified_session = session_name
+                    if session_name != verified_session:
+                        diagnostics.enter("session_spawn")
+                        record = _record_for_test(session_name, wolts_dir)
+                        if (not record or record.get("adapter") != "whatsapp"
+                                or not isinstance(record.get("runtime"), dict)
+                                or not record.get("runtime")):
+                            diagnostics.fail("session_not_started")
+                            raise RuntimeError("the test session route was not persisted")
+                        if record.get("whatsapp_account") != account:
+                            raise RuntimeError("the test session account binding did not match")
+                        if record.get("chat_id") != next(
+                            participant for participant, route in routes.items()
+                            if route is matching
+                        ):
+                            raise RuntimeError("the test session participant binding did not match")
+                        _verify_private_tmux(env, tmux_root, session_name)
+                        verified_session = session_name
+                        diagnostics.passed("session_spawn")
+                    if diagnostics.checks["harness_boot"] != "passed":
+                        diagnostics.enter("harness_boot")
+                        symptom = _capture_boot_symptom(env, session_name)
+                        if symptom in {"auth_or_config", "bootstrap_missing"}:
+                            diagnostics.fail(symptom)
+                            raise RuntimeError("the isolated harness reported a boot prerequisite error")
+                        if _harness_process_status(session_name, harness) is True:
+                            diagnostics.passed("harness_boot")
                 if send_gate.verified_session:
                     # The send gate may verify first if the model notifies
                     # before this polling loop observes the persisted route.
                     verified_session = send_gate.verified_session
+                    diagnostics.passed("harness_boot")
+                    diagnostics.enter("notify")
+                    diagnostics.passed("notify")
                 if (send_gate.status == "sent" and send_gate.verified_session
                         and verified_session == send_gate.verified_session
                         and session_name == send_gate.verified_session):
                     delivered = True
                     break
                 if server_errors:
+                    diagnostics.enter("server_health")
+                    diagnostics.fail("server_start_failed")
                     raise RuntimeError("the isolated local server stopped unexpectedly")
             if not delivered:
+                if not phase["selected"]:
+                    diagnostics.enter("inbound_selection")
+                    diagnostics.fail("selection_not_confirmed")
+                elif not phase["prompted"]:
+                    diagnostics.enter("challenge_dispatch")
+                    diagnostics.fail("session_not_started")
+                elif diagnostics.checks["session_spawn"] == "passed" and diagnostics.checks["harness_boot"] != "passed":
+                    diagnostics.enter("harness_boot")
+                    diagnostics.fail("harness_boot_unconfirmed")
+                else:
+                    diagnostics.enter("notify")
+                    diagnostics.fail("run_timeout")
                 raise TimeoutError("timed out waiting for the model reply")
             _say("Verified one real model session, account-bound registry route, and nonce reply.")
+            diagnostics.enter("notify")
+            diagnostics.passed("notify")
             return 0
+    except BaseException:
+        if not diagnostics.category:
+            diagnostics.fail()
+        raise
     finally:
+        diagnostics.enter("cleanup")
         cleanup_ok = _cleanup_resources(
             server, server_thread, listener, session_name, env, tmux_root,
         )
+        diagnostics.checks["cleanup"] = "passed" if cleanup_ok else "failed"
+        if not cleanup_ok and not diagnostics.category:
+            diagnostics.category = "cleanup_failed"
         if adapter is not None:
             adapter.TOKEN = ""
         secret["value"] = ""
@@ -706,7 +1080,7 @@ def _run_model_session(
         sys.path[:] = old_path
         sys.stdout, sys.stderr = original_stdout, original_stderr
         log_stream.close()
-        cleanup_ok = _finalize_run_root(run_root, cleanup_ok, tmux_root)
+        _remove_raw_log(run_root)
         if not cleanup_ok:
             _say("Cleanup needs attention; the private test directory was retained.")
 
@@ -714,23 +1088,27 @@ def _run_model_session(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", action="store_true", help="run the guarded live model-session test")
-    parser.add_argument("--harness", choices=("claude", "codex"),
+    parser.add_argument("--harness", choices=("codex",),
                         help="use this already-authorized harness login path")
     args = parser.parse_args()
     if not args.run or not args.harness:
         parser.error("both --run and --harness are required")
+    diagnostics = RunDiagnostics(args.harness)
     try:
         owner_test._require_tty()
         if input("This starts one real model session in private test state. Type MODEL to continue: ").strip() != "MODEL":
             print("Cancelled; no key was read and no process was started.")
             return 1
-        return _run_model_test(args.harness)
+        result = _run_model_test(args.harness, diagnostics)
+        if result and diagnostics.category:
+            _say(_diagnostic_line(diagnostics))
+        return result
     except KeyboardInterrupt:
         print("Stopped by owner; cleanup was attempted.")
         return 130
-    except Exception as exc:
-        print(f"Model-session test stopped ({type(exc).__name__}); no credential or message was printed.",
-              file=sys.stderr)
+    except Exception:
+        diagnostics.fail()
+        _say(_diagnostic_line(diagnostics))
         return 2
 
 

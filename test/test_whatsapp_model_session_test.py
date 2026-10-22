@@ -6,6 +6,7 @@ import stat
 import tempfile
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -50,6 +51,212 @@ def test_auth_path_supports_default_existing_codex_directory_without_reading_fil
 def test_auth_path_fails_when_existing_login_directory_is_unavailable(tmp_path):
     with pytest.raises(RuntimeError, match="no existing authorized login"):
         model_test._auth_path("claude", {"HOME": str(tmp_path)})
+
+
+def test_boot_symptom_classifier_returns_only_allowlisted_categories():
+    assert model_test._classify_boot_symptom(
+        "Not logged in. Run codex login. participant=opaque prompt=private"
+    ) == "auth_or_config"
+    assert model_test._classify_boot_symptom(
+        "notify: command not found; secret=synthetic"
+    ) == "bootstrap_missing"
+    assert model_test._classify_boot_symptom("ordinary model output") == "harness_boot_unconfirmed"
+
+
+def test_failure_record_has_only_sanitized_schema_and_private_mode(tmp_path):
+    root = tmp_path / "run"
+    root.mkdir(mode=0o700)
+    diagnostics = model_test.RunDiagnostics("codex")
+    diagnostics.enter("harness_boot")
+    diagnostics.fail("auth_or_config")
+    path = model_test._write_failure_record(root, diagnostics)
+    text = path.read_text()
+    data = __import__("json").loads(text)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert data == {
+        "schema": 1,
+        "harness": "codex",
+        "stage": "harness_boot",
+        "category": "auth_or_config",
+        "checks": {
+            "preflight": "pending", "server_health": "pending",
+            "inbound_selection": "pending", "selection_reply": "pending",
+            "challenge_dispatch": "pending", "session_spawn": "pending",
+            "harness_boot": "failed", "session_ack": "pending",
+            "notify": "pending", "cleanup": "not_reached",
+        },
+    }
+    assert all(term not in text for term in (
+        "synthetic-whatsapp-secret", "participant=", "private prompt",
+        "raw exception", "opaque",
+    ))
+
+
+def test_codex_preflight_checks_real_bootstrap_files_and_offline_cli(
+    tmp_path, monkeypatch,
+):
+    auth = tmp_path / "codex-auth"
+    auth.mkdir(mode=0o700)
+    (auth / "auth.json").write_text("synthetic-only")
+    run = tmp_path / "run"
+    run.mkdir(mode=0o700)
+    wolts = run / "wolts"
+    wolts.mkdir(mode=0o700)
+    wolt = model_test._create_synthetic_wolt(wolts, "codex")
+    env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(run / "home"),
+           "CODEX_HOME": str(run / "codex-home"), "WOLTSPACE_ISOLATION": "host"}
+    Path(env["HOME"]).mkdir(mode=0o700)
+    calls = []
+    real_which = model_test.shutil.which
+    fake_codex = tmp_path / "codex"
+    fake_codex.write_text("#!/bin/sh\nexit 0\n")
+    fake_codex.chmod(0o700)
+    monkeypatch.setattr(
+        model_test.shutil, "which",
+        lambda name, path=None: str(fake_codex) if name == "codex" else real_which(name, path=path),
+    )
+    monkeypatch.setattr(
+        model_test.subprocess, "run",
+        lambda argv, **kwargs: calls.append((argv, kwargs)) or SimpleNamespace(returncode=0),
+    )
+    diagnostics = model_test.RunDiagnostics("codex")
+    model_test._preflight_harness("codex", env, auth, wolt, diagnostics)
+    assert diagnostics.checks["preflight"] == "passed"
+    assert [call[0][1:] for call in calls] == [["--version"], ["--help"]]
+    assert all("CODEX_HOME" not in call[1]["env"] for call in calls)
+    assert (wolt / ".agents" / "skills" / "woltspace-start-chat" / "SKILL.md").is_file()
+    assert (wolt / ".agents" / "skills" / "woltspace-notify" / "SKILL.md").is_file()
+    assert Path(env["CODEX_HOME"]).is_relative_to(run)
+    assert (Path(env["CODEX_HOME"]) / "auth.json").is_symlink()
+    assert (Path(env["CODEX_HOME"]) / "auth.json").resolve() == (auth / "auth.json").resolve()
+
+
+def test_codex_preflight_executable_failure_is_allowlisted(tmp_path, monkeypatch):
+    auth = tmp_path / "codex-auth"
+    auth.mkdir()
+    (auth / "auth.json").write_text("synthetic-only")
+    run = tmp_path / "run"
+    run.mkdir()
+    wolts = run / "wolts"
+    wolts.mkdir()
+    wolt = model_test._create_synthetic_wolt(wolts, "codex")
+    real_which = model_test.shutil.which
+    monkeypatch.setattr(
+        model_test.shutil, "which",
+        lambda name, path=None: None if name == "codex" else real_which(name, path=path),
+    )
+    diagnostics = model_test.RunDiagnostics("codex")
+    with pytest.raises(RuntimeError, match="executable is unavailable"):
+        model_test._preflight_harness(
+            "codex", {"PATH": os.defpath, "HOME": str(run / "home"),
+                      "CODEX_HOME": str(run / "codex-home"), "WOLTSPACE_ISOLATION": "host"},
+            auth, wolt, diagnostics,
+        )
+    assert diagnostics.as_record()["category"] == "executable_missing"
+
+
+def test_real_session_prepare_uses_seeded_codex_skills_and_test_auth_home(tmp_path, monkeypatch):
+    import sessions
+    import harnesses
+
+    if not model_test.shutil.which("codex"):
+        pytest.skip("Codex CLI is not installed")
+
+    run = tmp_path / "run"
+    run.mkdir(mode=0o700)
+    wolts = run / "wolts"
+    wolts.mkdir(mode=0o700)
+    wolt = model_test._create_synthetic_wolt(wolts, "codex")
+    auth = run / "codex-home"
+    auth_source = run / "authorized-home"
+    auth_source.mkdir(mode=0o700)
+    (auth_source / "auth.json").write_text("synthetic-only")
+    model_test._preflight_harness(
+        "codex",
+        {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(run / "home"),
+         "CODEX_HOME": str(auth), "WOLTSPACE_ISOLATION": "host"},
+        auth_source, wolt, model_test.RunDiagnostics("codex"),
+    )
+    monkeypatch.setattr(sessions, "WOLTS_DIR", wolts)
+    monkeypatch.setenv("WOLTS_DIR", str(wolts))
+    monkeypatch.setenv("WOLTSPACE_WOLTS_DIR", str(wolts))
+    monkeypatch.setenv("WOLTSPACE_DIR", str(ROOT))
+    monkeypatch.setenv("CODEX_HOME", str(auth))
+    monkeypatch.setattr(harnesses, "codex_supports_no_daemon", lambda: True)
+    registry = sessions.SessionRegistry(wolts)
+    record = registry.create(
+        "wa-test-offline", wolt="wa-test", harness="codex", dir=str(wolt),
+        prompt="synthetic boot message", adapter="whatsapp", chat_id="user:4242",
+        whatsapp_account="synthetic-account",
+    )
+    command = sessions.prepare_session_command(
+        "wa-test-offline", "spawn", record["prompt"],
+    )
+    assert str(ROOT / "container" / "bin" / "wcodex") in command
+    assert "@woltspace-start-chat" in command
+    assert "notify --whatsapp user:4242" in command
+    assert (auth / "config.toml").is_file()
+    assert (wolt / ".agents" / "skills").is_symlink()
+
+
+def test_offline_executable_preflight_failure_precedes_key_read_and_preserves_only_record(
+    tmp_path, monkeypatch,
+):
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    auth = tmp_path / "auth"
+    auth.mkdir(mode=0o700)
+    monkeypatch.setattr(model_test.owner_test, "PRIVATE", private)
+    monkeypatch.setattr(model_test.owner_test, "_check_private_dir", lambda: None)
+    monkeypatch.setattr(
+        model_test, "_auth_path", lambda *_: ("CODEX_HOME", auth),
+    )
+    with tempfile.TemporaryDirectory(prefix="wpf-", dir="/tmp") as socket_base:
+        monkeypatch.setattr(model_test, "PRIVATE_TMUX_BASE", Path(socket_base))
+        key_reads = []
+        monkeypatch.setattr(
+            model_test.owner_test, "_read_token", lambda: key_reads.append(True),
+        )
+
+        def fail_preflight(_harness, _env, _auth_path, _wolt, diagnostics):
+            diagnostics.fail("executable_missing")
+            raise RuntimeError("raw private prompt and synthetic exception text")
+
+        monkeypatch.setattr(model_test, "_preflight_harness", fail_preflight)
+        diagnostics = model_test.RunDiagnostics("codex")
+        with pytest.raises(RuntimeError):
+            model_test._run_model_test("codex", diagnostics)
+    assert key_reads == []
+    records = list(private.glob("model-*/failure.json"))
+    assert len(records) == 1
+    assert stat.S_IMODE(records[0].stat().st_mode) == 0o600
+    assert sorted(p.name for p in records[0].parent.iterdir()) == ["failure.json"]
+    text = records[0].read_text()
+    assert "raw private prompt" not in text
+    assert "synthetic exception" not in text
+    assert __import__("json").loads(text)["category"] == "executable_missing"
+
+
+def test_main_outputs_only_sanitized_stage_and_category(monkeypatch, capfd):
+    import builtins
+
+    monkeypatch.setattr(model_test.sys, "argv", [
+        "whatsapp_model_session_test.py", "--run", "--harness", "codex",
+    ])
+    monkeypatch.setattr(model_test.owner_test, "_require_tty", lambda: None)
+    monkeypatch.setattr(builtins, "input", lambda *_: "MODEL")
+    monkeypatch.setattr(
+        model_test, "_run_model_test",
+        lambda _harness, _diagnostics: (_ for _ in ()).throw(
+            RuntimeError("synthetic-key participant=opaque private prompt raw exception")
+        ),
+    )
+    assert model_test.main() == 2
+    output = capfd.readouterr().out
+    assert output.strip() == "Run stopped: stage=preflight category=preflight_failed."
+    assert all(value not in output for value in (
+        "synthetic-key", "opaque", "private prompt", "raw exception",
+    ))
 
 
 def test_private_environment_is_minimal_and_keeps_auth_out_of_home(tmp_path):
@@ -147,6 +354,70 @@ def test_notify_gate_allows_only_one_exact_payload_after_route_verification():
     assert len(attempts) == 1
     assert gate.status == "sent"
     assert gate.verified_session == "s1"
+
+
+@pytest.mark.parametrize("mode", ["rejected", "timeout"])
+def test_notify_failure_record_hides_synthetic_participant_prompt_and_exception(
+    mode, tmp_path,
+):
+    root = tmp_path / "run"
+    root.mkdir(mode=0o700)
+    diagnostics = model_test.RunDiagnostics("codex")
+    diagnostics.enter("notify")
+    event = _completed_event()
+    sender_calls = []
+
+    async def sender():
+        sender_calls.append(True)
+        raise TimeoutError("raw exception prompt=synthetic participant=opaque secret=synthetic-key")
+
+    gate = model_test.OneNonceSendGate(
+        "🦦 wa-test: expected-nonce", lambda *_: "session-private", event,
+    )
+    message = "wrong-payload" if mode == "rejected" else "🦦 wa-test: expected-nonce"
+
+    async def run():
+        with pytest.raises(RuntimeError if mode == "rejected" else TimeoutError):
+            await gate.send("private-session", "opaque-participant", message,
+                            {"chat_id": "opaque-participant"}, sender)
+
+    asyncio.run(run())
+    category = "notify_rejected" if mode == "rejected" else "notify_ambiguous"
+    diagnostics.fail(category)
+    raw_log = root / "runner.log"
+    raw_log.write_text("private prompt, participant, and raw exception")
+    model_test._remove_raw_log(root)
+    path = model_test._write_failure_record(root, diagnostics)
+    assert path.read_text().find("opaque-participant") == -1
+    assert all(value not in path.read_text() for value in (
+        "private-session", "expected-nonce", "synthetic-key", "raw exception",
+    ))
+    assert not raw_log.exists()
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert sender_calls == ([] if mode == "rejected" else [True])
+    assert model_test._diagnostic_line(diagnostics) == (
+        f"Run stopped: stage=notify category={category}."
+    )
+
+
+def test_cleanup_failure_keeps_only_allowlisted_status_in_record(tmp_path):
+    root = tmp_path / "run"
+    root.mkdir(mode=0o700)
+    diagnostics = model_test.RunDiagnostics("codex")
+    diagnostics.enter("cleanup")
+    diagnostics.fail("cleanup_failed")
+    (root / "runner.log").write_text("prompt and synthetic key must not persist")
+    session_log = root / "wolts" / ".space" / "logs" / "session-boot.log"
+    session_log.parent.mkdir(parents=True)
+    session_log.write_text("private prompt and synthetic auth text")
+    model_test._remove_raw_log(root)
+    path = model_test._write_failure_record(root, diagnostics)
+    assert not model_test._finalize_run_root(root, False)
+    assert (root / ".cleanup-required").exists()
+    assert path.exists() and stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert not (root / "runner.log").exists()
+    assert not session_log.exists()
+    assert "synthetic key" not in path.read_text()
 
 
 def test_notify_gate_rejects_wrong_payload_or_unverified_session_before_io():
@@ -411,9 +682,16 @@ def test_path_length_preflight_happens_before_private_key_read(tmp_path, monkeyp
         with pytest.raises(RuntimeError, match="socket path exceeds"):
             model_test._run_model_test("claude")
         assert key_reads == []
+        records = list(private.glob("model-*/failure.json"))
+        assert len(records) == 1
+        assert stat.S_IMODE(records[0].stat().st_mode) == 0o600
+        assert __import__("json").loads(records[0].read_text())["stage"] == "preflight"
+        assert sorted(p.name for p in records[0].parent.iterdir()) == ["failure.json"]
     finally:
         if too_long.exists():
             too_long.rmdir()
+        for path in private.glob("model-*"):
+            __import__("shutil").rmtree(path)
 
 
 def test_real_tmux_private_socket_start_and_stop_smoke(tmp_path):

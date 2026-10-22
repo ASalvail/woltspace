@@ -53,23 +53,47 @@ outbound path.
 
 ## Single-message flow
 
-After review, invoke it from this checkout with the harness whose existing
-owner-authorized login is available:
+After review, invoke it from this checkout with the owner-selected Codex
+harness and its existing authorized login:
 
 ```sh
-.venv/bin/python scripts/whatsapp_model_session_test.py --run --harness claude
-# or: .venv/bin/python scripts/whatsapp_model_session_test.py --run --harness codex
+.venv/bin/python scripts/whatsapp_model_session_test.py --run --harness codex
 ```
 
 The command refuses non-interactive input and asks for the exact word `MODEL`
 before reading the private WhatsApp key. It prompts for two WhatsApp messages:
 the exact wolt selection and a generated nonce challenge.
-The selected harness must already have an authorized login directory:
-`CLAUDE_CONFIG_DIR` (or `~/.claude`) for Claude, or `CODEX_HOME` (or
-`~/.codex`) for Codex. Its CLI and `tmux` must be available on `PATH`. The
-runner sets a disposable `HOME` but passes that existing auth directory via
-the supported harness environment variable; harness state outside that auth
-directory is intentionally not copied.
+The selected harness must already have an authorized `CODEX_HOME` (or
+`~/.codex`) directory. Before reading the WhatsApp key or polling, the runner
+checks that the Codex executable and `wcodex`, `run-session.sh`, `session-reg`
+and `notify` are available; runs Codex `--version` and `--help` with a
+disposable `HOME` and without `CODEX_HOME`; seeds the actual platform skills
+into the synthetic wolt; and verifies the Codex start-chat/notify skills and
+the session's `notify` path resolve. This is an offline executable/bootstrap
+check only. It does not read or validate auth file contents or prove the
+account is signed in. The runner creates a private per-run `CODEX_HOME` and
+symlinks its `auth.json` to the selected existing login directory. Codex
+session/config writes therefore stay in the run root; no auth file is copied
+or opened by the runner. The supported `CODEX_HOME` variable is passed through
+the actual session runtime.
+
+On failure, the terminal reports only a fixed `stage` and allowlisted
+`category`. Stages are `preflight`, `server_health`, `inbound_selection`,
+`selection_reply`, `challenge_dispatch`, `session_spawn`, `harness_boot`,
+`session_ack`, `notify`, and `cleanup`; each has a `pending`, `passed`,
+`failed`, or `not_reached` status. Categories are fixed values such as
+`executable_missing`, `version_probe_failed`, `help_probe_failed`,
+`bootstrap_missing`, `auth_or_config`, `session_not_started`,
+`notify_rejected`, `notify_ambiguous`, `run_timeout`, and `cleanup_failed`.
+The failure record includes only the harness name, primary stage/category and
+those statuses. It never contains a prompt, participant/session ID,
+credential, exception text, or pane/log contents. Raw runner and session boot
+logs are removed after cleanup attempts.
+The runner classifies captured boot symptoms in memory; source text is never
+printed or stored. After verified cleanup, the private run directory retains
+only the mode-`0600` `failure.json`. If cleanup cannot be verified, it retains
+`.cleanup-required` and private cleanup state, removes `runner.log`, and writes
+the same sanitized record.
 
 The test allows one exact `🦦 wa-test: <nonce>` payload from the selected
 participant after checking the session registry, account fingerprint, and
