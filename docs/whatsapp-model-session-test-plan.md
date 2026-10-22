@@ -65,7 +65,10 @@ directory is intentionally not copied.
 
 The test allows one exact `🦦 wa-test: <nonce>` payload from the selected
 participant after checking the session registry, account fingerprint, and
-private tmux socket. The notification sender retains its bounded HTTP 429
+private tmux socket. If the model replies while the inbound handler is still
+saving its route, the notify request waits asynchronously for at most 45
+seconds for dispatch completion, then verifies the saved route and fails
+closed if it is absent. The notification sender retains its bounded HTTP 429
 handling (up to three attempts, honoring `Retry-After`). The runner does not
 retry an ambiguous timeout or any other send failure; the attempt is reserved
 before network I/O and all later notify attempts are rejected.

@@ -33,6 +33,7 @@ import scripts.whatsapp_owner_test as owner_test
 
 TEST_WOLT = "wa-test"
 TIMEOUT_SECONDS = 300
+DISPATCH_WAIT_SECONDS = 45
 _PATHS = (ROOT, ROOT / "container", ROOT / "container" / "lib", ROOT / "src")
 
 
@@ -231,9 +232,12 @@ def _kill_private_tmux(env: dict[str, str], run_root: Path) -> bool:
 class OneNonceSendGate:
     """Allow one precisely formatted notify send after authoritative checks."""
 
-    def __init__(self, expected_payload: str, verify):
+    def __init__(self, expected_payload: str, verify, dispatch_done: threading.Event,
+                 wait_seconds: float = DISPATCH_WAIT_SECONDS):
         self.expected_payload = expected_payload
         self.verify = verify
+        self.dispatch_done = dispatch_done
+        self.wait_seconds = wait_seconds
         self._lock = threading.Lock()
         self.status = "ready"
         self.verified_session = ""
@@ -241,11 +245,23 @@ class OneNonceSendGate:
 
     async def send(self, session: str, participant: str, message: str,
                    routing: dict | None, sender):
+        # A model can notify while adapter.handle is still returning from
+        # start_session and before it atomically saves adapter.ROUTES. Wait on
+        # a thread event without blocking this server's asyncio loop or holding
+        # the gate/phase locks. The dispatch thread always sets it in finally.
+        dispatch_finished = await asyncio.to_thread(
+            self.dispatch_done.wait, self.wait_seconds,
+        )
         with self._lock:
             if self.status != "ready":
                 raise RuntimeError("the single WhatsApp test send is already reserved")
-            # Reserve before validation and definitely before any network I/O.
+            # Reserve after bounded dispatch synchronization but before route
+            # validation and definitely before any network I/O.
             self.status = "reserved"
+            if not dispatch_finished:
+                self.status = "rejected"
+                self.failure = "the inbound dispatch did not finish in time"
+                raise RuntimeError(self.failure)
             if message != self.expected_payload:
                 self.status = "rejected"
                 self.failure = "the notify payload did not match the exact nonce"
@@ -343,12 +359,22 @@ def _expected_notify_payload(nonce: str) -> str:
 
 
 def _wrap_notify_send(real_send, gate: OneNonceSendGate):
-    async def guarded_send(adapter_name, session, message, chat_id, *args, **kwargs):
+    async def guarded_send(
+        adapter_name: str, session: str, message: str, chat_id: str,
+        thread_ts: str | None = None, routing: dict | None = None,
+        attachments=(), speech=None, session_record: dict | None = None,
+    ):
         if adapter_name != "whatsapp":
-            return await real_send(adapter_name, session, message, chat_id, *args, **kwargs)
+            return await real_send(
+                adapter_name, session, message, chat_id, thread_ts, routing,
+                attachments=attachments, speech=speech, session_record=session_record,
+            )
         return await gate.send(
-            session, str(chat_id), message, kwargs.get("routing"),
-            lambda: real_send(adapter_name, session, message, chat_id, *args, **kwargs),
+            session, str(chat_id), message, routing,
+            lambda: real_send(
+                adapter_name, session, message, chat_id, thread_ts, routing,
+                attachments=attachments, speech=speech, session_record=session_record,
+            ),
         )
     return guarded_send
 
@@ -466,6 +492,7 @@ def _run_model_session(
             phase: dict[str, Any] = {"selected": False, "prompted": False,
                                      "participant": "", "unexpected": False}
             phase_lock = threading.RLock()
+            dispatch_done = threading.Event()
 
             def verify_send_route(session: str, participant: str,
                                   routing: dict | None) -> str:
@@ -496,7 +523,7 @@ def _run_model_session(
                 return session
 
             send_gate = OneNonceSendGate(
-                _expected_notify_payload(nonce), verify_send_route,
+                _expected_notify_payload(nonce), verify_send_route, dispatch_done,
             )
             notify._send = _wrap_notify_send(notify._send, send_gate)
 
@@ -528,7 +555,12 @@ def _run_model_session(
                     # Mark before dispatch: a thrown/ambiguous start must not
                     # allow another model session from a duplicate phrase.
                     phase["prompted"] = True
-                adapter.handle(item, current_routes, started_at)
+                try:
+                    adapter.handle(item, current_routes, started_at)
+                finally:
+                    # The notify server may already be waiting for route
+                    # persistence. Signal only after handle fully returns.
+                    dispatch_done.set()
 
             _say("Isolated server is healthy on a private 127.0.0.1 port.")
             _say("In WhatsApp, send `wolt wa-test` and wait for the selection confirmation.")

@@ -2,6 +2,7 @@ import importlib.util
 import asyncio
 import runpy
 import stat
+import threading
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,12 @@ SPEC = importlib.util.spec_from_file_location(
 )
 model_test = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(model_test)
+
+
+def _completed_event():
+    event = threading.Event()
+    event.set()
+    return event
 
 
 def test_auth_path_uses_existing_configured_harness_directory(tmp_path):
@@ -118,7 +125,9 @@ def test_notify_gate_allows_only_one_exact_payload_after_route_verification():
         assert (session, participant, supplied_routing) == ("s1", "user:42", routing)
         return "s1"
 
-    gate = model_test.OneNonceSendGate("🦦 wa-test: wa-model-check", verify)
+    gate = model_test.OneNonceSendGate(
+        "🦦 wa-test: wa-model-check", verify, _completed_event(),
+    )
     wrapped = model_test._wrap_notify_send(
         lambda *args, **kwargs: _async_record(attempts, *args, **kwargs), gate,
     )
@@ -138,7 +147,9 @@ def test_notify_gate_allows_only_one_exact_payload_after_route_verification():
 
 def test_notify_gate_rejects_wrong_payload_or_unverified_session_before_io():
     attempts = []
-    gate = model_test.OneNonceSendGate("🦦 wa-test: nonce", lambda *_: "")
+    gate = model_test.OneNonceSendGate(
+        "🦦 wa-test: nonce", lambda *_: "", _completed_event(),
+    )
     wrapped = model_test._wrap_notify_send(
         lambda *args, **kwargs: _async_record(attempts, *args, **kwargs), gate,
     )
@@ -155,7 +166,9 @@ def test_notify_gate_rejects_wrong_payload_or_unverified_session_before_io():
 
 def test_notify_gate_requires_authoritative_verification_before_io():
     attempts = []
-    gate = model_test.OneNonceSendGate("🦦 wa-test: nonce", lambda *_: "")
+    gate = model_test.OneNonceSendGate(
+        "🦦 wa-test: nonce", lambda *_: "", _completed_event(),
+    )
     wrapped = model_test._wrap_notify_send(
         lambda *args, **kwargs: _async_record(attempts, *args, **kwargs), gate,
     )
@@ -174,7 +187,9 @@ def test_ambiguous_notify_send_is_terminal_and_never_retried():
     attempts = []
     routing = {"adapter": "whatsapp", "chat_id": "user:42",
                "whatsapp_account": "test-account", "wolt": "wa-test"}
-    gate = model_test.OneNonceSendGate("🦦 wa-test: nonce", lambda *_: "s1")
+    gate = model_test.OneNonceSendGate(
+        "🦦 wa-test: nonce", lambda *_: "s1", _completed_event(),
+    )
 
     async def fail_ambiguous(*_args, **_kwargs):
         attempts.append("sent")
@@ -193,6 +208,123 @@ def test_ambiguous_notify_send_is_terminal_and_never_retried():
     asyncio.run(run())
     assert attempts == ["sent"]
     assert gate.status == "ambiguous"
+
+
+@pytest.mark.parametrize("explicit", [
+    None,
+    {"adapter": "whatsapp", "participant": "user:42"},
+])
+def test_real_send_notification_passes_registry_routing_to_gate(
+    tmp_path, monkeypatch, explicit,
+):
+    import server.notify as notify
+
+    routing = {
+        "adapter": "whatsapp", "chat_id": "user:42",
+        "whatsapp_account": "test-account", "wolt": "wa-test",
+    }
+    expected = "🦦 wa-test: nonce"
+    attempts = []
+
+    def verify(session, participant, supplied_routing):
+        assert (session, participant) == ("s1", "user:42")
+        assert supplied_routing is routing
+        return "s1"
+
+    async def fake_send(adapter, session, message, chat_id, thread_ts=None,
+                        supplied_routing=None, **kwargs):
+        attempts.append((adapter, session, message, chat_id, thread_ts,
+                         supplied_routing, kwargs))
+        return {"adapter": adapter, "participant": chat_id}
+
+    gate = model_test.OneNonceSendGate(
+        expected, verify, _completed_event(),
+    )
+    monkeypatch.setattr(notify, "OUTBOX_DIR", tmp_path / "outbox")
+    monkeypatch.setattr(notify, "read_session_registry", lambda _session: routing)
+    monkeypatch.setattr(notify, "_send", model_test._wrap_notify_send(fake_send, gate))
+
+    result = asyncio.run(notify.send_notification("s1", expected, explicit))
+
+    assert result == {"adapter": "whatsapp", "participant": "user:42"}
+    assert len(attempts) == 1
+    assert attempts[0][5] is routing
+    assert gate.status == "sent"
+
+
+def test_real_send_notification_waits_for_dispatch_route_persistence(
+    tmp_path, monkeypatch,
+):
+    import server.notify as notify
+
+    routing = {
+        "adapter": "whatsapp", "chat_id": "user:42",
+        "whatsapp_account": "test-account", "wolt": "wa-test",
+    }
+    expected = "🦦 wa-test: nonce"
+    dispatch_done = threading.Event()
+    route_persisted = {"value": False}
+    attempts = []
+
+    def verify(session, participant, supplied_routing):
+        if (route_persisted["value"] and session == "s1"
+                and participant == "user:42" and supplied_routing is routing):
+            return "s1"
+        return ""
+
+    async def fake_send(*args, **kwargs):
+        attempts.append((args, kwargs))
+        return {"adapter": "whatsapp", "participant": "user:42"}
+
+    gate = model_test.OneNonceSendGate(
+        expected, verify, dispatch_done, wait_seconds=1,
+    )
+    monkeypatch.setattr(notify, "OUTBOX_DIR", tmp_path / "outbox")
+    monkeypatch.setattr(notify, "read_session_registry", lambda _session: routing)
+    monkeypatch.setattr(notify, "_send", model_test._wrap_notify_send(fake_send, gate))
+
+    async def run():
+        pending = asyncio.create_task(notify.send_notification("s1", expected))
+        await asyncio.sleep(0.02)
+        assert not pending.done()
+        assert gate.status == "ready"
+        assert attempts == []
+        route_persisted["value"] = True
+        dispatch_done.set()
+        return await pending
+
+    assert asyncio.run(run())["participant"] == "user:42"
+    assert len(attempts) == 1
+    assert gate.status == "sent"
+    assert gate.verified_session == "s1"
+
+
+def test_real_send_notification_fails_closed_after_dispatch_without_route(
+    tmp_path, monkeypatch,
+):
+    import server.notify as notify
+
+    routing = {
+        "adapter": "whatsapp", "chat_id": "user:42",
+        "whatsapp_account": "test-account", "wolt": "wa-test",
+    }
+    attempts = []
+    gate = model_test.OneNonceSendGate(
+        "🦦 wa-test: nonce", lambda *_: "", _completed_event(),
+    )
+    monkeypatch.setattr(notify, "OUTBOX_DIR", tmp_path / "outbox")
+    monkeypatch.setattr(notify, "read_session_registry", lambda _session: routing)
+    monkeypatch.setattr(
+        notify, "_send",
+        model_test._wrap_notify_send(
+            lambda *args, **kwargs: _async_record(attempts, *args, **kwargs), gate,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="route was not verified"):
+        asyncio.run(notify.send_notification("s1", "🦦 wa-test: nonce"))
+    assert attempts == []
+    assert gate.status == "rejected"
 
 
 async def _async_record(records, *args, **kwargs):
