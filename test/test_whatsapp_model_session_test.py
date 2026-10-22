@@ -113,6 +113,17 @@ def test_codex_process_presence_is_not_readiness(monkeypatch):
     assert record["checks"]["harness_boot"] == "pending"
 
 
+def test_harness_process_probe_excludes_launcher_shims(monkeypatch):
+    import sessions
+    calls = []
+    monkeypatch.setattr(
+        sessions, "session_has_agent_process",
+        lambda *args, **kwargs: calls.append(kwargs) or True,
+    )
+    assert model_test._harness_process_status("synthetic", "codex") is True
+    assert calls == [{"harness": "codex", "include_launching": False}]
+
+
 def test_failure_record_has_only_sanitized_schema_and_private_mode(tmp_path):
     root = tmp_path / "run"
     root.mkdir(mode=0o700)
@@ -470,6 +481,8 @@ def test_notify_gate_distinguishes_not_seen_from_blocked_send():
         ))
         await asyncio.wait_for(started.wait(), timeout=1)
         assert diagnostics.as_record()["notify_attempt"] == "send_in_flight"
+        assert not model_test._confirmed_notify(gate, "session-safe", diagnostics)
+        assert diagnostics.as_record()["checks"]["notify"] != "passed"
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task

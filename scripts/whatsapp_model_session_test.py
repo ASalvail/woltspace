@@ -337,10 +337,10 @@ def _capture_boot_symptom_text(record: dict) -> str | None:
 
 
 def _harness_process_status(session: str, harness: str) -> bool | None:
-    """Use the real session runtime's process-tree probe; never return argv."""
+    """Probe the actual harness, excluding launching shims; never return argv."""
     try:
         from sessions import session_has_agent_process
-        return session_has_agent_process(session, harness=harness)
+        return session_has_agent_process(session, harness=harness, include_launching=False)
     except Exception:
         return None
 
@@ -892,12 +892,23 @@ def _wrap_notify_send(real_send, gate: OneNonceSendGate):
     return guarded_send
 
 
-def _run_model_test(harness: str, diagnostics: RunDiagnostics | None = None) -> int:
+def _confirmed_notify(gate: OneNonceSendGate, session: str,
+                      diagnostics: RunDiagnostics) -> bool:
+    if gate.status != "sent" or not session or gate.verified_session != session:
+        return False
+    diagnostics.enter("notify")
+    diagnostics.passed("notify")
+    return True
+
+
+def _run_model_test(harness: str, diagnostics: RunDiagnostics | None = None,
+                    *, startup_runner=None) -> int:
     diagnostics = diagnostics or RunDiagnostics(harness)
     owner_test._check_private_dir()
     inherited = {key: value for key, value in os.environ.items()
                  if key != "WHATSAPP_AGENT_TOKEN"}
-    run_root = Path(tempfile.mkdtemp(prefix="model-", dir=owner_test.PRIVATE))
+    prefix = "startup-" if startup_runner is not None else "model-"
+    run_root = Path(tempfile.mkdtemp(prefix=prefix, dir=owner_test.PRIVATE))
     secret = {"value": ""}
     tmux_root = None
     cleanup_ok = True
@@ -921,14 +932,21 @@ def _run_model_test(harness: str, diagnostics: RunDiagnostics | None = None) -> 
         _preflight_harness(harness, preflight_env, auth_path, wolt_dir, diagnostics)
         # The executable, host authentication path, skills, wrappers, and
         # notify command are checked before the private WhatsApp key is read.
-        secret["value"] = owner_test._read_token()
-        result = _run_model_session(
-            harness, inherited, auth_variable, auth_path, run_root, secret, tmux_root,
-            diagnostics,
-        )
+        if startup_runner is not None:
+            result = startup_runner(
+                harness, inherited, auth_variable, auth_path, run_root, tmux_root,
+                diagnostics,
+            )
+        else:
+            secret["value"] = owner_test._read_token()
+            result = _run_model_session(
+                harness, inherited, auth_variable, auth_path, run_root, secret, tmux_root,
+                diagnostics,
+            )
         return 2 if diagnostics.category else result
     except BaseException:
-        diagnostics.fail()
+        if not diagnostics.category:
+            diagnostics.fail()
         raise
     finally:
         secret["value"] = ""
@@ -1197,11 +1215,8 @@ def _run_model_session(
                     # The send gate may verify first if the model notifies
                     # before this polling loop observes the persisted route.
                     verified_session = send_gate.verified_session
-                    diagnostics.enter("notify")
-                    diagnostics.passed("notify")
-                if (send_gate.status == "sent" and send_gate.verified_session
-                        and verified_session == send_gate.verified_session
-                        and session_name == send_gate.verified_session):
+                if (verified_session == send_gate.verified_session
+                        and _confirmed_notify(send_gate, session_name, diagnostics)):
                     delivered = True
                     break
                 if server_errors:
@@ -1274,7 +1289,8 @@ def main() -> int:
         print("Stopped by owner; cleanup was attempted.")
         return 130
     except Exception:
-        diagnostics.fail()
+        if not diagnostics.category:
+            diagnostics.fail()
         _say(_diagnostic_line(diagnostics))
         return 2
 

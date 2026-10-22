@@ -53,6 +53,48 @@ outbound path.
 
 ## Single-message flow
 
+### Startup inspection before another WhatsApp attempt
+
+The separate `scripts/whatsapp_startup_inspection.py` runner is prepared for
+implementation review. After review, its proposed command from this checkout is:
+
+```sh
+.venv/bin/python scripts/whatsapp_startup_inspection.py --run --harness codex --timeout 120
+```
+
+This starts one real Codex session through the supported `sessions.start_session`
+path, with explicit `prompt` execution policy, existing authorized login,
+private HOME/CODEX_HOME, platform skills and the short private tmux socket.
+It does not grant Auto or answer dialogs. The prompt is fixed synthetic text
+asking for one `startup-inspection-ok` notification. The actual notify CLI
+posts to the private local server; the entire sender boundary is replaced
+with an exact-message/session/account gate and local mocked sender. No
+WhatsApp credential is opened, no WhatsApp adapter is imported, and no
+WhatsApp polling or provider sending occurs. No owner WhatsApp message is
+needed. A local mocked notification demonstrates the harness/bootstrap/CLI
+path only; it does not establish full WhatsApp integration success.
+
+`--timeout` bounds the observation window starting before session creation
+(default 120 seconds, maximum 180). Executable preflight and the existing
+bounded platform metadata/startup/cleanup operations can extend wall time.
+The same command executes cleanup in `finally`: stop the exact synthetic
+session, stop the private local server/listener, and stop only that private
+tmux server. On success it prints the fixed local-notification and cleanup
+status plus allowlisted process/readiness/symptom/notify-attempt fields, and
+removes its `startup-*` root. Failures preserve only the validated
+schema-2 mode-0600 record after verified cleanup; uncertain cleanup retains
+the marked private root. The prior `model-*` roots and saved credential are
+untouched. No separate broad cleanup command is required; a retained marker
+requires scoped inspection. Do not wrap the command in an external hard kill
+that would skip its cleanup.
+
+Offline orchestration tests use a real registry, real notify CLI and real
+local API, with session spawn and private-tmux verification mocked. They
+exercise success, wrong payload, missing notify/timeout, detected trust
+prompt, spawn error, and cleanup failure; no model or provider is launched.
+
+### WhatsApp model-session flow
+
 After review, invoke it from this checkout with the owner-selected Codex
 harness and its existing authorized login:
 
