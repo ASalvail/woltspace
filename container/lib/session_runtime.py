@@ -461,6 +461,13 @@ class TmuxSessionRuntime:
         prefix = "env -u WHATSAPP_AGENT_TOKEN"
         return f"{prefix} {' '.join(values)} {command}" if values else f"{prefix} {command}"
 
+    @staticmethod
+    def _tmux_environment() -> dict[str, str]:
+        """Keep connector credentials out of the tmux client/server env."""
+        env = os.environ.copy()
+        env.pop("WHATSAPP_AGENT_TOKEN", None)
+        return env
+
     def spawn(self, session_id: str, cwd: str, command: str) -> RuntimeHandle:
         """Create one named tmux session and return its exact initial pane.
 
@@ -490,6 +497,7 @@ class TmuxSessionRuntime:
             text=True,
             check=True,
             timeout=_TMUX_TIMEOUT,
+            env=self._tmux_environment(),
         )
         stdout = result.stdout if isinstance(result.stdout, str) else ""
         pane_id = stdout.strip() if stdout.strip().startswith("%") else ""
@@ -527,6 +535,7 @@ class TmuxSessionRuntime:
             text=True,
             check=True,
             timeout=_TMUX_TIMEOUT,
+            env=self._tmux_environment(),
         )
         stdout = result.stdout if isinstance(result.stdout, str) else ""
         pane_id = stdout.strip() if stdout.strip().startswith("%") else ""

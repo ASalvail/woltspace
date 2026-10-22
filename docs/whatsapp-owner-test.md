@@ -28,13 +28,14 @@ inside a child process and holds it only in process memory while the test runs.
 It does not start a Wolt session, agent, tmux server, or lodge server.
 
 After the isolated poll starts, send `wolt wa-test` to the WhatsApp Agent and
-wait for the selection confirmation. Then send the one-time `wa-check-…` phrase
-printed by the local runner. That single test message is dispatched to the
-mocked session handler, which returns one fixed reply through the real WhatsApp
-Agent API. The runner prints no participant ID or inbound message text. It
-stops after one reply, on timeout, or when you press Ctrl+C. Stage one proves
-the Agent API transport and adapter routing with mocked session dispatch; it
-does not prove real model execution or `server.notify` delivery.
+wait for the selection confirmation. That is one expected outbound message.
+Then send the one-time `wa-check-…` phrase printed by the local runner. The
+single test message is dispatched to the mocked session handler, which returns
+one fixed reply through the real WhatsApp Agent API. The runner prints no
+participant ID or inbound message text. It stops after that reply, on timeout,
+or when you press Ctrl+C. Stage one proves the Agent API transport and adapter
+routing with mocked session dispatch; it does not prove real model execution or
+`server.notify` delivery.
 
 For stage two, first complete stage one so the key is stored. Then run:
 
@@ -49,8 +50,12 @@ and WhatsApp sender for one canned reply. It tests registry/account binding,
 notify routing, rate limiting, and the official send API. It still does not
 launch a model session or touch the installed server or port 7777.
 
+The API client may perform bounded retries after an explicit HTTP 429, using
+the server's `Retry-After` value. It does not retry an ambiguous send timeout.
 If a send times out, check WhatsApp before running another test because the
-outcome may be ambiguous. No automatic retry is performed by the test script.
+outcome may be ambiguous. Each one-time phrase reserves a single outbound
+attempt before the send starts, even if a duplicate update arrives in the same
+poll batch.
 
 ## Cleanup
 

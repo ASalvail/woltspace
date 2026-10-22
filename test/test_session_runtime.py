@@ -276,6 +276,12 @@ class TestTmuxSessionRuntime:
         assert marker not in str(command)
         assert command[command.index("-e") + 1] == "WHATSAPP_AGENT_TOKEN="
         assert command[-1].startswith("env -u WHATSAPP_AGENT_TOKEN ")
+        assert "WHATSAPP_AGENT_TOKEN" not in runner.calls[0][1]["env"]
+        handle = runtime.spawn_in_session(
+            RuntimeHandle("named-session", "named-session", "%17"), str(tmp_path), "cat"
+        )
+        assert "WHATSAPP_AGENT_TOKEN" not in runner.calls[1][1]["env"]
+        assert runner.calls[1][0][runner.calls[1][0].index("-e") + 1] == "WHATSAPP_AGENT_TOKEN="
 
     def test_run_session_wrapper_unsets_whatsapp_secret_before_agent_bootstrap(self):
         wrapper = Path(__file__).resolve().parents[1] / "container" / "bin" / "run-session.sh"

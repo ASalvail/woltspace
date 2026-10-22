@@ -24,10 +24,14 @@ outbound path.
   server's notify sender, run the isolated server in the test orchestrator
   process with an in-process secret lookup backed by that private file; do not
   duplicate the key into `.env` or a tracked artifact.
-- Set `TMUX_TMPDIR` and `HOME` to private directories inside the test root.
-  The model harness must use a dedicated test login configured privately in
-  that home. Do not inherit the owner's normal agent credentials or copy them
-  from the lodge.
+- Set `TMUX_TMPDIR` to a private directory inside the test root. Use an
+  already owner-authorized harness login through the existing supported
+  authentication path (for example, the configured `CODEX_HOME` or
+  `CLAUDE_CONFIG_DIR` path carried by the session runtime). Do not copy,
+  print, or inspect authentication files. The test runner should pass only the
+  selected harness path through the existing session environment allowlist;
+  it should not inherit unrelated owner environment variables. If no supported
+  authorized harness login is configured, stop and report that prerequisite.
 
 ## Single-message flow
 
@@ -47,8 +51,8 @@ outbound path.
 
 ## Stop conditions
 
-Do not run this plan if a dedicated model test login is unavailable, the
-isolated API endpoint cannot be confirmed, or the tmux socket cannot be proven
-private. Stop after stage two's real registry/notify path instead. Never use a
-real owner task as the test prompt, and do not retry an ambiguous WhatsApp send
-until the owner checks the chat.
+Do not run this plan if an owner-authorized supported harness login is
+unavailable, the isolated API endpoint cannot be confirmed, or the tmux socket
+cannot be proven private. Stop after stage two's real registry/notify path
+instead. Never use a real owner task as the test prompt, and do not retry an
+ambiguous WhatsApp send until the owner checks the chat.

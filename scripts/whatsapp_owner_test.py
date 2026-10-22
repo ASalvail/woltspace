@@ -137,7 +137,22 @@ def _isolated_run() -> int:
     # environment inherited by adapters, sessions, tmux, or child processes.
     token = _read_token()
     run_root = Path(tempfile.mkdtemp(prefix="run-", dir=PRIVATE))
-    os.chmod(run_root, 0o700)
+    try:
+        os.chmod(run_root, 0o700)
+        return _isolated_run_body(token, run_root)
+    except KeyboardInterrupt:
+        print("Stopped by owner; no additional reply was sent.")
+        return 130
+    except Exception as exc:
+        # Setup and import errors are kept as private as request errors.
+        print(f"Isolated check stopped ({type(exc).__name__}); no credential value was printed.", file=sys.stderr)
+        return 2
+    finally:
+        del token
+        shutil.rmtree(run_root, ignore_errors=True)
+
+
+def _isolated_run_body(token: str, run_root: Path) -> int:
     wolt_json = run_root / TEST_WOLT / "wolt" / "wolt.json"
     wolt_json.parent.mkdir(mode=0o700, parents=True)
     wolt_json.write_text(json.dumps({"name": TEST_WOLT, "type": "otter"}) + "\n")
@@ -158,40 +173,49 @@ def _isolated_run() -> int:
     # stubs cannot start sessions or reach the running server.
     core = types.ModuleType("bot.core")
     completed = {"reply": False, "error": ""}
+    send_attempt = {"started": False}
     adapter_ref: dict[str, object] = {}
     import secrets
     challenge = "wa-check-" + secrets.token_hex(4)
 
+    def send_canned_reply(participant: str) -> None:
+        if send_attempt["started"] or completed["reply"] or completed["error"]:
+            return
+        # Set before I/O: timeout/error leaves delivery ambiguous, so never
+        # issue a second send for the same one-time phrase.
+        send_attempt["started"] = True
+        adapter = adapter_ref["adapter"]
+        try:
+            adapter.api("POST", "/messages", {
+                "messaging_product": "whatsapp",
+                "to": participant,
+                "type": "text",
+                "text": {"body": "WhatsApp transport check succeeded; the isolated test runner received your message."},
+            })
+        except Exception as exc:
+            completed["error"] = type(exc).__name__
+        else:
+            completed["reply"] = True
+
+    def message_text(prompt: str) -> str:
+        marker = "]:"
+        return prompt.split(marker, 1)[1].split("\n", 1)[0].strip() if marker in prompt else ""
+
     def start_claude_session(prompt: str, *, routing: dict, **kwargs) -> dict:
-        if challenge in prompt and not completed["reply"] and not completed["error"]:
-            adapter = adapter_ref["adapter"]
-            try:
-                adapter.api("POST", "/messages", {
-                    "messaging_product": "whatsapp",
-                    "to": routing["chat_id"],
-                    "type": "text",
-                    "text": {"body": "WhatsApp transport check succeeded; the isolated test runner received your message."},
-                })
-                completed["reply"] = True
-            except Exception as exc:
-                completed["error"] = type(exc).__name__
+        if message_text(prompt) == challenge:
+            send_canned_reply(routing["chat_id"])
         return {"name": "isolated-whatsapp-test-session", "url": ""}
 
     core.start_claude_session = start_claude_session
 
     def message_session(_session_name: str, prompt: str) -> dict:
-        if challenge not in prompt or completed["reply"]:
+        if message_text(prompt) != challenge or completed["reply"] or completed["error"]:
             return {"ok": True}
         marker = "[WhatsApp message from "
         participant = prompt.split(marker, 1)[1].split("]:", 1)[0]
-        adapter = adapter_ref["adapter"]
-        adapter.api("POST", "/messages", {
-            "messaging_product": "whatsapp",
-            "to": participant,
-            "type": "text",
-            "text": {"body": "WhatsApp transport check succeeded; the isolated test runner received your message."},
-        })
-        completed["reply"] = True
+        send_canned_reply(participant)
+        if completed["error"]:
+            raise RuntimeError("mocked reply outcome is ambiguous")
         return {"ok": True}
 
     core.message_session = message_session
@@ -229,7 +253,7 @@ def _isolated_run() -> int:
     adapter.atomic_json(adapter.CURSOR, state)
     mode = sys.argv[1]
     if mode == "--notify-run":
-        dispatch = _notify_path_dispatch(adapter, run_root, challenge, completed)
+        dispatch = _notify_path_dispatch(adapter, run_root, challenge, completed, send_attempt)
         print(f"Isolated notify-path poll started. Send `{challenge}` once in WhatsApp.")
     else:
         dispatch = adapter.handle
@@ -241,7 +265,9 @@ def _isolated_run() -> int:
     deadline = time.monotonic() + TIMEOUT_SECONDS
     try:
         while time.monotonic() < deadline and not completed["reply"] and not completed["error"]:
-            state = adapter.poll_once(state, routes, activation, dispatch=dispatch)
+            state = adapter.poll_once(
+                state, routes, activation, cursor_path=adapter.CURSOR, dispatch=dispatch
+            )
             routes = adapter.load(adapter.ROUTES)
             if routes and not selected_prompted:
                 selected_prompted = True
@@ -262,8 +288,6 @@ def _isolated_run() -> int:
         # diagnose the test and this keeps transport details out of logs.
         print(f"Isolated check stopped ({type(exc).__name__}); no credential value was printed.", file=sys.stderr)
         return 2
-    finally:
-        shutil.rmtree(run_root, ignore_errors=True)
 
 
 def _cleanup() -> int:
@@ -276,7 +300,8 @@ def _cleanup() -> int:
     return 0
 
 
-def _notify_path_dispatch(adapter, run_root: Path, challenge: str, completed: dict):
+def _notify_path_dispatch(adapter, run_root: Path, challenge: str, completed: dict,
+                          send_attempt: dict):
     """Build a real registry→notify→sender test in the isolated data root."""
     import asyncio
     import server.notify as notify
@@ -288,8 +313,11 @@ def _notify_path_dispatch(adapter, run_root: Path, challenge: str, completed: di
     def dispatch(item: dict, routes: dict, activation: int) -> None:
         text = (item.get("text") or {}).get("body", "")
         participant = item.get("from", "")
-        if text.strip() != challenge or not participant.startswith("user:"):
+        if (text.strip() != challenge or not participant.startswith("user:")
+                or send_attempt["started"] or completed["reply"] or completed["error"]):
             return
+        # Reserve the one permitted delivery before any session/notify work.
+        send_attempt["started"] = True
         try:
             registry = notify.SessionRegistry(run_root)
             registry.create(

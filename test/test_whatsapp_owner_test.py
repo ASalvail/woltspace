@@ -1,8 +1,12 @@
 import importlib.util
+import json
 import os
+import secrets
 import sys
 import stat
 import tomllib
+import urllib.request
+import time
 from pathlib import Path
 
 import pytest
@@ -33,41 +37,114 @@ def test_owner_child_environment_drops_whatsapp_secret(monkeypatch):
     assert os.environ["WHATSAPP_AGENT_TOKEN"] == "synthetic-test-placeholder"
 
 
-def test_owner_notify_stage_uses_real_registry_and_notify_with_mocked_transport(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("mode", ["--transport-run", "--notify-run"])
+@pytest.mark.parametrize("ambiguous", [False, True])
+def test_full_isolated_runner_modes_use_mocked_network_and_private_environment(
+    tmp_path, monkeypatch, capsys, mode, ambiguous
 ):
-    import hashlib
-    from types import SimpleNamespace
-    import server.notify as notify
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    monkeypatch.setattr(owner_test, "PRIVATE", private)
+    monkeypatch.setattr(owner_test, "_read_token", lambda: "synthetic-test-token")
+    monkeypatch.setattr(secrets, "token_hex", lambda _size: "abcd1234")
+    monkeypatch.setattr(sys, "argv", [str(ROOT / "scripts" / "whatsapp_owner_test.py"), mode])
 
-    sent = []
-    monkeypatch.setattr(notify, "WOLTS_DIR", tmp_path)
-    monkeypatch.setattr(notify, "dotenv_env", lambda name: "synthetic-token" if name == "WHATSAPP_AGENT_TOKEN" else "")
-    monkeypatch.setattr(notify, "append_chat_history", lambda *args: None)
-    async def mock_transport(*args):
-        return _record(sent, args)
-    monkeypatch.setattr(notify, "whatsapp_send", mock_transport)
-    wolt_json = tmp_path / owner_test.TEST_WOLT / "wolt" / "wolt.json"
-    wolt_json.parent.mkdir(parents=True)
-    wolt_json.write_text('{"name":"wa-test","type":"otter"}\n')
-    adapter = SimpleNamespace(
-        TOKEN="synthetic-token",
-        ACCOUNT=hashlib.sha256(b"synthetic-token").hexdigest()[:20],
-    )
-    challenge = "wa-check-synthetic"
-    completed = {"reply": False, "error": ""}
-    dispatch = owner_test._notify_path_dispatch(adapter, tmp_path, challenge, completed)
-    dispatch({
-        "from": "user:99",
-        "text": {"body": challenge},
-    }, {}, 100)
-    assert completed == {"reply": True, "error": ""}
-    assert sent == [("synthetic-token", "user:99", "WhatsApp registry and notify path check succeeded.")]
+    phrase = "wa-check-abcd1234"
+    timestamp = int(time.time()) + 5
+    def message(mid, body):
+        return {"id": mid, "from": "user:99", "timestamp": str(timestamp),
+                "type": "text", "text": {"body": body}}
+    updates = ([message("select", "wolt wa-test"), message("challenge", phrase),
+                message("duplicate", phrase)] if mode == "--transport-run"
+               else [message("challenge", phrase), message("duplicate", phrase)])
+    get_count = 0
+    sent_posts = []
+    ambiguous_attempts = []
 
+    class Response:
+        status = 200
+        def __init__(self, body):
+            self.body = body
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def read(self): return json.dumps(self.body).encode()
 
-def _record(items, value):
-    items.append(value)
-    return {"ok": True}
+    def fake_urlopen(request, timeout=0):
+        nonlocal get_count
+        if request.get_method() == "GET":
+            batch = updates if get_count == 0 else []
+            get_count += 1
+            return Response({"next_offset": get_count, "entry": [{"changes": [{"value": {"messages": batch}}]}]})
+        payload = json.loads(request.data.decode())
+        sent_posts.append(payload)
+        if ambiguous and "transport check succeeded" in payload["text"]["body"]:
+            ambiguous_attempts.append(payload)
+            raise TimeoutError("synthetic ambiguous send")
+        return Response({"messages": [{"id": "sent"}]})
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): return False
+        async def post(self, url, *, headers, json):
+            assert headers["Authorization"] == "Bearer synthetic-test-token"
+            assert "api.whatsapp.com" in url
+            sent_posts.append(json)
+            if ambiguous:
+                ambiguous_attempts.append(json)
+                raise TimeoutError("synthetic ambiguous notify send")
+            return type("HttpResponse", (), {"status_code": 200, "headers": {},
+                                              "json": lambda self: {"messages": [{"id": "sent"}]}})()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+    # Force fresh imports so the test exercises the runner's complete setup.
+    names = ("bot.whatsapp_adapter", "server.notify", "server.config",
+             "server.notification_senders", "server.notification_types",
+             "server.speech", "server.state", "sessions", "bot.core", "wolts",
+             "lib", "lib.paths", "lib.notify_prompt")
+    saved = {name: sys.modules.pop(name) for name in names if name in sys.modules}
+    missing = object()
+    parent_attrs = {}
+    for name in names:
+        parent_name, _, attribute = name.rpartition(".")
+        parent = sys.modules.get(parent_name)
+        if parent is not None:
+            parent_attrs[(parent, attribute)] = getattr(parent, attribute, missing)
+    previous_env = os.environ.copy()
+    previous_path = list(sys.path)
+    try:
+        result = owner_test._isolated_run()
+    finally:
+        os.environ.clear()
+        os.environ.update(previous_env)
+        sys.path[:] = previous_path
+        for name in names:
+            sys.modules.pop(name, None)
+        sys.modules.update(saved)
+        for (parent, attribute), value in parent_attrs.items():
+            if value is missing:
+                parent.__dict__.pop(attribute, None)
+            else:
+                setattr(parent, attribute, value)
+    assert result == (2 if ambiguous else 0)
+    output = capsys.readouterr().out
+    if ambiguous:
+        assert "ended ambiguously" in output
+        assert len(ambiguous_attempts) == 1
+    else:
+        assert "One owner message received and one canned WhatsApp reply sent." in output
+    assert get_count >= 1
+    if mode == "--transport-run":
+        assert len([p for p in sent_posts if "transport check succeeded" in p["text"]["body"]]) <= 1
+        if not ambiguous:
+            # Selection confirmation plus exactly one test reply.
+            assert len(sent_posts) == 2
+    else:
+        assert len([p for p in sent_posts if "notify path check succeeded" in p["text"]["body"]]) == 1
+    assert all(payload["to"] == "user:99" for payload in sent_posts)
+    assert not list(private.iterdir())
 
 
 def test_owner_setup_fails_closed_when_no_real_terminal(monkeypatch):
