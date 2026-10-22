@@ -49,13 +49,26 @@ After review, invoke it from this checkout with the harness whose existing
 owner-authorized login is available:
 
 ```sh
-python scripts/whatsapp_model_session_test.py --run --harness claude
-# or: python scripts/whatsapp_model_session_test.py --run --harness codex
+.venv/bin/python scripts/whatsapp_model_session_test.py --run --harness claude
+# or: .venv/bin/python scripts/whatsapp_model_session_test.py --run --harness codex
 ```
 
 The command refuses non-interactive input and asks for the exact word `MODEL`
 before reading the private WhatsApp key. It prompts for two WhatsApp messages:
 the exact wolt selection and a generated nonce challenge.
+The selected harness must already have an authorized login directory:
+`CLAUDE_CONFIG_DIR` (or `~/.claude`) for Claude, or `CODEX_HOME` (or
+`~/.codex`) for Codex. Its CLI and `tmux` must be available on `PATH`. The
+runner sets a disposable `HOME` but passes that existing auth directory via
+the supported harness environment variable; harness state outside that auth
+directory is intentionally not copied.
+
+The test allows one exact `🦦 wa-test: <nonce>` payload from the selected
+participant after checking the session registry, account fingerprint, and
+private tmux socket. The notification sender retains its bounded HTTP 429
+handling (up to three attempts, honoring `Retry-After`). The runner does not
+retry an ambiguous timeout or any other send failure; the attempt is reserved
+before network I/O and all later notify attempts are rejected.
 
 1. Create only the synthetic test wolt and start the isolated server and its
    private tmux server. Confirm the API endpoint is the selected loopback port

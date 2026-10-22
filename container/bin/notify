@@ -148,6 +148,12 @@ def _creature_emoji(session: str, session_reg: Path) -> str:
     }.get(result.stdout.strip(), "🦫")
 
 
+def _format_full_message(session: str, wolt_name: str, message: str,
+                         session_reg: Path) -> str:
+    """Format the actual transport payload, including the standard identity prefix."""
+    return f"{_creature_emoji(session, session_reg)} {wolt_name}: {message}"
+
+
 def _safe_transport_detail(stderr: str, secrets: tuple[str, ...]) -> str:
     """Keep curl's diagnosis while withholding request credentials/content."""
     detail = " ".join(stderr.split())
@@ -224,7 +230,7 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:
         pass  # the plain name is always a fine prefix
     session_reg = Path(__file__).resolve().parent / "session-reg"
-    full_message = f"{_creature_emoji(session, session_reg)} {wolt_name}: {message}"
+    full_message = _format_full_message(session, wolt_name, message, session_reg)
     payload: dict[str, object] = {"session": session, "message": full_message}
     if adapter == "slack":
         payload.update(adapter="slack", channel=route_id, thread_ts=slack_thread)

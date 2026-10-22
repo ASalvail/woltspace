@@ -1,4 +1,6 @@
 import importlib.util
+import asyncio
+import runpy
 import stat
 from pathlib import Path
 
@@ -90,3 +92,158 @@ def test_synthetic_wolt_scaffolding_is_confined_to_private_test_root(tmp_path):
     assert '"enabled": false' in config
     assert all(path.resolve().is_relative_to(tmp_path.resolve())
                for path in wolt.rglob("*"))
+
+
+def test_expected_nonce_matches_the_real_notify_cli_prefix(monkeypatch):
+    notify_cli = runpy.run_path(str(ROOT / "container" / "bin" / "notify"))
+    monkeypatch.setitem(
+        notify_cli["_format_full_message"].__globals__,
+        "_creature_emoji", lambda *_: "🦦",
+    )
+    nonce = "wa-model-check-a1b2c3"
+    actual_cli_payload = notify_cli["_format_full_message"](
+        "test-session", "wa-test", nonce, ROOT / "container" / "bin" / "session-reg",
+    )
+    assert actual_cli_payload == model_test._expected_notify_payload(nonce)
+    assert actual_cli_payload == f"🦦 wa-test: {nonce}"
+
+
+def test_notify_gate_allows_only_one_exact_payload_after_route_verification():
+    attempts = []
+    routing = {
+        "adapter": "whatsapp", "chat_id": "user:42",
+        "whatsapp_account": "test-account", "wolt": "wa-test",
+    }
+    def verify(session, participant, supplied_routing):
+        assert (session, participant, supplied_routing) == ("s1", "user:42", routing)
+        return "s1"
+
+    gate = model_test.OneNonceSendGate("🦦 wa-test: wa-model-check", verify)
+    wrapped = model_test._wrap_notify_send(
+        lambda *args, **kwargs: _async_record(attempts, *args, **kwargs), gate,
+    )
+
+    async def run():
+        await wrapped("whatsapp", "s1", "🦦 wa-test: wa-model-check", "user:42",
+                      routing=routing)
+        with pytest.raises(RuntimeError, match="already reserved"):
+            await wrapped("whatsapp", "s1", "🦦 wa-test: wa-model-check", "user:42",
+                          routing=routing)
+
+    asyncio.run(run())
+    assert len(attempts) == 1
+    assert gate.status == "sent"
+    assert gate.verified_session == "s1"
+
+
+def test_notify_gate_rejects_wrong_payload_or_unverified_session_before_io():
+    attempts = []
+    gate = model_test.OneNonceSendGate("🦦 wa-test: nonce", lambda *_: "")
+    wrapped = model_test._wrap_notify_send(
+        lambda *args, **kwargs: _async_record(attempts, *args, **kwargs), gate,
+    )
+
+    async def run():
+        with pytest.raises(RuntimeError, match="exact nonce"):
+            await wrapped("whatsapp", "s1", "🦦 wa-test: nonce plus", "user:42",
+                          routing={})
+
+    asyncio.run(run())
+    assert attempts == []
+    assert gate.status == "rejected"
+
+
+def test_notify_gate_requires_authoritative_verification_before_io():
+    attempts = []
+    gate = model_test.OneNonceSendGate("🦦 wa-test: nonce", lambda *_: "")
+    wrapped = model_test._wrap_notify_send(
+        lambda *args, **kwargs: _async_record(attempts, *args, **kwargs), gate,
+    )
+
+    async def run():
+        with pytest.raises(RuntimeError, match="route was not verified"):
+            await wrapped("whatsapp", "s1", "🦦 wa-test: nonce", "user:42",
+                          routing={"adapter": "whatsapp"})
+
+    asyncio.run(run())
+    assert attempts == []
+    assert gate.status == "rejected"
+
+
+def test_ambiguous_notify_send_is_terminal_and_never_retried():
+    attempts = []
+    routing = {"adapter": "whatsapp", "chat_id": "user:42",
+               "whatsapp_account": "test-account", "wolt": "wa-test"}
+    gate = model_test.OneNonceSendGate("🦦 wa-test: nonce", lambda *_: "s1")
+
+    async def fail_ambiguous(*_args, **_kwargs):
+        attempts.append("sent")
+        raise TimeoutError("simulated timeout")
+
+    wrapped = model_test._wrap_notify_send(fail_ambiguous, gate)
+
+    async def run():
+        with pytest.raises(TimeoutError):
+            await wrapped("whatsapp", "s1", "🦦 wa-test: nonce", "user:42",
+                          routing=routing)
+        with pytest.raises(RuntimeError, match="already reserved"):
+            await wrapped("whatsapp", "s1", "🦦 wa-test: nonce", "user:42",
+                          routing=routing)
+
+    asyncio.run(run())
+    assert attempts == ["sent"]
+    assert gate.status == "ambiguous"
+
+
+async def _async_record(records, *args, **kwargs):
+    records.append((args, kwargs))
+    return {"ok": True}
+
+
+def test_cleanup_attempts_tmux_even_when_session_and_server_cleanup_fail(tmp_path):
+    calls = []
+    class Server:
+        should_exit = False
+    class Thread:
+        def join(self, timeout):
+            calls.append("join")
+        def is_alive(self):
+            return True
+    class Listener:
+        def close(self):
+            calls.append("close")
+
+    ok = model_test._cleanup_resources(
+        Server(), Thread(), Listener(), "s1", {}, tmp_path,
+        stop_session_fn=lambda _name: (_ for _ in ()).throw(RuntimeError("failed")),
+        kill_tmux_fn=lambda _env, _root: calls.append("tmux") or True,
+    )
+    assert not ok
+    assert calls == ["join", "close", "tmux"]
+
+
+def test_private_tmux_cleanup_only_accepts_confirmed_absence(tmp_path, monkeypatch):
+    env = {"WOLTSPACE_TMUX_BIN": "tmux"}
+    monkeypatch.setattr(
+        model_test, "_tmux_value",
+        lambda *_: (1, "", "no server running on /private/tmux/default"),
+    )
+    assert model_test._kill_private_tmux(env, tmp_path)
+    monkeypatch.setattr(
+        model_test, "_tmux_value",
+        lambda *_: (1, "", "permission denied"),
+    )
+    assert not model_test._kill_private_tmux(env, tmp_path)
+
+
+def test_cleanup_finalizer_retains_root_on_failure_and_removes_on_success(tmp_path):
+    retained = tmp_path / "retained"
+    retained.mkdir(mode=0o700)
+    assert not model_test._finalize_run_root(retained, False)
+    assert retained.is_dir()
+    assert (retained / ".cleanup-required").is_file()
+
+    disposable = tmp_path / "disposable"
+    disposable.mkdir(mode=0o700)
+    assert model_test._finalize_run_root(disposable, True)
+    assert not disposable.exists()

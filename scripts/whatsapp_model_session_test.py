@@ -177,27 +177,27 @@ def _wait_for_server(
     raise RuntimeError("isolated local server did not pass its loopback health check")
 
 
-def _tmux_value(env: dict[str, str], *args: str) -> tuple[int, str]:
+def _tmux_value(env: dict[str, str], *args: str) -> tuple[int, str, str]:
     result = subprocess.run(
         [env["WOLTSPACE_TMUX_BIN"], *args], env=env, stdin=subprocess.DEVNULL,
         capture_output=True, text=True, timeout=5, check=False,
     )
-    return result.returncode, result.stdout.strip()
+    return result.returncode, result.stdout.strip(), result.stderr.strip()
 
 
 def _verify_private_tmux(env: dict[str, str], run_root: Path, session: str) -> None:
-    status, socket_path = _tmux_value(env, "display-message", "-p", "#{socket_path}")
+    status, socket_path, _ = _tmux_value(env, "display-message", "-p", "#{socket_path}")
     if status or not socket_path:
         raise RuntimeError("could not verify the test tmux socket")
     try:
         Path(socket_path).resolve().relative_to(run_root.resolve())
     except ValueError:
         raise RuntimeError("tmux socket is outside the private test directory") from None
-    status, value = _tmux_value(env, "show-environment", "-g", "WHATSAPP_AGENT_TOKEN")
+    status, value, _ = _tmux_value(env, "show-environment", "-g", "WHATSAPP_AGENT_TOKEN")
     if status == 0 and value and not _is_unset_or_empty_token(value):
         raise RuntimeError("WhatsApp credential appeared in the private tmux server environment")
-    status, value = _tmux_value(env, "show-environment", "-t", session,
-                               "WHATSAPP_AGENT_TOKEN")
+    status, value, _ = _tmux_value(env, "show-environment", "-t", session,
+                                  "WHATSAPP_AGENT_TOKEN")
     if status == 0 and value and not _is_unset_or_empty_token(value):
         raise RuntimeError("WhatsApp credential appeared in the model session environment")
 
@@ -207,20 +207,150 @@ def _is_unset_or_empty_token(value: str) -> bool:
 
 
 def _kill_private_tmux(env: dict[str, str], run_root: Path) -> bool:
-    status, socket_path = _tmux_value(env, "display-message", "-p", "#{socket_path}")
+    try:
+        status, socket_path, error = _tmux_value(
+            env, "display-message", "-p", "#{socket_path}",
+        )
+    except Exception:
+        return False
     if status:
-        return True
+        # Tmux's own explicit "no server running" response is the only
+        # nonzero result that proves cleanup is already complete.
+        return "no server running" in error.lower()
     try:
         Path(socket_path).resolve().relative_to(run_root.resolve())
     except ValueError:
         return False
-    status, _ = _tmux_value(env, "kill-server")
+    try:
+        status, _, _ = _tmux_value(env, "kill-server")
+    except Exception:
+        return False
     return status == 0
+
+
+class OneNonceSendGate:
+    """Allow one precisely formatted notify send after authoritative checks."""
+
+    def __init__(self, expected_payload: str, verify):
+        self.expected_payload = expected_payload
+        self.verify = verify
+        self._lock = threading.Lock()
+        self.status = "ready"
+        self.verified_session = ""
+        self.failure = ""
+
+    async def send(self, session: str, participant: str, message: str,
+                   routing: dict | None, sender):
+        with self._lock:
+            if self.status != "ready":
+                raise RuntimeError("the single WhatsApp test send is already reserved")
+            # Reserve before validation and definitely before any network I/O.
+            self.status = "reserved"
+            if message != self.expected_payload:
+                self.status = "rejected"
+                self.failure = "the notify payload did not match the exact nonce"
+                raise RuntimeError(self.failure)
+            try:
+                verified = self.verify(session, participant, routing)
+            except Exception:
+                verified = ""
+            if not verified:
+                self.status = "rejected"
+                self.failure = "the test session route was not verified"
+                raise RuntimeError(self.failure)
+            self.verified_session = verified
+        try:
+            result = await sender()
+        except BaseException:
+            with self._lock:
+                self.status = "ambiguous"
+                self.failure = "the single WhatsApp send had an ambiguous outcome"
+            raise
+        with self._lock:
+            self.status = "sent"
+        return result
+
+
+def _cleanup_resources(
+    server, server_thread, listener, session_name: str, env: dict[str, str],
+    run_root: Path, *, stop_session_fn=None, kill_tmux_fn=None,
+) -> bool:
+    """Attempt every independent cleanup step and report aggregate certainty."""
+    ok = True
+    if server is not None:
+        try:
+            server.should_exit = True
+        except Exception:
+            ok = False
+    if server_thread is not None:
+        try:
+            server_thread.join(timeout=10)
+            if server_thread.is_alive():
+                ok = False
+        except Exception:
+            ok = False
+    if listener is not None:
+        try:
+            listener.close()
+        except Exception:
+            ok = False
+    if session_name:
+        try:
+            if stop_session_fn is None:
+                from sessions import stop_session as stop_session_fn
+            result = stop_session_fn(session_name)
+            if not isinstance(result, dict) or result.get("status") != "stopped":
+                ok = False
+        except Exception:
+            ok = False
+    # Do this even if session or API-server cleanup failed; each is independent.
+    try:
+        if kill_tmux_fn is None:
+            kill_tmux_fn = _kill_private_tmux
+        if not kill_tmux_fn(env, run_root):
+            ok = False
+    except Exception:
+        ok = False
+    return ok
+
+
+def _finalize_run_root(run_root: Path, cleanup_ok: bool) -> bool:
+    """Delete only after verified cleanup; retain a marked root otherwise."""
+    if cleanup_ok:
+        try:
+            shutil.rmtree(run_root)
+            if not run_root.exists():
+                return True
+        except Exception:
+            pass
+    try:
+        if run_root.exists():
+            (run_root / ".cleanup-required").touch(mode=0o600, exist_ok=True)
+    except Exception:
+        pass
+    return False
 
 
 def _record_for_test(session: str, wolts_dir: Path) -> dict[str, Any] | None:
     from sessions import SessionRegistry
     return SessionRegistry(wolts_dir).get(session, wolt=TEST_WOLT, check_alive=False)
+
+
+def _expected_notify_payload(nonce: str) -> str:
+    # container/bin/notify prefixes the creature emoji and display name before
+    # posting /notify. The synthetic wolt's creature is otter and name is fixed.
+    return f"🦦 {TEST_WOLT}: {nonce}"
+
+
+def _wrap_notify_send(real_send, gate: OneNonceSendGate):
+    async def guarded_send(adapter_name, session, message, chat_id, *args, **kwargs):
+        if adapter_name != "whatsapp":
+            return await real_send(adapter_name, session, message, chat_id, *args, **kwargs)
+        return await gate.send(
+            session, str(chat_id), message, kwargs.get("routing"),
+            lambda: real_send(adapter_name, session, message, chat_id, *args, **kwargs),
+        )
+    return guarded_send
 
 
 def _run_model_test(harness: str) -> int:
@@ -274,8 +404,8 @@ def _run_model_session(
     server = None
     server_thread = None
     server_errors: list[str] = []
-    outbound: list[str] = []
     verified_session = ""
+    send_gate = None
     run_log = run_root / "runner.log"
     fd = os.open(run_log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     log_stream = os.fdopen(fd, "w", encoding="utf-8", buffering=1)
@@ -293,15 +423,6 @@ def _run_model_session(
             import server.notify as notify
 
             notify.dotenv_env = lambda name: secret["value"] if name == "WHATSAPP_AGENT_TOKEN" else ""
-            real_whatsapp_send = notify.whatsapp_send
-
-            async def tracked_whatsapp_send(*args, **kwargs):
-                result = await real_whatsapp_send(*args, **kwargs)
-                message = args[2] if len(args) > 2 else kwargs.get("text", "")
-                outbound.append(message)
-                return result
-
-            notify.whatsapp_send = tracked_whatsapp_send
             config = uvicorn.Config(
                 server_app.app, host=host, port=port, log_level="error",
                 access_log=False, log_config=None, lifespan="off",
@@ -344,27 +465,70 @@ def _run_model_session(
             challenge = f"Reply with exactly {nonce} and do nothing else."
             phase: dict[str, Any] = {"selected": False, "prompted": False,
                                      "participant": "", "unexpected": False}
+            phase_lock = threading.RLock()
+
+            def verify_send_route(session: str, participant: str,
+                                  routing: dict | None) -> str:
+                nonlocal session_name
+                with phase_lock:
+                    if (not phase["selected"] or not phase["prompted"]
+                            or participant != phase["participant"]):
+                        return ""
+                if not session or not isinstance(routing, dict):
+                    return ""
+                if (routing.get("adapter") != "whatsapp"
+                        or routing.get("chat_id") != participant
+                        or routing.get("whatsapp_account") != account
+                        or routing.get("wolt") != TEST_WOLT):
+                    return ""
+                persisted_routes = adapter.load(adapter.ROUTES)
+                route = persisted_routes.get(participant, {})
+                if route.get("wolt") != TEST_WOLT or route.get("session") != session:
+                    return ""
+                record = _record_for_test(session, wolts_dir)
+                if (not record or record.get("adapter") != "whatsapp"
+                        or record.get("whatsapp_account") != account
+                        or record.get("chat_id") != participant
+                        or record.get("wolt") != TEST_WOLT):
+                    return ""
+                _verify_private_tmux(env, run_root, session)
+                session_name = session
+                return session
+
+            send_gate = OneNonceSendGate(
+                _expected_notify_payload(nonce), verify_send_route,
+            )
+            notify._send = _wrap_notify_send(notify._send, send_gate)
 
             def dispatch_test_message(item: dict, current_routes: dict, started_at: int) -> None:
                 text = (item.get("text") or {}).get("body", "")
                 participant = item.get("from", "")
-                if text.strip() == f"wolt {TEST_WOLT}" and not phase["selected"]:
-                    phase["participant"] = participant
+                if text.strip() == f"wolt {TEST_WOLT}":
+                    with phase_lock:
+                        if phase["selected"]:
+                            phase["unexpected"] = True
+                            return
+                        phase["participant"] = participant
                     adapter.handle(item, current_routes, started_at)
-                    if current_routes.get(participant, {}).get("wolt") == TEST_WOLT:
-                        phase["selected"] = True
-                    else:
-                        phase["unexpected"] = True
+                    with phase_lock:
+                        if current_routes.get(participant, {}).get("wolt") == TEST_WOLT:
+                            phase["selected"] = True
+                        else:
+                            phase["unexpected"] = True
                     return
-                if (phase["selected"] and not phase["prompted"]
+                with phase_lock:
+                    accepted_challenge = (
+                        phase["selected"] and not phase["prompted"]
                         and participant == phase["participant"]
-                        and text.strip() == challenge):
+                        and text.strip() == challenge
+                    )
+                    if not accepted_challenge:
+                        phase["unexpected"] = True
+                        return
                     # Mark before dispatch: a thrown/ambiguous start must not
                     # allow another model session from a duplicate phrase.
                     phase["prompted"] = True
-                    adapter.handle(item, current_routes, started_at)
-                    return
-                phase["unexpected"] = True
+                adapter.handle(item, current_routes, started_at)
 
             _say("Isolated server is healthy on a private 127.0.0.1 port.")
             _say("In WhatsApp, send `wolt wa-test` and wait for the selection confirmation.")
@@ -380,6 +544,8 @@ def _run_model_session(
                 routes = adapter.load(adapter.ROUTES)
                 if phase["unexpected"]:
                     raise RuntimeError("an unexpected WhatsApp message arrived; it was not dispatched")
+                if send_gate.failure:
+                    raise RuntimeError("the single notify attempt was rejected or ambiguous")
                 # Participant IDs are opaque; discover them only in memory.
                 matching = next((route for route in routes.values()
                                  if route.get("wolt") == TEST_WOLT), None)
@@ -397,37 +563,25 @@ def _run_model_session(
                         raise RuntimeError("the test session participant binding did not match")
                     _verify_private_tmux(env, run_root, session_name)
                     verified_session = session_name
-                if len(outbound) == 1 and outbound[0].strip() == nonce:
+                if send_gate.verified_session:
+                    # The send gate may verify first if the model notifies
+                    # before this polling loop observes the persisted route.
+                    verified_session = send_gate.verified_session
+                if (send_gate.status == "sent" and send_gate.verified_session
+                        and verified_session == send_gate.verified_session
+                        and session_name == send_gate.verified_session):
                     delivered = True
                     break
                 if server_errors:
                     raise RuntimeError("the isolated local server stopped unexpectedly")
             if not delivered:
-                if any(outbound):
-                    raise RuntimeError("the model did not send exactly one nonce reply")
                 raise TimeoutError("timed out waiting for the model reply")
             _say("Verified one real model session, account-bound registry route, and nonce reply.")
             return 0
     finally:
-        cleanup_ok = True
-        if server is not None:
-            server.should_exit = True
-        if server_thread is not None:
-            server_thread.join(timeout=10)
-            if server_thread.is_alive():
-                cleanup_ok = False
-        listener.close()
-        if session_name:
-            try:
-                from sessions import stop_session
-                stop_session(session_name)
-            except Exception:
-                cleanup_ok = False
-        if cleanup_ok:
-            try:
-                cleanup_ok = _kill_private_tmux(env, run_root)
-            except Exception:
-                cleanup_ok = False
+        cleanup_ok = _cleanup_resources(
+            server, server_thread, listener, session_name, env, run_root,
+        )
         if adapter is not None:
             adapter.TOKEN = ""
         secret["value"] = ""
@@ -436,10 +590,8 @@ def _run_model_session(
         sys.path[:] = old_path
         sys.stdout, sys.stderr = original_stdout, original_stderr
         log_stream.close()
-        if cleanup_ok:
-            shutil.rmtree(run_root, ignore_errors=True)
-        else:
-            (run_root / ".cleanup-required").touch(mode=0o600, exist_ok=True)
+        cleanup_ok = _finalize_run_root(run_root, cleanup_ok)
+        if not cleanup_ok:
             _say("Cleanup needs attention; the private test directory was retained.")
 
 
