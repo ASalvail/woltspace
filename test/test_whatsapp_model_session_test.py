@@ -1,7 +1,9 @@
 import importlib.util
 import asyncio
+import os
 import runpy
 import stat
+import tempfile
 import threading
 from pathlib import Path
 
@@ -62,6 +64,8 @@ def test_private_environment_is_minimal_and_keeps_auth_out_of_home(tmp_path):
     tmux.chmod(0o700)
     auth = tmp_path / "claude-auth"
     auth.mkdir(mode=0o700)
+    with tempfile.TemporaryDirectory(prefix="wt-", dir="/tmp") as socket_base:
+        tmux_tmp = model_test._prepare_private_tmux_dir(run_root, Path(socket_base))
     inherited = {
         "PATH": str(bindir),
         "HOME": str(tmp_path),
@@ -73,11 +77,11 @@ def test_private_environment_is_minimal_and_keeps_auth_out_of_home(tmp_path):
     }
     env = model_test._private_environment(
         run_root, wolts_dir, "claude", "CLAUDE_CONFIG_DIR", auth,
-        "127.0.0.1", 41321, inherited,
+        "127.0.0.1", 41321, inherited, tmux_tmp,
     )
     assert env["CLAUDE_CONFIG_DIR"] == str(auth.resolve())
     assert env["HOME"] == str(run_root / "home")
-    assert env["TMUX_TMPDIR"] == str(run_root / "tmux")
+    assert env["TMUX_TMPDIR"] == str(tmux_tmp)
     assert env["WOLTSPACE_WOLTS_DIR"] == str(wolts_dir)
     assert env["WOLTSPACE_API"] == "http://127.0.0.1:41321"
     assert env["PORT"] != "7777"
@@ -368,7 +372,88 @@ def test_private_tmux_cleanup_only_accepts_confirmed_absence(tmp_path, monkeypat
     assert not model_test._kill_private_tmux(env, tmp_path)
 
 
-def test_cleanup_finalizer_retains_root_on_failure_and_removes_on_success(tmp_path):
+def test_private_tmux_path_preflight_checks_ownership_and_linux_limit(tmp_path):
+    run_root = tmp_path / "model-12345678"
+    run_root.mkdir(mode=0o700)
+    with tempfile.TemporaryDirectory(prefix="wt-", dir="/tmp") as base_name:
+        base = Path(base_name)
+        socket_dir = model_test._prepare_private_tmux_dir(run_root, base)
+        assert socket_dir.parent == base
+        assert stat.S_IMODE(socket_dir.stat().st_mode) == 0o700
+        candidate = socket_dir / f"tmux-{os.getuid()}" / "default"
+        assert len(os.fsencode(candidate)) < 108
+
+    long_base = Path("/tmp") / ("x" * 90)
+    try:
+        with pytest.raises(RuntimeError, match="socket path exceeds"):
+            model_test._prepare_private_tmux_dir(run_root, long_base)
+        assert not (long_base / run_root.name).exists()
+    finally:
+        if long_base.exists():
+            long_base.rmdir()
+
+
+def test_path_length_preflight_happens_before_private_key_read(tmp_path, monkeypatch):
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    monkeypatch.setattr(model_test.owner_test, "PRIVATE", private)
+    monkeypatch.setattr(model_test.owner_test, "_check_private_dir", lambda: None)
+    monkeypatch.setattr(
+        model_test, "_auth_path", lambda *_: ("CLAUDE_CONFIG_DIR", tmp_path),
+    )
+    too_long = Path("/tmp") / ("y" * 90)
+    monkeypatch.setattr(model_test, "PRIVATE_TMUX_BASE", too_long)
+    key_reads = []
+    monkeypatch.setattr(
+        model_test.owner_test, "_read_token", lambda: key_reads.append(True),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="socket path exceeds"):
+            model_test._run_model_test("claude")
+        assert key_reads == []
+    finally:
+        if too_long.exists():
+            too_long.rmdir()
+
+
+def test_real_tmux_private_socket_start_and_stop_smoke(tmp_path):
+    import shutil
+    import tempfile
+
+    tmux_bin = shutil.which("tmux")
+    if not tmux_bin:
+        pytest.skip("tmux is not installed")
+    run_root = tmp_path / "model-smoke"
+    run_root.mkdir(mode=0o700)
+    with tempfile.TemporaryDirectory(prefix="wt-", dir="/tmp") as base_name:
+        tmux_root = model_test._prepare_private_tmux_dir(run_root, Path(base_name))
+        env = {
+            "WOLTSPACE_TMUX_BIN": tmux_bin,
+            "TMUX_TMPDIR": str(tmux_root),
+            "PATH": os.environ.get("PATH", os.defpath),
+            "HOME": str(tmp_path),
+        }
+        try:
+            status, _, error = model_test._tmux_value(
+                env, "new-session", "-d", "-s", "isolated-smoke", "sleep 30",
+            )
+            assert status == 0, error
+            status, socket_path, error = model_test._tmux_value(
+                env, "display-message", "-p", "#{socket_path}",
+            )
+            assert status == 0, error
+            assert Path(socket_path).resolve().is_relative_to(tmux_root.resolve())
+            assert model_test._tmux_value(
+                env, "show-environment", "-g", "WHATSAPP_AGENT_TOKEN",
+            )[0] != 0
+            assert model_test._kill_private_tmux(env, tmux_root)
+            assert not Path(socket_path).exists()
+        finally:
+            model_test._kill_private_tmux(env, tmux_root)
+            shutil.rmtree(tmux_root, ignore_errors=True)
+
+
+def test_cleanup_finalizer_retains_root_on_failure_and_removes_on_success(tmp_path, monkeypatch):
     retained = tmp_path / "retained"
     retained.mkdir(mode=0o700)
     assert not model_test._finalize_run_root(retained, False)
@@ -377,5 +462,9 @@ def test_cleanup_finalizer_retains_root_on_failure_and_removes_on_success(tmp_pa
 
     disposable = tmp_path / "disposable"
     disposable.mkdir(mode=0o700)
-    assert model_test._finalize_run_root(disposable, True)
+    socket_base = Path(tempfile.mkdtemp(prefix="wt-", dir="/tmp"))
+    monkeypatch.setattr(model_test, "PRIVATE_TMUX_BASE", socket_base)
+    tmux_root = model_test._prepare_private_tmux_dir(disposable, socket_base)
+    assert model_test._finalize_run_root(disposable, True, tmux_root)
     assert not disposable.exists()
+    assert not tmux_root.exists()

@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
+PRIVATE_TMUX_BASE = ROOT.parents[2] / ".whatsapp-model-tmux"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 import scripts.whatsapp_owner_test as owner_test
@@ -56,14 +57,42 @@ def _auth_path(harness: str, inherited: dict[str, str]) -> tuple[str, Path]:
     return variable, selected.resolve()
 
 
+def _prepare_private_tmux_dir(run_root: Path, base: Path | None = None) -> Path:
+    """Create a short, owned per-run socket dir and validate Linux sun_path."""
+    base = base or PRIVATE_TMUX_BASE
+    uid = os.getuid()
+    for directory in (base,):
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        info = directory.lstat()
+        if (stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != uid):
+            raise RuntimeError("private tmux directory ownership check failed")
+        os.chmod(directory, 0o700)
+    tmux_tmp = base / run_root.name
+    try:
+        tmux_tmp.mkdir(mode=0o700)
+    except FileExistsError:
+        raise RuntimeError("private tmux run directory already exists") from None
+    info = tmux_tmp.lstat()
+    if (stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != uid or stat.S_IMODE(info.st_mode) != 0o700):
+        raise RuntimeError("private tmux run directory ownership check failed")
+    socket_path = tmux_tmp / f"tmux-{uid}" / "default"
+    # Linux sockaddr_un.sun_path reserves 108 bytes including the NUL.
+    if len(os.fsencode(socket_path)) >= 108:
+        shutil.rmtree(tmux_tmp)
+        raise RuntimeError("private tmux socket path exceeds Linux pathname limit")
+    return tmux_tmp
+
+
 def _private_environment(
     run_root: Path, wolts_dir: Path, harness: str, auth_variable: str,
     auth_path: Path, host: str, port: int, inherited: dict[str, str],
+    tmux_tmp: Path,
 ) -> dict[str, str]:
     """Build a narrow process env; never copy owner API tokens into it."""
     home = run_root / "home"
     xdg = run_root / "xdg"
-    tmux_tmp = run_root / "tmux"
     temp = run_root / "tmp"
     for directory in (home, xdg, xdg / "config", xdg / "data", xdg / "state",
                       xdg / "cache", tmux_tmp, temp):
@@ -186,14 +215,14 @@ def _tmux_value(env: dict[str, str], *args: str) -> tuple[int, str, str]:
     return result.returncode, result.stdout.strip(), result.stderr.strip()
 
 
-def _verify_private_tmux(env: dict[str, str], run_root: Path, session: str) -> None:
+def _verify_private_tmux(env: dict[str, str], tmux_root: Path, session: str) -> None:
     status, socket_path, _ = _tmux_value(env, "display-message", "-p", "#{socket_path}")
     if status or not socket_path:
         raise RuntimeError("could not verify the test tmux socket")
     try:
-        Path(socket_path).resolve().relative_to(run_root.resolve())
+        Path(socket_path).resolve().relative_to(tmux_root.resolve())
     except ValueError:
-        raise RuntimeError("tmux socket is outside the private test directory") from None
+        raise RuntimeError("tmux socket is outside the private socket directory") from None
     status, value, _ = _tmux_value(env, "show-environment", "-g", "WHATSAPP_AGENT_TOKEN")
     if status == 0 and value and not _is_unset_or_empty_token(value):
         raise RuntimeError("WhatsApp credential appeared in the private tmux server environment")
@@ -207,7 +236,24 @@ def _is_unset_or_empty_token(value: str) -> bool:
     return value.startswith("-WHATSAPP_AGENT_TOKEN") or value == "WHATSAPP_AGENT_TOKEN="
 
 
-def _kill_private_tmux(env: dict[str, str], run_root: Path) -> bool:
+def _remove_stale_private_socket(tmux_root: Path) -> bool:
+    """Remove only an owned socket node beneath this private per-run dir."""
+    try:
+        if tmux_root.is_symlink() or tmux_root.stat().st_uid != os.getuid():
+            return False
+        path = tmux_root / f"tmux-{os.getuid()}" / "default"
+        info = path.lstat()
+        if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
+            return False
+        path.unlink()
+        return not path.exists()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+
+def _kill_private_tmux(env: dict[str, str], tmux_root: Path) -> bool:
     try:
         status, socket_path, error = _tmux_value(
             env, "display-message", "-p", "#{socket_path}",
@@ -217,16 +263,30 @@ def _kill_private_tmux(env: dict[str, str], run_root: Path) -> bool:
     if status:
         # Tmux's own explicit "no server running" response is the only
         # nonzero result that proves cleanup is already complete.
-        return "no server running" in error.lower()
+        return ("no server running" in error.lower()
+                and _remove_stale_private_socket(tmux_root))
     try:
-        Path(socket_path).resolve().relative_to(run_root.resolve())
+        Path(socket_path).resolve().relative_to(tmux_root.resolve())
     except ValueError:
         return False
     try:
         status, _, _ = _tmux_value(env, "kill-server")
     except Exception:
         return False
-    return status == 0
+    if status:
+        return False
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            check_status, _, check_error = _tmux_value(
+                env, "display-message", "-p", "#{socket_path}",
+            )
+        except Exception:
+            return False
+        if check_status and "no server running" in check_error.lower():
+            return _remove_stale_private_socket(tmux_root)
+        time.sleep(0.05)
+    return False
 
 
 class OneNonceSendGate:
@@ -289,7 +349,7 @@ class OneNonceSendGate:
 
 def _cleanup_resources(
     server, server_thread, listener, session_name: str, env: dict[str, str],
-    run_root: Path, *, stop_session_fn=None, kill_tmux_fn=None,
+    tmux_root: Path, *, stop_session_fn=None, kill_tmux_fn=None,
 ) -> bool:
     """Attempt every independent cleanup step and report aggregate certainty."""
     ok = True
@@ -323,17 +383,25 @@ def _cleanup_resources(
     try:
         if kill_tmux_fn is None:
             kill_tmux_fn = _kill_private_tmux
-        if not kill_tmux_fn(env, run_root):
+        if not kill_tmux_fn(env, tmux_root):
             ok = False
     except Exception:
         ok = False
     return ok
 
 
-def _finalize_run_root(run_root: Path, cleanup_ok: bool) -> bool:
+def _finalize_run_root(run_root: Path, cleanup_ok: bool,
+                       tmux_root: Path | None = None) -> bool:
     """Delete only after verified cleanup; retain a marked root otherwise."""
     if cleanup_ok:
         try:
+            if tmux_root is not None:
+                expected_parent = PRIVATE_TMUX_BASE.resolve()
+                if (tmux_root.is_symlink()
+                        or tmux_root.resolve().parent != expected_parent
+                        or tmux_root.resolve().name != run_root.name):
+                    raise RuntimeError("refusing to remove unexpected tmux directory")
+                shutil.rmtree(tmux_root)
             shutil.rmtree(run_root)
             if not run_root.exists():
                 return True
@@ -384,17 +452,20 @@ def _run_model_test(harness: str) -> int:
     inherited = {key: value for key, value in os.environ.items()
                  if key != "WHATSAPP_AGENT_TOKEN"}
     auth_variable, auth_path = _auth_path(harness, inherited)
-    token = owner_test._read_token()
     run_root = Path(tempfile.mkdtemp(prefix="model-", dir=owner_test.PRIVATE))
-    secret = {"value": token}
-    del token
+    secret = {"value": ""}
+    tmux_root = None
     old_env = os.environ.copy()
     old_env.pop("WHATSAPP_AGENT_TOKEN", None)
     old_path = list(sys.path)
     try:
         os.chmod(run_root, 0o700)
+        # Bound and validate the private tmux socket path before key access,
+        # adapter initialization, or any API polling.
+        tmux_root = _prepare_private_tmux_dir(run_root)
+        secret["value"] = owner_test._read_token()
         return _run_model_session(
-            harness, inherited, auth_variable, auth_path, run_root, secret,
+            harness, inherited, auth_variable, auth_path, run_root, secret, tmux_root,
         )
     finally:
         secret["value"] = ""
@@ -402,12 +473,25 @@ def _run_model_test(harness: str) -> int:
         os.environ.update(old_env)
         sys.path[:] = old_path
         if run_root.exists() and not (run_root / ".cleanup-required").exists():
-            shutil.rmtree(run_root, ignore_errors=True)
+            if tmux_root is None:
+                shutil.rmtree(run_root, ignore_errors=True)
+            else:
+                # Failures before the server lifecycle begins can remove their
+                # empty per-run socket directory. Never remove a live socket.
+                socket_path = tmux_root / f"tmux-{os.getuid()}" / "default"
+                if not socket_path.exists():
+                    try:
+                        shutil.rmtree(tmux_root)
+                        shutil.rmtree(run_root)
+                    except OSError:
+                        (run_root / ".cleanup-required").touch(mode=0o600, exist_ok=True)
+                else:
+                    (run_root / ".cleanup-required").touch(mode=0o600, exist_ok=True)
 
 
 def _run_model_session(
     harness: str, inherited: dict[str, str], auth_variable: str,
-    auth_path: Path, run_root: Path, secret: dict[str, str],
+    auth_path: Path, run_root: Path, secret: dict[str, str], tmux_root: Path,
 ) -> int:
     wolts_dir = run_root / "wolts"
     wolts_dir.mkdir(mode=0o700)
@@ -416,7 +500,7 @@ def _run_model_session(
     host = "127.0.0.1"
     env = _private_environment(
         run_root, wolts_dir, harness, auth_variable, auth_path,
-        host, port, inherited,
+        host, port, inherited, tmux_root,
     )
     if "WHATSAPP_AGENT_TOKEN" in env:
         raise RuntimeError("refusing to start with WhatsApp credentials in child environment")
@@ -518,7 +602,7 @@ def _run_model_session(
                         or record.get("chat_id") != participant
                         or record.get("wolt") != TEST_WOLT):
                     return ""
-                _verify_private_tmux(env, run_root, session)
+                _verify_private_tmux(env, tmux_root, session)
                 session_name = session
                 return session
 
@@ -593,7 +677,7 @@ def _run_model_session(
                         if route is matching
                     ):
                         raise RuntimeError("the test session participant binding did not match")
-                    _verify_private_tmux(env, run_root, session_name)
+                    _verify_private_tmux(env, tmux_root, session_name)
                     verified_session = session_name
                 if send_gate.verified_session:
                     # The send gate may verify first if the model notifies
@@ -612,7 +696,7 @@ def _run_model_session(
             return 0
     finally:
         cleanup_ok = _cleanup_resources(
-            server, server_thread, listener, session_name, env, run_root,
+            server, server_thread, listener, session_name, env, tmux_root,
         )
         if adapter is not None:
             adapter.TOKEN = ""
@@ -622,7 +706,7 @@ def _run_model_session(
         sys.path[:] = old_path
         sys.stdout, sys.stderr = original_stdout, original_stderr
         log_stream.close()
-        cleanup_ok = _finalize_run_root(run_root, cleanup_ok)
+        cleanup_ok = _finalize_run_root(run_root, cleanup_ok, tmux_root)
         if not cleanup_ok:
             _say("Cleanup needs attention; the private test directory was retained.")
 

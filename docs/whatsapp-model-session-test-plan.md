@@ -31,8 +31,16 @@ outbound path.
   private file; do not duplicate the key into `.env` or a tracked artifact.
   Server output goes to a private `0600` temporary log that is removed during
   successful cleanup.
-- Set `TMUX_TMPDIR` to a private directory inside the test root. Use an
-  already owner-authorized harness login through the existing supported
+- Set `TMUX_TMPDIR` to a separate per-run directory under the wolt owner's
+  private `.whatsapp-model-tmux/` directory. Both directories are mode `0700`,
+  checked for current-user ownership, and the exact `tmux-UID/default` socket
+  pathname is checked against Linux's 108-byte `sockaddr_un.sun_path` bound
+  before the WhatsApp key is read or any API poll can start. This short path
+  avoids nesting the socket under the long source checkout and test root. The
+  finalizer removes only that run's socket directory after confirming the
+  private server is stopped; if cleanup is uncertain, it preserves the run
+  root and socket directory for scoped cleanup. Use an already
+  owner-authorized harness login through the existing supported
   authentication path (for example, the configured `CODEX_HOME` or
   `CLAUDE_CONFIG_DIR` path carried by the session runtime). Do not copy,
   print, or inspect authentication files. The test runner should pass only the
