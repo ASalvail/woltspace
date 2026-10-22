@@ -62,10 +62,32 @@ implementation review. After review, its proposed command from this checkout is:
 .venv/bin/python scripts/whatsapp_startup_inspection.py --run --harness codex --timeout 120
 ```
 
+The comparison mode, prepared for review before another launch, is:
+
+```sh
+.venv/bin/python scripts/whatsapp_startup_inspection.py --run --harness codex --timeout 120 --directory-trust normal
+```
+
+The default `--directory-trust preserve` keeps directory prompts visible.
+`normal` omits `WOLTSPACE_PRESERVE_TRUST_PROMPTS` and uses normal platform
+preparation for only the fresh synthetic directory. Both modes retain explicit
+tool `prompt` policy and omit the approval bypass flag. Before enabling normal
+preparation, the inspector verifies CODEX_HOME is the owned private per-run
+directory with no existing/symlinked config. The normal trust writer therefore
+creates only that private config; the owner's auth/config directory is not its
+target. It does not answer a displayed dialog.
+
+Startup inspection now classifies the visible pane rather than scrollback.
+Specific `directory_trust_prompt`, `onboarding_prompt`, and `tool_approval_prompt`
+symptoms require a matching concrete question/header plus interactive choices.
+Overlapping signals or a broad trust/approval mention remain ambiguous
+`trust_or_approval`; they do not establish the dialog type or a prior failure
+cause. Only these fixed classifications leave the local parser, never pane text.
+
 This starts one real Codex session through the supported `sessions.start_session`
 path, with explicit `prompt` execution policy, existing authorized login,
 private HOME/CODEX_HOME, platform skills and the short private tmux socket.
-It does not grant Auto or answer dialogs. It sets
+It does not grant Auto or answer dialogs. In preserve mode it sets
 `WOLTSPACE_PRESERVE_TRUST_PROMPTS=1` in the private session environment
 so the normal platform trust writer does not pre-accept a directory dialog.
 The setting is forwarded through tmux to the real bootstrap process.

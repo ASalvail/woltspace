@@ -77,7 +77,7 @@ def _observe_boot(session: str, env: dict, diagnostics) -> bool:
     )
     diagnostics.enter("harness_boot")
     if model._handle_boot_symptom(
-        diagnostics, model._capture_boot_symptom(env, session),
+        diagnostics, model._capture_boot_symptom(env, session, visible_only=True),
     ):
         return False
     readiness = model._harness_readiness_status(session, "codex")
@@ -87,9 +87,25 @@ def _observe_boot(session: str, env: dict, diagnostics) -> bool:
     return True
 
 
+def _directory_trust_environment(env: dict, run_root: Path, mode: str) -> None:
+    """Allow normal trust writes only to the fresh private Codex config."""
+    if mode not in {"preserve", "normal"}:
+        raise ValueError("unsupported directory trust inspection mode")
+    home = Path(env.get("CODEX_HOME", ""))
+    expected = run_root / "codex-home"
+    if (home.is_symlink() or home.resolve() != expected.resolve()
+            or not home.is_dir() or home.stat().st_uid != os.getuid()
+            or (home / "config.toml").exists() or (home / "config.toml").is_symlink()):
+        raise RuntimeError("startup inspection requires a fresh private Codex config")
+    if mode == "preserve":
+        env["WOLTSPACE_PRESERVE_TRUST_PROMPTS"] = "1"
+    else:
+        env.pop("WOLTSPACE_PRESERVE_TRUST_PROMPTS", None)
+
+
 def _run_startup_session(
     harness, inherited, auth_variable, auth_path, run_root, tmux_root, diagnostics,
-    *, timeout_seconds=120,
+    *, timeout_seconds=120, directory_trust="preserve",
 ):
     """Real local server/session machinery; every outbound sender is mocked."""
     if harness != "codex" or not 1 <= timeout_seconds <= MAX_SECONDS:
@@ -100,9 +116,11 @@ def _run_startup_session(
         run_root, wolts_dir, harness, auth_variable, auth_path,
         "127.0.0.1", port, inherited, tmux_root,
     )
-    # The platform normally pre-accepts directory trust independently of tool
-    # approval policy. This inspection must observe those prompts instead.
-    env["WOLTSPACE_PRESERVE_TRUST_PROMPTS"] = "1"
+    try:
+        _directory_trust_environment(env, run_root, directory_trust)
+    except BaseException:
+        listener.close()
+        raise
     old_env, old_path = os.environ.copy(), list(sys.path)
     old_env.pop("WHATSAPP_AGENT_TOKEN", None)
     session = ""
@@ -231,15 +249,17 @@ def main():
     parser.add_argument("--run", action="store_true")
     parser.add_argument("--harness", choices=("codex",), required=True)
     parser.add_argument("--timeout", type=int, default=120)
+    parser.add_argument("--directory-trust", choices=("preserve", "normal"), default="preserve")
     args = parser.parse_args()
     if not args.run or not 1 <= args.timeout <= MAX_SECONDS:
         parser.error("--run and a timeout between 1 and 180 seconds are required")
     diagnostics = model.RunDiagnostics("codex")
     try:
+        model._say(f"Startup inspection directory_trust={args.directory_trust}.")
         result = model._run_model_test(
             "codex", diagnostics,
             startup_runner=lambda *items: _run_startup_session(
-                *items, timeout_seconds=args.timeout,
+                *items, timeout_seconds=args.timeout, directory_trust=args.directory_trust,
             ),
         )
         if result:

@@ -59,6 +59,7 @@ _FAILURE_CATEGORIES = {
     "selection_not_confirmed", "adapter_reply_failed", "session_not_started", "auth_or_config",
     "harness_boot_unconfirmed", "notify_rejected", "notify_ambiguous",
     "trust_or_approval_prompt", "waiting_for_input", "run_timeout",
+    "directory_trust_prompt", "onboarding_prompt", "tool_approval_prompt",
     "cleanup_failed", "internal_error",
 }
 
@@ -153,6 +154,7 @@ class RunDiagnostics:
 
 _BOOT_SYMPTOMS = {
     "auth_or_config", "bootstrap_missing", "trust_or_approval",
+    "directory_trust_prompt", "onboarding_prompt", "tool_approval_prompt",
     "waiting_for_input", "none_detected", "capture_unavailable",
 }
 _BOOT_PATTERNS = (
@@ -178,6 +180,34 @@ _BOOT_PATTERNS = (
 
 def _classify_boot_symptom(text: str) -> str:
     """Map private pane text to one fixed category; never return source text."""
+    # Require both a specific question/header and concrete interactive choices.
+    # A mere occurrence of "trust"/"approval" is only an ambiguous symptom.
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+    choices = bool(re.search(
+        r"(?im)^\s*(?:[>❯›]\s*)?\d+[.)]\s*(yes|no|proceed|exit|dark|light)\b|"
+        r"(?im:press (enter|return) to (confirm|continue))", text,
+    ))
+    directory = choices and bool(re.search(
+        r"do you trust (the contents of )?(this|the) (directory|folder|workspace|project)\??",
+        text, re.I,
+    ))
+    tool = choices and bool(re.search(
+        r"would you like to run the following command\??|approve (this|the following) command\??",
+        text, re.I,
+    ))
+    onboarding = choices and bool(re.search(
+        r"welcome to codex[\s\S]{0,300}(choose|select).{0,50}(theme|appearance)|"
+        r"(choose|select).{0,50}(theme|appearance)[\s\S]{0,300}welcome to codex",
+        text, re.I,
+    ))
+    specific = [name for name, match in (
+        ("directory_trust_prompt", directory), ("tool_approval_prompt", tool),
+        ("onboarding_prompt", onboarding),
+    ) if match]
+    if len(specific) == 1:
+        return specific[0]
+    if len(specific) > 1:
+        return "trust_or_approval"
     for category, pattern in _BOOT_PATTERNS:
         if pattern.search(text):
             return category
@@ -273,10 +303,13 @@ def _track_adapter_replies(real_api, diagnostics: RunDiagnostics):
     return tracked
 
 
-def _capture_boot_symptom(env: dict[str, str], session: str) -> str:
+def _capture_boot_symptom(env: dict[str, str], session: str, *, visible_only=False) -> str:
     """Classify the private tmux pane without returning or persisting its text."""
     try:
-        status, text, _ = _tmux_value(env, "capture-pane", "-p", "-t", session, "-S", "-80")
+        args = ("capture-pane", "-p", "-t", session)
+        if not visible_only:
+            args += ("-S", "-80")
+        status, text, _ = _tmux_value(env, *args)
     except Exception:
         return "capture_unavailable"
     if status:
@@ -292,12 +325,12 @@ def _handle_boot_symptom(diagnostics: RunDiagnostics, symptom: str) -> bool:
         diagnostics.enter("harness_boot")
         diagnostics.fail(symptom)
         return True
-    if symptom in {"trust_or_approval", "waiting_for_input"}:
+    if symptom in {"trust_or_approval", "waiting_for_input", "directory_trust_prompt",
+                   "onboarding_prompt", "tool_approval_prompt"}:
         diagnostics.set_harness_readiness("prompt_detected")
         diagnostics.enter("harness_boot")
         diagnostics.fail(
-            "trust_or_approval_prompt" if symptom == "trust_or_approval"
-            else "waiting_for_input",
+            "trust_or_approval_prompt" if symptom == "trust_or_approval" else symptom,
         )
         return True
     return False
