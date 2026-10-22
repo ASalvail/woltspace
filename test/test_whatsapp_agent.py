@@ -1,5 +1,6 @@
 import asyncio
 import importlib.util
+import io
 import json
 import sys
 import types
@@ -95,8 +96,8 @@ def test_dispatch_failure_is_marked_before_recovery_without_replay(monkeypatch, 
     ]}}]}]}
     state = {"offset": 0, "processed": []}
     def interrupted(*args):
-        raise RuntimeError("simulated process interruption")
-    with __import__("pytest").raises(RuntimeError, match="interruption"):
+        raise KeyboardInterrupt("simulated process interruption")
+    with __import__("pytest").raises(KeyboardInterrupt, match="interruption"):
         adapter.poll_once(state, {}, 100, cursor_path=path,
                           request=lambda *a: (200, body), dispatch=interrupted)
     recovered = json.loads(path.read_text())
@@ -106,6 +107,26 @@ def test_dispatch_failure_is_marked_before_recovery_without_replay(monkeypatch, 
                       dispatch=lambda *args: delivered.append(args[0]["id"]))
     assert delivered == []
     assert recovered["processed"] == ["m1"]
+
+
+def test_item_failure_does_not_drop_later_messages_in_checkpointed_batch(monkeypatch, tmp_path):
+    adapter = _load_adapter(monkeypatch, tmp_path)
+    path = tmp_path / "cursor.json"
+    batch = {"next_offset": 3, "entry": [{"changes": [{"value": {"messages": [
+        {"id": "bad", "from": "user:1", "timestamp": "100", "type": "text"},
+        None,
+        {"id": "good", "from": "user:1", "timestamp": "100", "type": "text"},
+    ]}}]}]}
+    delivered = []
+    def dispatch(item, routes, activation):
+        if item["id"] == "bad":
+            raise RuntimeError("item-specific failure")
+        delivered.append(item["id"])
+    state = adapter.poll_once({"offset": 0, "processed": []}, {}, 100,
+                              cursor_path=path, request=lambda *a: (200, batch), dispatch=dispatch)
+    assert delivered == ["good"]
+    assert state["processed"] == ["bad", "good"]
+    assert state["offset"] == 3
 
 
 @__import__("pytest").mark.parametrize(("code", "expected"), [(401, "API key"), (409, "one active poller")])
@@ -119,6 +140,23 @@ def test_authentication_and_poll_conflict_are_actionable_terminal_errors(monkeyp
     monkeypatch.setattr(adapter.urllib.request, "urlopen", rejected)
     with __import__("pytest").raises(adapter.WhatsAppConfigurationError, match=expected):
         adapter.api("GET", "/updates?offset=0")
+
+
+def test_documented_bad_request_error_100_is_terminal_and_redacted(monkeypatch, tmp_path):
+    adapter = _load_adapter(monkeypatch, tmp_path)
+    monkeypatch.setattr(adapter, "pace_request", lambda *a: None)
+    private_detail = "secret response detail"
+    def rejected(request, timeout):
+        raise __import__("urllib.error", fromlist=["HTTPError"]).HTTPError(
+            request.full_url, 400, "rejected", {}, io.BytesIO(
+                json.dumps({"error": {"code": 100, "message": private_detail}}).encode()
+            )
+        )
+    monkeypatch.setattr(adapter.urllib.request, "urlopen", rejected)
+    with __import__("pytest").raises(adapter.WhatsAppConfigurationError, match="HTTP 400, error 100") as error:
+        adapter.api("GET", "/updates?offset=0")
+    assert "API key" in str(error.value)
+    assert private_detail not in str(error.value)
 
 
 def test_activation_filter_and_persisted_dedup(monkeypatch, tmp_path):
@@ -276,3 +314,24 @@ def test_registry_to_notify_to_mocked_whatsapp_sender(monkeypatch, tmp_path):
     result = asyncio.run(notify.send_notification("wa-integration", "session reply"))
     assert result == {"adapter": "whatsapp", "participant": "user:99"}
     assert sent == [(key, "user:99", "session reply")]
+
+
+def test_successful_session_start_with_ack_timeout_does_not_claim_start_failed(monkeypatch, tmp_path):
+    adapter = _load_adapter(monkeypatch, tmp_path)
+    starts = []
+    def start(prompt, *, wolt, routing):
+        starts.append((prompt, wolt, routing))
+        return {"name": "session-new", "url": "https://lodge/session-new"}
+    monkeypatch.setattr(adapter, "start_claude_session", start)
+    monkeypatch.setattr(adapter, "eligible_wolts", lambda: {"beaver": {}})
+    sends = []
+    def fail_ack(method, path, payload):
+        sends.append(payload["text"]["body"])
+        raise TimeoutError("ambiguous acknowledgement timeout")
+    monkeypatch.setattr(adapter, "api", fail_ack)
+    routes = {"user:1": {"wolt": "beaver"}}
+    adapter.handle({"id": "m", "from": "user:1", "timestamp": "100", "type": "text",
+                    "text": {"body": "please do this once"}}, routes, 100)
+    assert len(starts) == 1
+    assert routes["user:1"]["session"] == "session-new"
+    assert sends == ["Session started: https://lodge/session-new"]

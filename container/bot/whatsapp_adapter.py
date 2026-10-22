@@ -10,7 +10,6 @@ import hashlib
 import json
 import logging
 import os
-import sys
 import tempfile
 import time
 import urllib.error
@@ -89,6 +88,18 @@ def _api_request(method: str, path: str, payload: dict | None = None) -> tuple[i
             raise WhatsAppConfigurationError(
                 f"WhatsApp Agent API authentication failed (HTTP {exc.code}); check the Agent API key"
             ) from None
+        if exc.code == 400 and method == "GET" and path.startswith("/updates?"):
+            # The Agent Platform documents error code 100 for an invalid key.
+            # Read only to classify it; never surface the response body.
+            try:
+                error = json.loads(exc.read()).get("error", {})
+                invalid_key = isinstance(error, dict) and error.get("code") == 100
+            except (AttributeError, TypeError, ValueError):
+                invalid_key = False
+            if invalid_key:
+                raise WhatsAppConfigurationError(
+                    "WhatsApp Agent API rejected the key (HTTP 400, error 100); check the Agent API key"
+                ) from None
         if exc.code == 409:
             raise WhatsAppConfigurationError(
                 "WhatsApp Agent API rejected this poller (HTTP 409); verify there is only one active poller"
@@ -177,6 +188,8 @@ def handle(item: dict, routes: dict, activation: int) -> None:
     route_instruction = notify_reply_instruction("--whatsapp", sender)
     prompt = f"[WhatsApp message from {sender}]: {text}\n{route_instruction}"
     routing = {"adapter": "whatsapp", "chat_id": sender, "whatsapp_account": ACCOUNT}
+    started_session = False
+    link = ""
     try:
         if route.get("session"):
             result = message_session(route["session"], prompt)
@@ -187,14 +200,24 @@ def handle(item: dict, routes: dict, activation: int) -> None:
             route["session"] = session.get("name")
             routes[sender] = route
             atomic_json(ROUTES, routes)
+            started_session = True
             link = session.get("url", "")
-            if link:
-                api("POST", "/messages", {"messaging_product": "whatsapp", "to": sender,
-                     "type": "text", "text": {"body": f"Session started: {link}"}})
     except Exception:
-        log.error("Could not start or resume the WhatsApp session (%s)", type(sys.exc_info()[1]).__name__)
-        api("POST", "/messages", {"messaging_product": "whatsapp", "to": sender,
-             "type": "text", "text": {"body": "I could not start a session. Please try again."}})
+        log.error("Could not start or resume the WhatsApp session")
+        try:
+            api("POST", "/messages", {"messaging_product": "whatsapp", "to": sender,
+                 "type": "text", "text": {"body": "I could not start a session. Please try again."}})
+        except Exception:
+            log.error("Could not send the WhatsApp session failure reply")
+        return
+    # Starting/resuming the session is the dispatch. A failed acknowledgement
+    # must not invite a duplicate message and duplicate instructions.
+    if started_session and link:
+        try:
+            api("POST", "/messages", {"messaging_product": "whatsapp", "to": sender,
+                 "type": "text", "text": {"body": f"Session started: {link}"}})
+        except Exception:
+            log.error("Session started, but the WhatsApp acknowledgement could not be delivered")
 
 
 def poll_once(state: dict, routes: dict, activation: int, *, cursor_path: Path = CURSOR,
@@ -215,6 +238,9 @@ def poll_once(state: dict, routes: dict, activation: int, *, cursor_path: Path =
     processed = list(state.get("processed", []))
     known = set(processed)
     for item in batch:
+        if not isinstance(item, dict):
+            log.error("Ignoring malformed WhatsApp update item")
+            continue
         mid = item.get("id")
         if not isinstance(mid, str) or mid in known:
             continue
@@ -227,7 +253,13 @@ def poll_once(state: dict, routes: dict, activation: int, *, cursor_path: Path =
         state["processed"] = processed[-10000:]
         atomic_json(cursor_path, state)
         if not too_old:
-            dispatch(item, routes, activation)
+            try:
+                dispatch(item, routes, activation)
+            except Exception as exc:
+                # This item is marked before dispatch to avoid replaying an
+                # ambiguous side effect. Continue so unrelated later updates
+                # in the same checkpointed batch are not lost.
+                log.error("WhatsApp message dispatch failed (%s)", type(exc).__name__)
     return state
 
 

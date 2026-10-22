@@ -34,8 +34,13 @@ The first poll uses explicit `offset=0`, with a persisted activation time to
 ignore older retained messages. The `next_offset` cursor is persisted; HTTP 204
 keeps the same cursor because it has no body. Message IDs are also persisted
 before dispatch. There is an unavoidable crash window: a process can persist an
-offset or ID and stop before a session receives the message. Recovery therefore
-does not claim exactly-once dispatch. The account token's one-way fingerprint
+offset or ID and stop before a session receives the message. Ordinary item-level
+dispatch failures are logged and later items in the same batch still run; the
+failed item's persisted ID prevents automatic replay because its outcome may be
+ambiguous. Malformed items are skipped. Recovery therefore does not claim
+exactly-once dispatch. A session-start acknowledgement can also be lost after
+the session was successfully created; this does not trigger a misleading
+"session failed" reply. The account token's one-way fingerprint
 names cursor and routing files, so changing keys does not inherit earlier
 participant ownership. The API caps updates polling at 15 requests/minute and
 message sends at 12 requests/minute. Explicit HTTP 429 refusals receive a
