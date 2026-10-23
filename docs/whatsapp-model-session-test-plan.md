@@ -117,6 +117,50 @@ restrictions remain in effect; the helper does not request or grant approval.
 This comparison has not been launched and does not use a WhatsApp credential,
 provider poll or provider send.
 
+The reviewed probe subsequently established correct routing/session/executable,
+a blocked tool-context health request in a different network namespace, and a
+successful nearby host health check. The next proposed comparison requests
+normal approval before the first helper call:
+
+```sh
+.venv/bin/python scripts/whatsapp_startup_inspection.py --run --harness codex --timeout 180 --directory-trust normal --capture-snapshot --probe-transport --request-notify-approval
+```
+
+This new mode is prepared for review, **not yet launched**. It changes the
+synthetic instruction only: request normal one-time shell-tool escalation for
+the helper, wait for the current reviewer, and stop on denied/unavailable
+approval. No proxy, network, sandbox, reviewer or execution-policy setting is
+changed. The helper still supplies the exact fixed stdin/route and reserves
+its one attempt before I/O; it never retries an ambiguous send. This tests the
+general local notify path: provider delivery happens in the lodge, and the
+shell does not need direct WhatsApp networking.
+
+The runner prints `Approval needed` after verifying its temporary registry and
+socket, followed by an exact `env -u TMUX tmux -S ... attach-session -t ...`
+command for **that private test session only**. Run this printed command in a
+second terminal. No key, auth content or participant identifier is included.
+If Codex shows the intended helper request, the owner can approve it once;
+do not select a permanent rule or answer unrelated dialogs. The runner never
+answers a dialog. Detach with Ctrl-b then d. Ctrl-C in the runner attempts its
+normal scoped cleanup.
+
+The task begins with approval-needed status, not proof that a dialog is
+already visible. A concrete tool-approval symptom can remain waiting, while
+directory-trust/onboarding and ambiguous prompt symptoms keep their previous
+failure behavior. The runner repeats a fixed pending status every 15 seconds
+until a helper result appears and announces the bounded observation deadline.
+If no helper result is observed by that deadline, it explicitly reports
+`approval_not_completed`, then cleans up. This does not prove approval was
+denied or even displayed. A delayed owner response is not an integration
+failure. No session remains running after successful cleanup; the printed
+attach command then expires.
+
+Normal approval is a runtime check in addition to feature authorization.
+An approved escalation runs that command and its children outside the command
+sandbox; it is **not** an OS-enforced exact-port grant. The current reviewer
+may ask the owner or apply managed review. Honor its result. See the official
+[sandbox and approval guidance](https://learn.chatgpt.com/docs/agent-approvals-security#sandbox-and-approvals).
+
 The default `--directory-trust preserve` keeps directory prompts visible.
 `normal` omits `WOLTSPACE_PRESERVE_TRUST_PROMPTS` and uses normal platform
 preparation for only the fresh synthetic directory. Both modes retain explicit

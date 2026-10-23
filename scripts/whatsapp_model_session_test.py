@@ -61,6 +61,7 @@ _FAILURE_CATEGORIES = {
     "trust_or_approval_prompt", "waiting_for_input", "run_timeout",
     "directory_trust_prompt", "onboarding_prompt", "tool_approval_prompt",
     "local_transport_probe_failed",
+    "approval_not_completed",
     "cleanup_failed", "internal_error",
 }
 

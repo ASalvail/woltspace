@@ -8,6 +8,7 @@ import contextlib
 import json
 import os
 import re
+import shlex
 import sys
 import threading
 import time
@@ -33,6 +34,15 @@ PROBE_PROMPT = (
     "using your shell tool. This executable performs the checks and owns the notify call; "
     "it supplies startup-inspection-ok on standard input. Use only that executable for this "
     "task and do nothing else. It contacts only the private local test server."
+)
+APPROVAL_PROBE_PROMPT = (
+    PROBE_PROMPT + " Prior inspection established that the command sandbox blocks the local API. "
+    "BEFORE the first helper invocation, request normal one-time shell-tool approval using "
+    "sandbox_permissions=require_escalated and a justification explaining access to the isolated "
+    "local Woltspace API. Wait for the current reviewer; do not invoke the helper without approval. "
+    "Do not request a persistent prefix grant, change network/sandbox/reviewer settings, or answer "
+    "any dialog yourself. Existing feature authorization does not replace runtime approval. "
+    "If approval is denied or unavailable, report that blocker and stop. Never retry an ambiguous send."
 )
 MAX_SECONDS = 180
 SNAPSHOT_NAME = "startup-snapshot.json"
@@ -218,21 +228,42 @@ def _verify_record(session: str, wolts_dir: Path, env: dict,
     return True
 
 
-def _observe_boot(session: str, env: dict, diagnostics) -> bool:
+def _observe_boot(session: str, env: dict, diagnostics, *, allow_tool_approval=False) -> bool:
     process = model._harness_process_status(session, "codex")
     diagnostics.set_harness_process(
         "present" if process is True else "absent" if process is False else "unknown",
     )
     diagnostics.enter("harness_boot")
-    if model._handle_boot_symptom(
-        diagnostics, model._capture_boot_symptom(env, session, visible_only=True),
-    ):
+    symptom = model._capture_boot_symptom(env, session, visible_only=True)
+    if allow_tool_approval and symptom == "tool_approval_prompt":
+        diagnostics.set_boot_symptom(symptom)
+        diagnostics.set_harness_readiness("prompt_detected")
+        return True  # Human may answer the normal tool request; runner never does.
+    if model._handle_boot_symptom(diagnostics, symptom):
         return False
     readiness = model._harness_readiness_status(session, "codex")
     diagnostics.set_harness_readiness(readiness)
     if readiness == "ready_marker_seen":
         diagnostics.passed("harness_boot")
     return True
+
+
+def _approval_notice(session, wolts_dir, env, tmux_root, seconds):
+    if not _verify_record(session, wolts_dir, env, tmux_root):
+        raise RuntimeError("refusing unverified test-session attach instructions")
+    record = model._record_for_test(session, wolts_dir)
+    target = record["runtime"].get("tmux_session_name", "")
+    if not isinstance(target, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", target):
+        raise RuntimeError("invalid private test-session target")
+    socket = tmux_root / f"tmux-{os.getuid()}" / "default"
+    command = shlex.join(["env", "-u", "TMUX", "tmux", "-S", str(socket),
+                          "attach-session", "-t", "=" + target])
+    model._say("Approval needed: the synthetic task requests normal one-time command escalation; "
+               "prompt visibility is not yet confirmed. No approval will be answered automatically.")
+    model._say("Attach only to this temporary test session: " + command)
+    model._say(f"Approve only the intended startup-notify-probe command if shown; "
+               f"do not grant a permanent rule. Observation budget: {seconds}s. "
+               "Detach with Ctrl-b then d; Ctrl-C in the runner stops and cleans up.")
 
 
 def _directory_trust_environment(env: dict, run_root: Path, mode: str) -> None:
@@ -254,10 +285,11 @@ def _directory_trust_environment(env: dict, run_root: Path, mode: str) -> None:
 def _run_startup_session(
     harness, inherited, auth_variable, auth_path, run_root, tmux_root, diagnostics,
     *, timeout_seconds=120, directory_trust="preserve", capture_snapshot=False,
-    probe_transport=False,
+    probe_transport=False, request_notify_approval=False,
 ):
     """Real local server/session machinery; every outbound sender is mocked."""
-    if harness != "codex" or not 1 <= timeout_seconds <= MAX_SECONDS:
+    if (harness != "codex" or not 1 <= timeout_seconds <= MAX_SECONDS
+            or request_notify_approval and not probe_transport):
         raise ValueError("unsupported startup inspection settings")
     wolts_dir = run_root / "wolts"
     listener, port = model._bind_local_socket()
@@ -282,7 +314,7 @@ def _run_startup_session(
     counter = None
     probe_config = probe_result = None
     host_health = "not_checked"
-    prompt = PROBE_PROMPT if probe_transport else PROMPT
+    prompt = APPROVAL_PROBE_PROMPT if request_notify_approval else PROBE_PROMPT if probe_transport else PROMPT
     fd = os.open(run_root / "runner.log", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     log = os.fdopen(fd, "w", encoding="utf-8", buffering=1)
     os.environ.clear()
@@ -364,7 +396,14 @@ def _run_startup_session(
                 diagnostics.passed("session_spawn")
             finally:
                 dispatch_done.set()
+            if request_notify_approval:
+                _approval_notice(session, wolts_dir, env, tmux_root, timeout_seconds)
+            next_notice = time.monotonic() + 15
             while time.monotonic() < deadline:
+                if request_notify_approval and probe_result is None and time.monotonic() >= next_notice:
+                    model._say("Approval-needed task still pending; no helper result observed. "
+                               f"Remaining observation budget: {max(0, int(deadline-time.monotonic()))}s.")
+                    next_notice = time.monotonic() + 15
                 if probe_config is not None:
                     probe_result = _read_probe(probe_config)
                     if probe_result is not None:
@@ -387,11 +426,16 @@ def _run_startup_session(
                         and (probe_config is None or probe_result is not None and probe_result["phase"] == "complete")):
                     model._say("Startup inspection received one verified local mocked notification.")
                     return 0
-                if not _observe_boot(session, env, diagnostics):
+                if not _observe_boot(session, env, diagnostics, allow_tool_approval=request_notify_approval):
                     raise RuntimeError("startup inspection detected an interactive boot prompt")
                 time.sleep(0.2)
             diagnostics.enter("notify")
-            diagnostics.fail("run_timeout")
+            if request_notify_approval and probe_result is None:
+                model._say("Approval-needed task did not complete before the observation deadline; "
+                           "no helper result observed. This does not prove approval was denied. Cleaning up.")
+                diagnostics.fail("approval_not_completed")
+            else:
+                diagnostics.fail("run_timeout")
             raise TimeoutError("startup inspection timed out")
     except BaseException:
         if not diagnostics.category:
@@ -440,7 +484,10 @@ def main():
     parser.add_argument("--directory-trust", choices=("preserve", "normal"), default="preserve")
     parser.add_argument("--capture-snapshot", action="store_true")
     parser.add_argument("--probe-transport", action="store_true")
+    parser.add_argument("--request-notify-approval", action="store_true")
     args = parser.parse_args()
+    if args.request_notify_approval and not args.probe_transport:
+        parser.error("--request-notify-approval requires --probe-transport")
     if not args.run or not 1 <= args.timeout <= MAX_SECONDS:
         parser.error("--run and a timeout between 1 and 180 seconds are required")
     diagnostics = model.RunDiagnostics("codex")
@@ -452,6 +499,7 @@ def main():
                 *items, timeout_seconds=args.timeout, directory_trust=args.directory_trust,
                 capture_snapshot=args.capture_snapshot,
                 probe_transport=args.probe_transport,
+                request_notify_approval=args.request_notify_approval,
             ),
         )
         if result:

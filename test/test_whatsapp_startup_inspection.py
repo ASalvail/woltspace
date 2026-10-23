@@ -33,6 +33,42 @@ def test_startup_uses_supported_session_creation_with_prompt_policy(monkeypatch)
     assert calls[0]["routing"]["chat_id"] == startup.PARTICIPANT
 
 
+def test_approval_prompt_preserves_one_attempt_and_normal_policy():
+    from scripts import whatsapp_startup_inspection as startup
+    prompt = startup.APPROVAL_PROBE_PROMPT
+    assert prompt.startswith(startup.PROBE_PROMPT)
+    for text in ("BEFORE the first helper invocation", "sandbox_permissions=require_escalated",
+                 "Wait for the current reviewer", "persistent prefix grant",
+                 "Never retry an ambiguous send", "stop"):
+        assert text in prompt
+    skill = (ROOT / "container/skills/notify/SKILL.md").read_text()
+    assert "model's shell does not need direct WhatsApp access" in skill
+    assert "Existing feature authorization does not" in skill
+
+
+@pytest.mark.parametrize("symptom,expected", [
+    ("tool_approval_prompt", True), ("directory_trust_prompt", False),
+    ("onboarding_prompt", False), ("trust_or_approval", False),
+])
+def test_only_specific_tool_approval_can_wait(monkeypatch, symptom, expected):
+    from scripts import whatsapp_startup_inspection as startup
+    monkeypatch.setattr(startup.model, "_harness_process_status", lambda *_: True)
+    monkeypatch.setattr(startup.model, "_capture_boot_symptom", lambda *_, **__: symptom)
+    diagnostics = startup.model.RunDiagnostics("codex")
+    assert startup._observe_boot("synthetic", {}, diagnostics, allow_tool_approval=True) is expected
+    assert bool(diagnostics.category) is not expected
+
+
+def test_approval_attach_notice_refuses_unverified_target(monkeypatch, tmp_path):
+    from scripts import whatsapp_startup_inspection as startup
+    monkeypatch.setattr(startup, "_verify_record", lambda *_: False)
+    output = []
+    monkeypatch.setattr(startup.model, "_say", output.append)
+    with pytest.raises(RuntimeError):
+        startup._approval_notice("synthetic", tmp_path, {}, tmp_path, 120)
+    assert output == []
+
+
 @pytest.mark.parametrize("directory_trust", ["preserve", "normal"])
 def test_real_prepare_scopes_directory_trust_and_keeps_prompt_policy(
     tmp_path, monkeypatch, directory_trust,
@@ -196,7 +232,7 @@ def test_snapshot_targets_only_verified_exact_pane(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("scenario", [
-    "success", "normal_success", "snapshot_success", "snapshot_timeout", "wrong_payload", "timeout", "trust_prompt", "spawn_failure", "cleanup_failure", "probe_success", "probe_api_missing",
+    "success", "normal_success", "snapshot_success", "snapshot_timeout", "wrong_payload", "timeout", "trust_prompt", "spawn_failure", "cleanup_failure", "probe_success", "probe_api_missing", "probe_approval_success", "probe_approval_timeout",
 ])
 def test_full_offline_startup_orchestration(tmp_path, scenario):
     # Fresh interpreter ensures real server/session imports bind to only the
@@ -225,7 +261,7 @@ model.owner_test._read_token = key_forbidden
 model._verify_private_tmux = lambda *_: None
 model._harness_process_status = lambda *_: True
 model._harness_readiness_status = lambda *_: "unsupported"
-model._capture_boot_symptom = lambda *_, **__: "trust_or_approval" if scenario == "trust_prompt" else "none_detected"
+model._capture_boot_symptom = lambda *_, **__: "tool_approval_prompt" if scenario.startswith("probe_approval_") else "trust_or_approval" if scenario == "trust_prompt" else "none_detected"
 model._tmux_value = lambda env, *args: (0, "%1", "") if args[0] == "list-panes" else (
     0, "Synthetic model UI is waiting\nAPI_KEY=private-snapshot-value", "")
 real_cleanup = model._cleanup_resources
@@ -236,9 +272,9 @@ model._cleanup_resources = cleanup
 cli_threads = []
 cli_results = []
 def fake_start(prompt=None):
-    assert (os.environ.get("WOLTSPACE_PRESERVE_TRUST_PROMPTS") == "1") == (scenario not in {"normal_success", "probe_success", "probe_api_missing"})
+    assert (os.environ.get("WOLTSPACE_PRESERVE_TRUST_PROMPTS") == "1") == (scenario != "normal_success" and not scenario.startswith("probe_"))
     if scenario.startswith("probe_"):
-        assert prompt == startup.PROBE_PROMPT
+        assert prompt == (startup.APPROVAL_PROBE_PROMPT if scenario.startswith("probe_approval_") else startup.PROBE_PROMPT)
     if scenario == "spawn_failure":
         raise RuntimeError("private-raw-start-error synthetic-secret")
     # Supported registry path and real notify routing, without tmux/model spawn.
@@ -254,7 +290,7 @@ def fake_start(prompt=None):
     registry.update(record["name"], wolt="wa-test", runtime={
         "kind": "tmux", "tmux_session_name": "synthetic", "pane_id": "%1",
     })
-    if scenario not in {"timeout", "snapshot_timeout", "trust_prompt"}:
+    if scenario not in {"timeout", "snapshot_timeout", "trust_prompt", "probe_approval_timeout"}:
         def cli():
             env = dict(os.environ)
             env["WOLTSPACE_WOLT_SESSION"] = record["name"]
@@ -281,10 +317,11 @@ with tempfile.TemporaryDirectory(prefix=".wsi-offline-", dir=startup.ROOT.parent
     model.PRIVATE_TMUX_BASE = Path(sockets)
     try:
         result = model._run_model_test("codex", diag, startup_runner=lambda *args:
-            startup._run_startup_session(*args, timeout_seconds=1 if scenario in {"timeout", "snapshot_timeout"} else 5,
-                directory_trust="normal" if scenario in {"normal_success", "probe_success", "probe_api_missing"} else "preserve",
+            startup._run_startup_session(*args, timeout_seconds=1 if scenario in {"timeout", "snapshot_timeout", "probe_approval_timeout"} else 5,
+                directory_trust="normal" if scenario == "normal_success" or scenario.startswith("probe_") else "preserve",
                 capture_snapshot=scenario.startswith(("snapshot_", "probe_")),
-                probe_transport=scenario.startswith("probe_")))
+                probe_transport=scenario.startswith("probe_"),
+                request_notify_approval=scenario.startswith("probe_approval_")))
     except Exception:
         result = 2
     for thread in cli_threads:
@@ -293,13 +330,13 @@ with tempfile.TemporaryDirectory(prefix=".wsi-offline-", dir=startup.ROOT.parent
 record = diag.as_record()
 assert model._valid_diagnostic_record(record)
 assert "bot.whatsapp_adapter" not in sys.modules
-if scenario in {"success", "normal_success", "snapshot_success", "probe_success"}:
+if scenario in {"success", "normal_success", "snapshot_success", "probe_success", "probe_approval_success"}:
     assert result == 0
     assert record["notify_attempt"] == "sent"
     assert record["checks"]["notify"] == "passed"
     assert record["checks"]["cleanup"] == "passed"
     assert cli_results == [0]
-    if scenario not in {"snapshot_success", "probe_success"}:
+    if scenario not in {"snapshot_success", "probe_success", "probe_approval_success"}:
         assert not list(private.glob("startup-*"))
 elif scenario == "cleanup_failure":
     assert result == 2 and record["category"] == "cleanup_failed"
@@ -313,11 +350,12 @@ else:
         "trust_prompt": "trust_or_approval_prompt",
         "spawn_failure": "session_not_started",
         "probe_api_missing": "local_transport_probe_failed",
+        "probe_approval_timeout": "approval_not_completed",
     }[scenario]
     assert record["checks"]["notify"] != "passed"
     assert record["notify_attempt"] == ("rejected" if scenario == "wrong_payload" else "not_seen")
     assert record["checks"]["cleanup"] == "passed"
-if scenario not in {"success", "normal_success", "snapshot_success", "probe_success"}:
+if scenario not in {"success", "normal_success", "snapshot_success", "probe_success", "probe_approval_success"}:
     paths = list(private.glob("startup-*/failure.json"))
     assert len(paths) == 1
     data = json.loads(paths[0].read_text())
@@ -331,13 +369,18 @@ if scenario.startswith(("snapshot_", "probe_")):
     assert snapshot["pane_status"] == "captured"
     assert "Synthetic model UI" in snapshot["pane_text"]
     assert "private-snapshot-value" not in str(snapshot)
-    assert snapshot["notify_requests"] == (1 if scenario in {"snapshot_success", "probe_success"} else 0)
-    assert snapshot["notify_last_status"] == (200 if scenario in {"snapshot_success", "probe_success"} else None)
+    assert snapshot["notify_requests"] == (1 if scenario in {"snapshot_success", "probe_success", "probe_approval_success"} else 0)
+    assert snapshot["notify_last_status"] == (200 if scenario in {"snapshot_success", "probe_success", "probe_approval_success"} else None)
     assert snapshots[0].stat().st_mode & 0o777 == 0o600
     assert not list(snapshots[0].parent.rglob("*.log"))
     assert {p.name for p in snapshots[0].parent.iterdir()} == (
-        {"startup-snapshot.json"} if scenario in {"snapshot_success", "probe_success"} else {"startup-snapshot.json", "failure.json"})
-    if scenario.startswith("probe_"):
+        {"startup-snapshot.json"} if scenario in {"snapshot_success", "probe_success", "probe_approval_success"} else {"startup-snapshot.json", "failure.json"})
+    if scenario == "probe_approval_timeout":
+        assert snapshot["host_health"] == "not_checked"
+        assert snapshot["transport_probe"] is None
+        assert record["boot_symptom"] == "tool_approval_prompt"
+        assert cli_results == []
+    elif scenario.startswith("probe_"):
         assert snapshot["host_health"] == "ok"
         assert snapshot["transport_probe"]["destination"] == ("default_7777" if scenario == "probe_api_missing" else "expected")
         assert snapshot["transport_probe"]["net_namespace"] == "same"
@@ -356,3 +399,10 @@ print("offline_startup_ok")
     assert result.returncode == 0, result.stderr
     assert "offline_startup_ok" in result.stdout
     assert "private-raw-start-error" not in result.stdout + result.stderr
+    if scenario.startswith("probe_approval_"):
+        assert "Approval needed:" in result.stdout
+        assert "Attach only to this temporary test session: env -u TMUX tmux -S " in result.stdout
+        assert "attach-session -t =synthetic" in result.stdout
+        assert "Observation budget:" in result.stdout
+    if scenario == "probe_approval_timeout":
+        assert "This does not prove approval was denied. Cleaning up." in result.stdout
