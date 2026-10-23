@@ -196,7 +196,7 @@ def test_snapshot_targets_only_verified_exact_pane(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("scenario", [
-    "success", "normal_success", "snapshot_success", "snapshot_timeout", "wrong_payload", "timeout", "trust_prompt", "spawn_failure", "cleanup_failure",
+    "success", "normal_success", "snapshot_success", "snapshot_timeout", "wrong_payload", "timeout", "trust_prompt", "spawn_failure", "cleanup_failure", "probe_success", "probe_api_missing",
 ])
 def test_full_offline_startup_orchestration(tmp_path, scenario):
     # Fresh interpreter ensures real server/session imports bind to only the
@@ -235,8 +235,10 @@ def cleanup(*args):
 model._cleanup_resources = cleanup
 cli_threads = []
 cli_results = []
-def fake_start():
-    assert (os.environ.get("WOLTSPACE_PRESERVE_TRUST_PROMPTS") == "1") == (scenario != "normal_success")
+def fake_start(prompt=None):
+    assert (os.environ.get("WOLTSPACE_PRESERVE_TRUST_PROMPTS") == "1") == (scenario not in {"normal_success", "probe_success", "probe_api_missing"})
+    if scenario.startswith("probe_"):
+        assert prompt == startup.PROBE_PROMPT
     if scenario == "spawn_failure":
         raise RuntimeError("private-raw-start-error synthetic-secret")
     # Supported registry path and real notify routing, without tmux/model spawn.
@@ -258,10 +260,13 @@ def fake_start():
             env["WOLTSPACE_WOLT_SESSION"] = record["name"]
             from session_runtime import _session_env_value
             env["PATH"] = _session_env_value("PATH", env["PATH"])
+            if scenario == "probe_api_missing":
+                env.pop("WOLTSPACE_API", None)
             message = "wrong-synthetic-body" if scenario == "wrong_payload" else startup.BODY
+            command = [str(Path(env["WOLTS_DIR"]) / "wa-test/startup-notify-probe")] if scenario.startswith("probe_") else [
+                str(startup.ROOT / "container/bin/notify"), "--whatsapp", startup.PARTICIPANT]
             result = subprocess.run(
-                [str(startup.ROOT / "container/bin/notify"),
-                 "--whatsapp", startup.PARTICIPANT], input=message,
+                command, input=message,
                 env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, timeout=10,
             )
@@ -277,8 +282,9 @@ with tempfile.TemporaryDirectory(prefix=".wsi-offline-", dir=startup.ROOT.parent
     try:
         result = model._run_model_test("codex", diag, startup_runner=lambda *args:
             startup._run_startup_session(*args, timeout_seconds=1 if scenario in {"timeout", "snapshot_timeout"} else 5,
-                directory_trust="normal" if scenario == "normal_success" else "preserve",
-                capture_snapshot=scenario.startswith("snapshot_")))
+                directory_trust="normal" if scenario in {"normal_success", "probe_success", "probe_api_missing"} else "preserve",
+                capture_snapshot=scenario.startswith(("snapshot_", "probe_")),
+                probe_transport=scenario.startswith("probe_")))
     except Exception:
         result = 2
     for thread in cli_threads:
@@ -287,13 +293,13 @@ with tempfile.TemporaryDirectory(prefix=".wsi-offline-", dir=startup.ROOT.parent
 record = diag.as_record()
 assert model._valid_diagnostic_record(record)
 assert "bot.whatsapp_adapter" not in sys.modules
-if scenario in {"success", "normal_success", "snapshot_success"}:
+if scenario in {"success", "normal_success", "snapshot_success", "probe_success"}:
     assert result == 0
     assert record["notify_attempt"] == "sent"
     assert record["checks"]["notify"] == "passed"
     assert record["checks"]["cleanup"] == "passed"
     assert cli_results == [0]
-    if scenario != "snapshot_success":
+    if scenario not in {"snapshot_success", "probe_success"}:
         assert not list(private.glob("startup-*"))
 elif scenario == "cleanup_failure":
     assert result == 2 and record["category"] == "cleanup_failed"
@@ -306,30 +312,37 @@ else:
         "snapshot_timeout": "run_timeout",
         "trust_prompt": "trust_or_approval_prompt",
         "spawn_failure": "session_not_started",
+        "probe_api_missing": "local_transport_probe_failed",
     }[scenario]
     assert record["checks"]["notify"] != "passed"
     assert record["notify_attempt"] == ("rejected" if scenario == "wrong_payload" else "not_seen")
     assert record["checks"]["cleanup"] == "passed"
-if scenario not in {"success", "normal_success", "snapshot_success"}:
+if scenario not in {"success", "normal_success", "snapshot_success", "probe_success"}:
     paths = list(private.glob("startup-*/failure.json"))
     assert len(paths) == 1
     data = json.loads(paths[0].read_text())
     assert model._valid_diagnostic_record(data)
     assert all(term not in str(data) for term in (startup.PARTICIPANT, startup.BODY, startup.PROMPT))
     assert not list(paths[0].parent.rglob("*.log"))
-if scenario.startswith("snapshot_"):
+if scenario.startswith(("snapshot_", "probe_")):
     snapshots = list(private.glob("startup-*/startup-snapshot.json"))
     assert len(snapshots) == 1
     snapshot = json.loads(snapshots[0].read_text())
     assert snapshot["pane_status"] == "captured"
     assert "Synthetic model UI" in snapshot["pane_text"]
     assert "private-snapshot-value" not in str(snapshot)
-    assert snapshot["notify_requests"] == (1 if scenario == "snapshot_success" else 0)
-    assert snapshot["notify_last_status"] == (200 if scenario == "snapshot_success" else None)
+    assert snapshot["notify_requests"] == (1 if scenario in {"snapshot_success", "probe_success"} else 0)
+    assert snapshot["notify_last_status"] == (200 if scenario in {"snapshot_success", "probe_success"} else None)
     assert snapshots[0].stat().st_mode & 0o777 == 0o600
     assert not list(snapshots[0].parent.rglob("*.log"))
     assert {p.name for p in snapshots[0].parent.iterdir()} == (
-        {"startup-snapshot.json"} if scenario == "snapshot_success" else {"startup-snapshot.json", "failure.json"})
+        {"startup-snapshot.json"} if scenario in {"snapshot_success", "probe_success"} else {"startup-snapshot.json", "failure.json"})
+    if scenario.startswith("probe_"):
+        assert snapshot["host_health"] == "ok"
+        assert snapshot["transport_probe"]["destination"] == ("default_7777" if scenario == "probe_api_missing" else "expected")
+        assert snapshot["transport_probe"]["net_namespace"] == "same"
+        assert snapshot["transport_probe"]["health"] == "ok"
+        assert snapshot["transport_probe"]["api_present"] == (scenario != "probe_api_missing")
 print("offline_startup_ok")
 '''
     env = dict(os.environ)

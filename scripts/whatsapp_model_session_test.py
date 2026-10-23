@@ -60,6 +60,7 @@ _FAILURE_CATEGORIES = {
     "harness_boot_unconfirmed", "notify_rejected", "notify_ambiguous",
     "trust_or_approval_prompt", "waiting_for_input", "run_timeout",
     "directory_trust_prompt", "onboarding_prompt", "tool_approval_prompt",
+    "local_transport_probe_failed",
     "cleanup_failed", "internal_error",
 }
 

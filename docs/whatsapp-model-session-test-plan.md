@@ -89,6 +89,34 @@ to a PR. Remove it after the diagnostic review no longer needs it. Raw pane
 text exists only transiently in memory; raw logs are removed as before. This
 mode is prepared for review, not yet launched.
 
+The next transport-boundary comparison is prepared for review with:
+
+```sh
+.venv/bin/python scripts/whatsapp_startup_inspection.py --run --harness codex --timeout 120 --directory-trust normal --capture-snapshot --probe-transport
+```
+
+The fixed synthetic prompt asks the model to execute `./startup-notify-probe`
+once. In that same tool invocation the helper compares only selected environment
+values internally: API presence, expected isolated destination versus default
+7777/other, session match, and checkout notify executable match. It reports only
+fixed classes and same/different/unavailable network namespace. It makes a
+body-free `/health` request only to the known isolated endpoint. Notify runs
+only if connectivity and endpoint/session/executable checks pass, using the
+existing CLI and fixed synthetic body; its output is discarded and only its
+exit code is retained. Missing or mismatched routing skips the send, including
+any fallback to the installed server. A private one-attempt marker prevents
+duplicate helper calls from sending again.
+
+The host samples the same endpoint when it first observes the tool's probe
+record (usually the `health_started` transition). This is a nearby comparison,
+not a claim of simultaneous health observations. Snapshot schema 2 retains
+only the validated fixed probe fields and host health class alongside the
+existing redacted UI. No environment values, endpoint, session identifier or
+namespace identifier are emitted by the probe. Normal prompt policy and network
+restrictions remain in effect; the helper does not request or grant approval.
+This comparison has not been launched and does not use a WhatsApp credential,
+provider poll or provider send.
+
 The default `--directory-trust preserve` keeps directory prompts visible.
 `normal` omits `WOLTSPACE_PRESERVE_TRUST_PROMPTS` and uses normal platform
 preparation for only the fresh synthetic directory. Both modes retain explicit

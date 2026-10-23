@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from scripts import whatsapp_model_session_test as model
+from scripts import startup_transport_probe as transport
 
 PARTICIPANT = "user:4242424242"
 ACCOUNT = "synthetic-startup-account"
@@ -26,6 +27,12 @@ PROMPT = (
     "to send the text startup-inspection-ok via --whatsapp user:4242424242. "
     "Pass the text through standard input. The endpoint is a local mock and "
     "does not contact WhatsApp. Do nothing else."
+)
+PROBE_PROMPT = (
+    "This is an isolated local transport inspection. Run ./startup-notify-probe exactly once "
+    "using your shell tool. This executable performs the checks and owns the notify call; "
+    "it supplies startup-inspection-ok on standard input. Use only that executable for this "
+    "task and do nothing else. It contacts only the private local test server."
 )
 MAX_SECONDS = 180
 SNAPSHOT_NAME = "startup-snapshot.json"
@@ -72,16 +79,18 @@ class _NotifyCounter:
         await self.app(scope, receive, counted_send)
 
 
-def _capture_snapshot(session, wolts_dir, env, tmux_root, directory_trust, counter):
+def _capture_snapshot(session, wolts_dir, env, tmux_root, directory_trust, counter,
+                      *, prompt=PROMPT, probe=None, host_health="not_checked"):
     """Capture only the registry's verified exact pane before cleanup."""
     snapshot = {
-        "schema": 1, "directory_trust": directory_trust, "synthetic_prompt": PROMPT,
+        "schema": 2, "directory_trust": directory_trust, "synthetic_prompt": prompt,
         "pane_status": "unavailable", "pane_text": "",
         "boot_input_delivery": "cli_argument_consumption_unconfirmed",
         "wrapper_started": False, "deferred_prompt_hook_ran": False,
         "harness_registry_status": "unknown", "harness_exit_code": None,
         "harness_rollout_observed": False,
         "notify_requests": 0, "notify_last_status": None,
+        "transport_probe": probe, "host_health": host_health,
     }
     if counter is not None:
         with counter.lock:
@@ -147,16 +156,47 @@ def _status_line(diagnostics):
     )
 
 
-def _start_session():
+def _start_session(prompt=PROMPT):
     from sessions import start_session
     # Supported platform creation, including registry, bootstrap and runtime.
     # Prompt is explicit even though the fresh private grant store defaults to it.
     return start_session(
-        wolt=model.TEST_WOLT, harness="codex", prompt=PROMPT,
+        wolt=model.TEST_WOLT, harness="codex", prompt=prompt,
         execution_policy="prompt",
         routing={"adapter": "whatsapp", "chat_id": PARTICIPANT,
                  "whatsapp_account": ACCOUNT},
     )
+
+
+def _prepare_transport_probe(wolt_dir, endpoint):
+    config = wolt_dir / ".state" / "transport-probe-config.json"
+    transport.write_json(config, {
+        "endpoint": endpoint, "session": "", "notify": str(ROOT / "container/bin/notify"),
+        "net_namespace": transport.net_namespace(),
+    })
+    executable = wolt_dir / "startup-notify-probe"
+    executable.write_text(
+        f"#!{sys.executable}\nimport sys\nfrom pathlib import Path\n"
+        f"sys.path.insert(0, {str(ROOT)!r})\n"
+        "from scripts.startup_transport_probe import run\n"
+        "raise SystemExit(run(Path(__file__).parent / '.state/transport-probe-config.json'))\n",
+    )
+    executable.chmod(0o700)
+    return config
+
+
+def _read_probe(config):
+    path = config.with_name("transport-probe-result.json")
+    try:
+        import stat
+        info = path.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > 4096):
+            return None
+        data = json.loads(path.read_text())
+        return data if transport.valid_result(data) else None
+    except (OSError, ValueError, TypeError):
+        return None
 
 
 def _verify_record(session: str, wolts_dir: Path, env: dict,
@@ -214,6 +254,7 @@ def _directory_trust_environment(env: dict, run_root: Path, mode: str) -> None:
 def _run_startup_session(
     harness, inherited, auth_variable, auth_path, run_root, tmux_root, diagnostics,
     *, timeout_seconds=120, directory_trust="preserve", capture_snapshot=False,
+    probe_transport=False,
 ):
     """Real local server/session machinery; every outbound sender is mocked."""
     if harness != "codex" or not 1 <= timeout_seconds <= MAX_SECONDS:
@@ -239,6 +280,9 @@ def _run_startup_session(
     dispatch_done = threading.Event()
     gate = None
     counter = None
+    probe_config = probe_result = None
+    host_health = "not_checked"
+    prompt = PROBE_PROMPT if probe_transport else PROMPT
     fd = os.open(run_root / "runner.log", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     log = os.fdopen(fd, "w", encoding="utf-8", buffering=1)
     os.environ.clear()
@@ -303,11 +347,17 @@ def _run_startup_session(
             diagnostics.enter("server_health")
             model._wait_for_server(env["WOLTSPACE_API"], wolts_dir, thread, server_errors)
             diagnostics.passed("server_health")
+            if probe_transport:
+                probe_config = _prepare_transport_probe(wolts_dir / model.TEST_WOLT, env["WOLTSPACE_API"])
             diagnostics.enter("session_spawn")
             deadline = time.monotonic() + timeout_seconds
             try:
-                result = _start_session()
+                result = _start_session(prompt) if probe_transport else _start_session()
                 session = result.get("name", "") if isinstance(result, dict) else ""
+                if probe_config is not None:
+                    config = transport.read_config(probe_config)
+                    config["session"] = session
+                    transport.write_json(probe_config, config)
                 if not session or not _verify_record(session, wolts_dir, env, tmux_root):
                     diagnostics.fail("session_not_started")
                     raise RuntimeError("startup session could not be verified")
@@ -315,6 +365,15 @@ def _run_startup_session(
             finally:
                 dispatch_done.set()
             while time.monotonic() < deadline:
+                if probe_config is not None:
+                    probe_result = _read_probe(probe_config)
+                    if probe_result is not None:
+                        if host_health == "not_checked":
+                            host_health = transport.health(env["WOLTSPACE_API"])
+                        if probe_result["phase"] == "complete" and probe_result["notify"] != "sent":
+                            diagnostics.enter("notify")
+                            diagnostics.fail("local_transport_probe_failed")
+                            raise RuntimeError("local transport probe did not pass")
                 if server_errors:
                     diagnostics.enter("server_health")
                     diagnostics.fail("server_start_failed")
@@ -324,7 +383,8 @@ def _run_startup_session(
                     diagnostics.fail("notify_ambiguous" if gate.status == "ambiguous"
                                      else "notify_rejected")
                     raise RuntimeError("local mocked notification failed")
-                if model._confirmed_notify(gate, session, diagnostics):
+                if (model._confirmed_notify(gate, session, diagnostics)
+                        and (probe_config is None or probe_result is not None and probe_result["phase"] == "complete")):
                     model._say("Startup inspection received one verified local mocked notification.")
                     return 0
                 if not _observe_boot(session, env, diagnostics):
@@ -340,7 +400,12 @@ def _run_startup_session(
     finally:
         # Capture while the pane still exists, then write only sanitized data
         # after scoped cleanup. The snapshot never contains auth file contents.
-        snapshot = _capture_snapshot(session, wolts_dir, env, tmux_root, directory_trust, counter) if capture_snapshot else None
+        if probe_config is not None:
+            probe_result = _read_probe(probe_config)
+        snapshot = _capture_snapshot(
+            session, wolts_dir, env, tmux_root, directory_trust, counter,
+            prompt=prompt, probe=probe_result, host_health=host_health,
+        ) if capture_snapshot else None
         diagnostics.enter("cleanup")
         with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
             cleanup_ok = model._cleanup_resources(server, thread, listener, session, env, tmux_root)
@@ -374,6 +439,7 @@ def main():
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument("--directory-trust", choices=("preserve", "normal"), default="preserve")
     parser.add_argument("--capture-snapshot", action="store_true")
+    parser.add_argument("--probe-transport", action="store_true")
     args = parser.parse_args()
     if not args.run or not 1 <= args.timeout <= MAX_SECONDS:
         parser.error("--run and a timeout between 1 and 180 seconds are required")
@@ -385,6 +451,7 @@ def main():
             startup_runner=lambda *items: _run_startup_session(
                 *items, timeout_seconds=args.timeout, directory_trust=args.directory_trust,
                 capture_snapshot=args.capture_snapshot,
+                probe_transport=args.probe_transport,
             ),
         )
         if result:
