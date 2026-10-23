@@ -15,6 +15,7 @@ import io
 import json
 import os
 import secrets
+import shlex
 import shutil
 import socket
 import stat
@@ -37,6 +38,18 @@ import scripts.whatsapp_owner_test as owner_test
 TEST_WOLT = "wa-test"
 TIMEOUT_SECONDS = 300
 DISPATCH_WAIT_SECONDS = 45
+NOTIFY_APPROVAL_INSTRUCTION = (
+    "This isolated test uses the local notify API, whose access from the command sandbox "
+    "was previously confirmed blocked. Load the general notify skill (woltspace-notify for copy "
+    "delivery, woltspace:notify for plugin delivery). BEFORE the first "
+    "notify invocation, request normal one-time shell-tool approval using "
+    "sandbox_permissions=require_escalated with a justification explaining access to the "
+    "isolated local Woltspace API. Keep the exact participant route and nonce on literal stdin. "
+    "Wait for the current reviewer; feature authorization does not replace runtime approval. "
+    "Do not request a persistent prefix grant, change network/sandbox/reviewer settings, or "
+    "answer dialogs yourself. If approval is denied or unavailable, report that blocker and stop. "
+    "Never retry an ambiguous send. Send only the requested exact nonce, with no extra notification."
+)
 _PATHS = (ROOT, ROOT / "container", ROOT / "container" / "lib", ROOT / "src")
 _DIAGNOSTIC_STAGES = (
     "preflight", "server_health", "inbound_selection", "selection_reply",
@@ -338,6 +351,32 @@ def _handle_boot_symptom(diagnostics: RunDiagnostics, symptom: str) -> bool:
     return False
 
 
+def _observe_notify_approval(diagnostics: RunDiagnostics, symptom: str) -> bool:
+    """Keep pending approval observable; echoed instructions are not UI proof."""
+    if symptom not in {"tool_approval_prompt", "trust_or_approval", "waiting_for_input"}:
+        return False
+    diagnostics.set_boot_symptom(symptom)
+    diagnostics.set_harness_readiness(
+        "prompt_detected" if symptom == "tool_approval_prompt" else "unknown",
+    )
+    return True
+
+
+def _print_approval_notice(target, tmux_root, seconds, *, command="notify"):
+    if (not isinstance(target, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", target)
+            or command not in {"notify", "startup-notify-probe"}):
+        raise RuntimeError("invalid private test-session attach target")
+    socket = tmux_root / f"tmux-{os.getuid()}" / "default"
+    attach = shlex.join(["env", "-u", "TMUX", "tmux", "-S", str(socket),
+                         "attach-session", "-t", "=" + target])
+    _say("Approval needed: the synthetic task requests normal one-time command escalation; "
+         "prompt visibility is not yet confirmed. No approval will be answered automatically.")
+    _say("Attach only to this temporary test session: " + attach)
+    _say(f"Approve only the intended {command} command if shown; do not grant a permanent rule. "
+         f"Observation budget: {seconds}s. Detach with Ctrl-b then d; "
+         "Ctrl-C in the runner stops and cleans up.")
+
+
 def _harness_readiness_status(session: str, harness: str) -> str:
     """Report configured TUI readiness evidence, never process presence as readiness."""
     try:
@@ -552,6 +591,17 @@ def _preflight_harness(
                 and (skill_dir / "woltspace-notify" / "SKILL.md").is_file()):
             diagnostics.fail("bootstrap_missing")
             raise RuntimeError("Codex platform skills were not prepared for the test wolt")
+        for installed, source in (
+            (skill_dir / "woltspace-start-chat/modes/whatsapp.md",
+             ROOT / "container/skills/start-chat/modes/whatsapp.md"),
+            (skill_dir / "woltspace-notify/SKILL.md", ROOT / "container/skills/notify/SKILL.md"),
+        ):
+            # Copy delivery intentionally rewrites SKILL.md's frontmatter
+            # name to woltspace-notify; the instructional body must match.
+            if (not installed.is_file() or
+                    installed.read_text().split("---", 2)[-1] != source.read_text().split("---", 2)[-1]):
+                diagnostics.fail("bootstrap_missing")
+                raise RuntimeError("test skills do not match reviewed WhatsApp/notify guidance")
 
         binary = shutil.which(harness, path=env.get("PATH"))
         if not binary:
@@ -1039,6 +1089,7 @@ def _run_model_session(
     account = hashlib.sha256(secret["value"].encode()).hexdigest()[:20]
     session_name = ""
     adapter = None
+    original_start = None
     server = None
     server_thread = None
     server_errors: list[str] = []
@@ -1097,6 +1148,12 @@ def _run_model_session(
             adapter.ROUTES = adapter.STATE / f"routes-{account}.json"
             adapter.LOCK = adapter.STATE / f"poll-{account}.lock"
             adapter.api = _track_adapter_replies(adapter.api, diagnostics)
+            original_start = adapter.start_claude_session
+
+            def approval_start(prompt, **kwargs):
+                return original_start(prompt + "\n" + NOTIFY_APPROVAL_INSTRUCTION, **kwargs)
+
+            adapter.start_claude_session = approval_start
             activation = int(time.time())
             state = {"offset": 0, "activation": activation, "processed": []}
             adapter.atomic_json(adapter.CURSOR, state)
@@ -1193,6 +1250,8 @@ def _run_model_session(
             _say("The test sends no automatic retry after an ambiguous outbound timeout.")
             diagnostics.enter("inbound_selection")
             deadline = time.monotonic() + TIMEOUT_SECONDS
+            approval_started = False
+            next_notice = float("inf")
             delivered = False
             while time.monotonic() < deadline:
                 state = adapter.poll_once(
@@ -1220,6 +1279,8 @@ def _run_model_session(
                         diagnostics.enter("session_spawn")
                         record = _record_for_test(session_name, wolts_dir)
                         if (not record or record.get("adapter") != "whatsapp"
+                                or record.get("wolt") != TEST_WOLT or record.get("harness") != harness
+                                or (record.get("execution_policy") or {}).get("mode") != "prompt"
                                 or not isinstance(record.get("runtime"), dict)
                                 or not record.get("runtime")):
                             diagnostics.fail("session_not_started")
@@ -1234,6 +1295,17 @@ def _run_model_session(
                         _verify_private_tmux(env, tmux_root, session_name)
                         verified_session = session_name
                         diagnostics.passed("session_spawn")
+                        # Give the owner a full budget only once the exact
+                        # private runtime/route is verified for attachment.
+                        # This is not a claim of model readiness.
+                        if not approval_started:
+                            deadline = time.monotonic() + TIMEOUT_SECONDS
+                            approval_started = True
+                            next_notice = time.monotonic() + 15
+                            _print_approval_notice(
+                                record["runtime"].get("tmux_session_name", ""),
+                                tmux_root, TIMEOUT_SECONDS,
+                            )
                     if diagnostics.checks["harness_boot"] != "passed":
                         diagnostics.enter("harness_boot")
                         process_status = _harness_process_status(session_name, harness)
@@ -1241,13 +1313,14 @@ def _run_model_session(
                             "present" if process_status is True else
                             "absent" if process_status is False else "unknown",
                         )
-                        symptom = _capture_boot_symptom(env, session_name)
-                        if _handle_boot_symptom(diagnostics, symptom):
-                            raise RuntimeError("the isolated harness has an actionable boot prompt")
-                        readiness = _harness_readiness_status(session_name, harness)
-                        diagnostics.set_harness_readiness(readiness)
-                        if readiness == "ready_marker_seen":
-                            diagnostics.passed("harness_boot")
+                        symptom = _capture_boot_symptom(env, session_name, visible_only=True)
+                        if not _observe_notify_approval(diagnostics, symptom):
+                            if _handle_boot_symptom(diagnostics, symptom):
+                                raise RuntimeError("the isolated harness has an actionable boot prompt")
+                            readiness = _harness_readiness_status(session_name, harness)
+                            diagnostics.set_harness_readiness(readiness)
+                            if readiness == "ready_marker_seen":
+                                diagnostics.passed("harness_boot")
                     else:
                         process_status = _harness_process_status(session_name, harness)
                         diagnostics.set_harness_process(
@@ -1266,6 +1339,10 @@ def _run_model_session(
                     diagnostics.enter("server_health")
                     diagnostics.fail("server_start_failed")
                     raise RuntimeError("the isolated local server stopped unexpectedly")
+                if approval_started and send_gate.status == "ready" and time.monotonic() >= next_notice:
+                    _say("Approval-needed task still pending; no notify attempt observed. "
+                         f"Remaining observation budget: {max(0, int(deadline-time.monotonic()))}s.")
+                    next_notice = time.monotonic() + 15
             if not delivered:
                 if not phase["selected"]:
                     diagnostics.enter("inbound_selection")
@@ -1279,7 +1356,12 @@ def _run_model_session(
                     diagnostics.fail("harness_boot_unconfirmed")
                 else:
                     diagnostics.enter("notify")
-                    diagnostics.fail("run_timeout")
+                    if approval_started and send_gate.status == "ready":
+                        _say("Approval-needed task did not complete before the observation deadline; "
+                             "no notify attempt observed. This does not prove approval was denied. Cleaning up.")
+                        diagnostics.fail("approval_not_completed")
+                    else:
+                        diagnostics.fail("run_timeout")
                 raise TimeoutError("timed out waiting for the model reply")
             _say("Verified one real model session, account-bound registry route, and nonce reply.")
             diagnostics.enter("notify")
@@ -1299,6 +1381,8 @@ def _run_model_session(
             diagnostics.category = "cleanup_failed"
         if adapter is not None:
             adapter.TOKEN = ""
+            if original_start is not None:
+                adapter.start_claude_session = original_start
         secret["value"] = ""
         os.environ.clear()
         os.environ.update(old_env)

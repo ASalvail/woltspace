@@ -8,7 +8,6 @@ import contextlib
 import json
 import os
 import re
-import shlex
 import sys
 import threading
 import time
@@ -235,13 +234,7 @@ def _observe_boot(session: str, env: dict, diagnostics, *, allow_tool_approval=F
     )
     diagnostics.enter("harness_boot")
     symptom = model._capture_boot_symptom(env, session, visible_only=True)
-    if allow_tool_approval and symptom in {"tool_approval_prompt", "trust_or_approval", "waiting_for_input"}:
-        diagnostics.set_boot_symptom(symptom)
-        # Broad wording can be our echoed task, not an interactive UI. Keep
-        # observing without treating it as readiness or answering anything.
-        diagnostics.set_harness_readiness(
-            "prompt_detected" if symptom == "tool_approval_prompt" else "unknown",
-        )
+    if allow_tool_approval and model._observe_notify_approval(diagnostics, symptom):
         return True  # Human may answer a real tool request; runner never does.
     if model._handle_boot_symptom(diagnostics, symptom):
         return False
@@ -257,17 +250,7 @@ def _approval_notice(session, wolts_dir, env, tmux_root, seconds):
         raise RuntimeError("refusing unverified test-session attach instructions")
     record = model._record_for_test(session, wolts_dir)
     target = record["runtime"].get("tmux_session_name", "")
-    if not isinstance(target, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", target):
-        raise RuntimeError("invalid private test-session target")
-    socket = tmux_root / f"tmux-{os.getuid()}" / "default"
-    command = shlex.join(["env", "-u", "TMUX", "tmux", "-S", str(socket),
-                          "attach-session", "-t", "=" + target])
-    model._say("Approval needed: the synthetic task requests normal one-time command escalation; "
-               "prompt visibility is not yet confirmed. No approval will be answered automatically.")
-    model._say("Attach only to this temporary test session: " + command)
-    model._say(f"Approve only the intended startup-notify-probe command if shown; "
-               f"do not grant a permanent rule. Observation budget: {seconds}s. "
-               "Detach with Ctrl-b then d; Ctrl-C in the runner stops and cleans up.")
+    model._print_approval_notice(target, tmux_root, seconds, command="startup-notify-probe")
 
 
 def _directory_trust_environment(env: dict, run_root: Path, mode: str) -> None:

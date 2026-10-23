@@ -1,0 +1,163 @@
+"""Offline full real-test orchestration: synthetic inbound/spawn/provider only."""
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.parametrize("scenario", ["sent", "approval_pending", "ambiguous"])
+def test_real_runner_approval_flow_without_credentials_or_model(tmp_path, scenario):
+    code = r'''
+import asyncio, json, os, re, subprocess, sys, tempfile, threading, time, types
+from pathlib import Path
+from scripts import whatsapp_model_session_test as m
+base, scenario = Path(sys.argv[1]), sys.argv[2]
+private = base / "private"
+private.mkdir(mode=0o700)
+auth = base / "synthetic-auth"
+auth.mkdir(mode=0o700)
+m.owner_test.PRIVATE = private
+m.owner_test._check_private_dir = lambda: None
+m.owner_test._read_token = lambda: "synthetic-only-key"
+m._auth_path = lambda *_: ("CODEX_HOME", auth)
+def preflight(*args):
+    Path(args[1]["CODEX_HOME"]).mkdir(mode=0o700)
+    args[-1].passed("preflight")
+m._preflight_harness = preflight
+m._verify_private_tmux = lambda *_: None
+m._harness_process_status = lambda *_: True
+m._harness_readiness_status = lambda *_: "unsupported"
+m._capture_boot_symptom = lambda *_, **__: m._classify_boot_symptom(m.NOTIFY_APPROVAL_INSTRUCTION)
+real_cleanup = m._cleanup_resources
+m._cleanup_resources = lambda *args: real_cleanup(
+    *args, stop_session_fn=lambda _: {"status": "stopped"}, kill_tmux_fn=lambda *_: True)
+m.TIMEOUT_SECONDS = 1
+cli_threads, cli_results, sends, starts = [], [], [], []
+real_wrap = m._wrap_notify_send
+async def provider_send(*args, **kwargs):
+    sends.append(1)
+    if scenario == "ambiguous":
+        raise TimeoutError("synthetic-private-provider-error")
+    return {"ok": True}
+m._wrap_notify_send = lambda original, gate: real_wrap(provider_send, gate)
+adapter = types.ModuleType("bot.whatsapp_adapter")
+def load(path):
+    return json.loads(path.read_text()) if path.exists() else {}
+adapter.load = load
+adapter.atomic_json = lambda path, data: path.write_text(json.dumps(data))
+adapter.api = lambda *_: (200, {"messages": [{"id": "synthetic-control"}]})
+def start(prompt, **kwargs):
+    starts.append(1)
+    assert prompt.endswith(m.NOTIFY_APPROVAL_INSTRUCTION)
+    assert "WHATSAPP_AGENT_TOKEN" not in os.environ
+    assert kwargs["routing"]["whatsapp_account"] == adapter.ACCOUNT
+    nonce = re.search(r"wa-model-check-[0-9a-f]+", prompt).group()
+    from sessions import SessionRegistry
+    registry = SessionRegistry()
+    record = registry.create(
+        "wa-test-offline-model", wolt="wa-test", harness="codex", creature="otter",
+        dir=str(Path(os.environ["WOLTS_DIR"]) / "wa-test"),
+        adapter="whatsapp", chat_id="user:4242424242", whatsapp_account=adapter.ACCOUNT,
+        execution_policy={"mode": "prompt", "isolation": "host"})
+    registry.update(record["name"], wolt="wa-test", runtime={
+        "kind": "tmux", "tmux_session_name": "synthetic-model", "pane_id": "%1"})
+    if scenario != "approval_pending":
+        def cli():
+            # Arrives after initial selection budget would have expired, but
+            # within the new full budget from verified attach readiness.
+            time.sleep(0.6)
+            env = dict(os.environ)
+            env["WOLTSPACE_WOLT_SESSION"] = record["name"]
+            from session_runtime import _session_env_value
+            env["PATH"] = _session_env_value("PATH", env["PATH"])
+            result = subprocess.run(
+                [str(m.ROOT / "container/bin/notify"), "--whatsapp", "user:4242424242"],
+                input=nonce, env=env, text=True, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, timeout=10)
+            cli_results.append(result.returncode)
+        thread = threading.Thread(target=cli)
+        thread.start()
+        cli_threads.append(thread)
+    return {"name": record["name"], "url": "http://synthetic.invalid/session"}
+adapter.start_claude_session = start
+def handle(item, routes, activation):
+    participant, body = item["from"], item["text"]["body"]
+    if body == "wolt wa-test":
+        routes[participant] = {"wolt": "wa-test"}
+        adapter.api("POST", "/messages", {"text": {"body": "Selected wa-test. Send a message."}})
+    else:
+        record = adapter.start_claude_session(body, wolt="wa-test", routing={
+            "adapter": "whatsapp", "chat_id": participant, "whatsapp_account": adapter.ACCOUNT})
+        routes[participant]["session"] = record["name"]
+        adapter.api("POST", "/messages", {"text": {"body": "Session started: synthetic"}})
+    adapter.atomic_json(adapter.ROUTES, routes)
+adapter.handle = handle
+challenge = []
+real_say = m._say
+def say(text):
+    if text.startswith("Then send exactly: `"):
+        challenge.append(text[len("Then send exactly: `"):-1])
+    real_say(text)
+m._say = say
+def poll(state, routes, activation, *, cursor_path, dispatch):
+    step = state.get("step", 0)
+    if step < 2:
+        if step == 0:
+            time.sleep(0.7)  # Consume selection time before session exists.
+        dispatch({"from": "user:4242424242", "text": {"body":
+                  "wolt wa-test" if step == 0 else challenge[0]}}, routes, activation)
+        state["step"] = step + 1
+    else:
+        time.sleep(0.02)
+    return state
+adapter.poll_once = poll
+sys.modules["bot.whatsapp_adapter"] = adapter
+diag = m.RunDiagnostics("codex")
+with tempfile.TemporaryDirectory(prefix=".wma-offline-", dir=m.ROOT.parents[2]) as sockets:
+    m.PRIVATE_TMUX_BASE = Path(sockets)
+    try:
+        result = m._run_model_test("codex", diag)
+    except Exception:
+        result = 2
+    for thread in cli_threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+record = diag.as_record()
+assert m._valid_diagnostic_record(record)
+assert starts == [1]
+assert record["checks"]["cleanup"] == "passed"
+assert adapter.start_claude_session is start and adapter.TOKEN == ""
+if scenario == "sent":
+    assert result == 0 and sends == [1] and cli_results == [0]
+    assert record["notify_attempt"] == "sent" and record["checks"]["notify"] == "passed"
+    assert not list(private.glob("model-*"))
+else:
+    assert result == 2 and record["checks"]["notify"] != "passed"
+    assert record["category"] == ("approval_not_completed" if scenario == "approval_pending" else "notify_ambiguous")
+    assert sends == ([] if scenario == "approval_pending" else [1])
+    if scenario == "approval_pending":
+        assert record["harness_readiness"] == "unknown" and cli_results == []
+    files = list(private.glob("model-*/failure.json"))
+    assert len(files) == 1 and m._valid_diagnostic_record(json.loads(files[0].read_text()))
+    assert {p.name for p in files[0].parent.iterdir()} == {"failure.json"}
+assert "WHATSAPP_AGENT_TOKEN" not in os.environ
+print("offline_model_approval_ok")
+'''
+    env = dict(os.environ)
+    env.pop("WHATSAPP_AGENT_TOKEN", None)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    result = subprocess.run([sys.executable, "-c", code, str(tmp_path), scenario],
+                            cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, timeout=35)
+    assert result.returncode == 0, result.stderr
+    assert "offline_model_approval_ok" in result.stdout
+    assert "Approval needed:" in result.stdout
+    assert "attach-session -t =synthetic-model" in result.stdout
+    assert "Approve only the intended notify command" in result.stdout
+    assert "synthetic-private-provider-error" not in result.stdout + result.stderr
+    if scenario == "approval_pending":
+        assert "This does not prove approval was denied. Cleaning up." in result.stdout

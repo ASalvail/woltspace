@@ -196,6 +196,12 @@ def test_codex_preflight_checks_real_bootstrap_files_and_offline_cli(
     assert all("CODEX_HOME" not in call[1]["env"] for call in calls)
     assert (wolt / ".agents" / "skills" / "woltspace-start-chat" / "SKILL.md").is_file()
     assert (wolt / ".agents" / "skills" / "woltspace-notify" / "SKILL.md").is_file()
+    mode = wolt / ".agents/skills/woltspace-start-chat/modes/whatsapp.md"
+    assert mode.read_bytes() == (ROOT / "container/skills/start-chat/modes/whatsapp.md").read_bytes()
+    assert "load the `woltspace-notify` skill" in mode.read_text()
+    delivered_notify = wolt / ".agents/skills/woltspace-notify/SKILL.md"
+    assert delivered_notify.read_text().split("---", 2)[-1] == (ROOT / "container/skills/notify/SKILL.md").read_text().split("---", 2)[-1]
+    assert 'sandbox_permissions="require_escalated"' in delivered_notify.read_text()
     assert Path(env["CODEX_HOME"]).is_relative_to(run)
     assert (Path(env["CODEX_HOME"]) / "auth.json").is_symlink()
     assert (Path(env["CODEX_HOME"]) / "auth.json").resolve() == (auth / "auth.json").resolve()

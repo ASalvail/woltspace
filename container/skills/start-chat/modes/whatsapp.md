@@ -6,6 +6,14 @@ and send them with the explicit participant route shown in the incoming message.
 
 ## Replies
 
+Before the first reply, load the `woltspace-notify` skill (or `woltspace:notify`
+with plugin delivery, as listed in your available skills) and read its
+"Local API access and normal approval" guidance. Notify reaches the local
+Woltspace API; the lodge handles WhatsApp delivery. Request normal one-time
+shell-tool approval if sandbox networking blocks that local API, preserving
+the route and literal stdin. Do not change network/reviewer policy or answer
+approval dialogs automatically; never blindly retry an ambiguous send.
+
 Use the exact `user:<digits>` participant identifier from the incoming
 WhatsApp message:
 

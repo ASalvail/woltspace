@@ -1,8 +1,11 @@
 # Isolated WhatsApp model-session test plan
 
-**Status: implementation ready for review; not launched.** The separate
+**Status: final approval-aware adjustment prepared for review; no final live
+retry launched.** Owner-observed transport/registry stages and the local
+approval-aware mocked-notify diagnostic passed. Full WhatsApp/model reply
+success remains unproven. The separate
 runner is `scripts/whatsapp_model_session_test.py`; it requires an explicit
-`--run`, a selected `--harness` (`claude` or `codex`), a real TTY, and typed
+`--run`, the owner-selected `--harness codex`, a real TTY, and typed
 confirmation. Do not launch it until Survey reviews that implementation.
 Stage one and stage two in
 `whatsapp-owner-test.md` do not create a real agent session. This plan covers a
@@ -227,6 +230,36 @@ harness and its existing authorized login:
 The command refuses non-interactive input and asks for the exact word `MODEL`
 before reading the private WhatsApp key. It prompts for two WhatsApp messages:
 the exact wolt selection and a generated nonce challenge.
+Have a second terminal ready. After the session's account-bound route and
+private runtime have been verified, the runner prints an exact scoped tmux
+attach command, `Approval needed`, and a fresh 300-second observation budget.
+Use only this newly printed attach command; previous temporary sessions are
+gone. If the normal reviewer shows the intended `notify` command request,
+the owner may approve it **once**, without a persistent rule. Do not answer
+unrelated prompts. Feature authorization does not replace runtime approval.
+Escalation applies to the command and children, not an exact destination port.
+The runner never answers dialogs or changes network, reviewer or sandbox
+configuration. Detach with Ctrl-b then d; Ctrl-C in the runner triggers scoped
+cleanup. There is no automatic retry after an ambiguous send.
+
+The selection/challenge phase retains its own 300-second limit. Time spent
+waiting for those messages does not consume the subsequent owner approval
+budget: it starts once the exact private session is verified for attachment.
+This is **runtime attachment readiness**, not evidence of model readiness.
+Codex's separate readiness field remains unsupported/unknown without a marker.
+While no notify attempt is observed, the runner repeats a pending status at
+the next polling iteration after 15 seconds (a provider long poll can delay
+that observation). If its budget expires, it visibly reports
+`approval_not_completed`, not a claim of approval denial, and cleans up.
+
+The real adapter still creates the session through the normal supported path.
+Only this test's start callback appends the fixed normal-approval instruction
+to the model prompt, without changing the owner's exact challenge or the
+one-nonce outbound gate. Separately, the source WhatsApp start-chat mode now
+explicitly loads `woltspace-notify` before the first reply. Before key access,
+preflight verifies the delivered WhatsApp mode and notify instructional body
+match this checkout (delivery intentionally renames skill frontmatter). Thus
+the general local-API guidance is also present in actual WhatsApp bootstrap.
 The selected harness must already have an authorized `CODEX_HOME` (or
 `~/.codex`) directory. Before reading the WhatsApp key or polling, the runner
 checks that the Codex executable and `wcodex`, `run-session.sh`, `session-reg`
@@ -267,8 +300,12 @@ running Codex process alone does not mark `harness_boot` passed.
 The runner classifies captured boot symptoms in memory as `auth_or_config`,
 `bootstrap_missing`, `trust_or_approval`, `waiting_for_input`, or
 `none_detected`; capture failure is `capture_unavailable`. Source text is
-never printed or stored. Trust/approval and explicit interactive prompts stop
-the run with fixed categories instead of waiting through the full timeout.
+never printed or stored. Concrete directory-trust/onboarding or auth/bootstrap
+symptoms stop the run. Tool approval may wait for the owner; broad approval or
+input-wait text stays observable with readiness unknown because it can be
+echoed instructions. The runner does not interpret that text as a real dialog
+or answer it. A missing notify attempt at the deadline is inconclusive about
+whether approval was displayed or denied.
 After verified cleanup, the private run directory retains
 only the mode-`0600` `failure.json`. If cleanup cannot be verified, it retains
 `.cleanup-required` and private cleanup state, removes `runner.log`, and writes
@@ -301,7 +338,10 @@ before network I/O and all later notify attempts are rejected.
 3. Verify the isolated session registry records the WhatsApp participant and
    account fingerprint; verify the new tmux process has no
    `WHATSAPP_AGENT_TOKEN`; verify the adapter's selection confirmation and
-   one nonce reply sent through the real `server.notify` route.
+   one nonce reply sent through the real `server.notify` route. Use the newly
+   printed private attach command and complete the normal one-time runtime
+   approval if the current reviewer prompts. No additional WhatsApp message
+   is requested while waiting for that approval.
 4. Stop the exact test session, private tmux server, isolated API server, and
    poller. Remove the temporary data root and logs. Keep the credential file
    only until the owner runs the documented cleanup command. If cleanup cannot
