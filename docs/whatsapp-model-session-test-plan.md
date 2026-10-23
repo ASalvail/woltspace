@@ -146,8 +146,11 @@ normal scoped cleanup.
 
 The task begins with approval-needed status, not proof that a dialog is
 already visible. A concrete tool-approval symptom can remain waiting, while
-directory-trust/onboarding and ambiguous prompt symptoms keep their previous
-failure behavior. The runner repeats a fixed pending status every 15 seconds
+directory-trust/onboarding prompts keep their previous failure behavior.
+In this opt-in mode broad trust/approval or input-wait wording stays observable
+with readiness `unknown`: it can be the echoed synthetic instructions, and
+neither establishes a displayed dialog nor terminates the run. Outside this
+mode, existing symptom handling is unchanged. The runner repeats a fixed pending status every 15 seconds
 until a helper result appears and announces the bounded observation deadline.
 If no helper result is observed by that deadline, it explicitly reports
 `approval_not_completed`, then cleans up. This does not prove approval was

@@ -235,10 +235,14 @@ def _observe_boot(session: str, env: dict, diagnostics, *, allow_tool_approval=F
     )
     diagnostics.enter("harness_boot")
     symptom = model._capture_boot_symptom(env, session, visible_only=True)
-    if allow_tool_approval and symptom == "tool_approval_prompt":
+    if allow_tool_approval and symptom in {"tool_approval_prompt", "trust_or_approval", "waiting_for_input"}:
         diagnostics.set_boot_symptom(symptom)
-        diagnostics.set_harness_readiness("prompt_detected")
-        return True  # Human may answer the normal tool request; runner never does.
+        # Broad wording can be our echoed task, not an interactive UI. Keep
+        # observing without treating it as readiness or answering anything.
+        diagnostics.set_harness_readiness(
+            "prompt_detected" if symptom == "tool_approval_prompt" else "unknown",
+        )
+        return True  # Human may answer a real tool request; runner never does.
     if model._handle_boot_symptom(diagnostics, symptom):
         return False
     readiness = model._harness_readiness_status(session, "codex")

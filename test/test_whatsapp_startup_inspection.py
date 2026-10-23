@@ -48,15 +48,36 @@ def test_approval_prompt_preserves_one_attempt_and_normal_policy():
 
 @pytest.mark.parametrize("symptom,expected", [
     ("tool_approval_prompt", True), ("directory_trust_prompt", False),
-    ("onboarding_prompt", False), ("trust_or_approval", False),
+    ("onboarding_prompt", False), ("trust_or_approval", True),
+    ("waiting_for_input", True), ("auth_or_config", False), ("bootstrap_missing", False),
 ])
-def test_only_specific_tool_approval_can_wait(monkeypatch, symptom, expected):
+def test_approval_observer_waits_without_mistaking_broad_text_for_ui(monkeypatch, symptom, expected):
     from scripts import whatsapp_startup_inspection as startup
     monkeypatch.setattr(startup.model, "_harness_process_status", lambda *_: True)
     monkeypatch.setattr(startup.model, "_capture_boot_symptom", lambda *_, **__: symptom)
     diagnostics = startup.model.RunDiagnostics("codex")
     assert startup._observe_boot("synthetic", {}, diagnostics, allow_tool_approval=True) is expected
     assert bool(diagnostics.category) is not expected
+    if symptom in {"trust_or_approval", "waiting_for_input"}:
+        assert diagnostics.as_record()["harness_readiness"] == "unknown"
+        baseline = startup.model.RunDiagnostics("codex")
+        assert not startup._observe_boot("synthetic", {}, baseline)
+        assert baseline.category
+
+
+@pytest.mark.parametrize("suffix", ["", "\n• Starting MCP servers (1/2): codex_apps (0s • esc to interrupt)\n› Ask Codex to do anything"])
+def test_exact_echoed_approval_instructions_are_not_a_displayed_prompt(monkeypatch, suffix):
+    from scripts import whatsapp_startup_inspection as startup
+    text = startup.APPROVAL_PROBE_PROMPT + suffix
+    symptom = startup.model._classify_boot_symptom(text)
+    assert symptom == "trust_or_approval"  # Reproduce the owner-run false positive.
+    monkeypatch.setattr(startup.model, "_harness_process_status", lambda *_: True)
+    monkeypatch.setattr(startup.model, "_capture_boot_symptom", lambda *_, **__: symptom)
+    diagnostics = startup.model.RunDiagnostics("codex")
+    assert startup._observe_boot("synthetic", {}, diagnostics, allow_tool_approval=True)
+    record = diagnostics.as_record()
+    assert record["harness_readiness"] == "unknown" and not diagnostics.category
+    assert record["checks"]["harness_boot"] != "passed"
 
 
 def test_approval_attach_notice_refuses_unverified_target(monkeypatch, tmp_path):
@@ -232,7 +253,7 @@ def test_snapshot_targets_only_verified_exact_pane(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("scenario", [
-    "success", "normal_success", "snapshot_success", "snapshot_timeout", "wrong_payload", "timeout", "trust_prompt", "spawn_failure", "cleanup_failure", "probe_success", "probe_api_missing", "probe_approval_success", "probe_approval_timeout",
+    "success", "normal_success", "snapshot_success", "snapshot_timeout", "wrong_payload", "timeout", "trust_prompt", "spawn_failure", "cleanup_failure", "probe_success", "probe_api_missing", "probe_approval_success", "probe_approval_timeout", "probe_approval_echo_timeout",
 ])
 def test_full_offline_startup_orchestration(tmp_path, scenario):
     # Fresh interpreter ensures real server/session imports bind to only the
@@ -261,7 +282,14 @@ model.owner_test._read_token = key_forbidden
 model._verify_private_tmux = lambda *_: None
 model._harness_process_status = lambda *_: True
 model._harness_readiness_status = lambda *_: "unsupported"
-model._capture_boot_symptom = lambda *_, **__: "tool_approval_prompt" if scenario.startswith("probe_approval_") else "trust_or_approval" if scenario == "trust_prompt" else "none_detected"
+def boot_symptom(*_, **__):
+    if scenario == "probe_approval_echo_timeout":
+        return model._classify_boot_symptom(startup.APPROVAL_PROBE_PROMPT +
+            "\n• Starting MCP servers (1/2): codex_apps (0s • esc to interrupt)\n› Ask Codex to do anything")
+    if scenario.startswith("probe_approval_"):
+        return "tool_approval_prompt"
+    return "trust_or_approval" if scenario == "trust_prompt" else "none_detected"
+model._capture_boot_symptom = boot_symptom
 model._tmux_value = lambda env, *args: (0, "%1", "") if args[0] == "list-panes" else (
     0, "Synthetic model UI is waiting\nAPI_KEY=private-snapshot-value", "")
 real_cleanup = model._cleanup_resources
@@ -290,7 +318,7 @@ def fake_start(prompt=None):
     registry.update(record["name"], wolt="wa-test", runtime={
         "kind": "tmux", "tmux_session_name": "synthetic", "pane_id": "%1",
     })
-    if scenario not in {"timeout", "snapshot_timeout", "trust_prompt", "probe_approval_timeout"}:
+    if scenario not in {"timeout", "snapshot_timeout", "trust_prompt", "probe_approval_timeout", "probe_approval_echo_timeout"}:
         def cli():
             env = dict(os.environ)
             env["WOLTSPACE_WOLT_SESSION"] = record["name"]
@@ -317,7 +345,7 @@ with tempfile.TemporaryDirectory(prefix=".wsi-offline-", dir=startup.ROOT.parent
     model.PRIVATE_TMUX_BASE = Path(sockets)
     try:
         result = model._run_model_test("codex", diag, startup_runner=lambda *args:
-            startup._run_startup_session(*args, timeout_seconds=1 if scenario in {"timeout", "snapshot_timeout", "probe_approval_timeout"} else 5,
+            startup._run_startup_session(*args, timeout_seconds=1 if scenario in {"timeout", "snapshot_timeout", "probe_approval_timeout", "probe_approval_echo_timeout"} else 5,
                 directory_trust="normal" if scenario == "normal_success" or scenario.startswith("probe_") else "preserve",
                 capture_snapshot=scenario.startswith(("snapshot_", "probe_")),
                 probe_transport=scenario.startswith("probe_"),
@@ -351,6 +379,7 @@ else:
         "spawn_failure": "session_not_started",
         "probe_api_missing": "local_transport_probe_failed",
         "probe_approval_timeout": "approval_not_completed",
+        "probe_approval_echo_timeout": "approval_not_completed",
     }[scenario]
     assert record["checks"]["notify"] != "passed"
     assert record["notify_attempt"] == ("rejected" if scenario == "wrong_payload" else "not_seen")
@@ -375,10 +404,12 @@ if scenario.startswith(("snapshot_", "probe_")):
     assert not list(snapshots[0].parent.rglob("*.log"))
     assert {p.name for p in snapshots[0].parent.iterdir()} == (
         {"startup-snapshot.json"} if scenario in {"snapshot_success", "probe_success", "probe_approval_success"} else {"startup-snapshot.json", "failure.json"})
-    if scenario == "probe_approval_timeout":
+    if scenario in {"probe_approval_timeout", "probe_approval_echo_timeout"}:
         assert snapshot["host_health"] == "not_checked"
         assert snapshot["transport_probe"] is None
-        assert record["boot_symptom"] == "tool_approval_prompt"
+        assert record["boot_symptom"] == ("trust_or_approval" if scenario == "probe_approval_echo_timeout" else "tool_approval_prompt")
+        if scenario == "probe_approval_echo_timeout":
+            assert record["harness_readiness"] == "unknown"
         assert cli_results == []
     elif scenario.startswith("probe_"):
         assert snapshot["host_health"] == "ok"
@@ -404,5 +435,5 @@ print("offline_startup_ok")
         assert "Attach only to this temporary test session: env -u TMUX tmux -S " in result.stdout
         assert "attach-session -t =synthetic" in result.stdout
         assert "Observation budget:" in result.stdout
-    if scenario == "probe_approval_timeout":
+    if scenario in {"probe_approval_timeout", "probe_approval_echo_timeout"}:
         assert "This does not prove approval was denied. Cleaning up." in result.stdout
