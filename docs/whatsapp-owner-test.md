@@ -119,10 +119,18 @@ the cause of an earlier generic selection-reply failure. Do not replay a nonce
 or retry a potentially delivered message without review.
 
 Cleanup records independent API-server, listener, session, tmux and finalization
-outcomes. An absent tmux socket is treated as stopped only after validating the
-exact private owned 0700 base/run/socket-parent directories and `lstat` absence.
-Permission, foreign ownership, symlink or unverified states fail closed and
-retain evidence. Report the fixed failure line; never dump private raw logs or
+outcomes. A validated absent socket counts as `tmux=not_needed` only when the
+runner positively knows no session-start dispatch was requested. The start flag
+is set before dispatch, including calls that throw or have ambiguous outcomes;
+default/unknown is not never-started. For a started/unknown runtime, a missing
+socket might have been unlinked while the server lives, so cleanup fails closed.
+
+The runner kills only the exact verified private server before registry stop/
+stamp; `tmux=passed` retains successful server-kill plus disappearance/stop
+confirmation. A registry `stopped` result alone is insufficient. The existing
+finalizer preserves the root whenever aggregate cleanup fails. Exact private
+owned 0700 base/run/socket-parent directories and node ownership/type are checked.
+Permission, foreign ownership, symlink or unverified states retain evidence. Report the fixed failure line; never dump private raw logs or
 auth/key files. Diagnostic changes alone are not a fix for an unknown provider
 failure and do not authorize another live attempt.
 

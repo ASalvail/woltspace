@@ -336,7 +336,9 @@ model._capture_boot_symptom = boot_symptom
 model._tmux_value = lambda env, *args: (0, "%1", "") if args[0] == "list-panes" else (
     0, "Synthetic model UI is waiting\nAPI_KEY=private-snapshot-value", "")
 real_cleanup = model._cleanup_resources
+cleanup_requests = []
 def cleanup(*args):
+    cleanup_requests.append(args[-1])
     return real_cleanup(*args, stop_session_fn=lambda _: {"status": "stopped"},
                         kill_tmux_fn=lambda *_: scenario != "cleanup_failure")
 model._cleanup_resources = cleanup
@@ -415,6 +417,7 @@ with tempfile.TemporaryDirectory(prefix=".wsi-offline-", dir=startup.ROOT.parent
         thread.join(timeout=10)
         assert not thread.is_alive()
 record = diag.as_record()
+assert cleanup_requests == [True]  # Including spawn_failure before a returned ID.
 assert model._valid_diagnostic_record(record)
 assert "bot.whatsapp_adapter" not in sys.modules
 if scenario in {"success", "normal_success", "snapshot_success", "probe_success", "probe_approval_success", "owner_tool_success"}:

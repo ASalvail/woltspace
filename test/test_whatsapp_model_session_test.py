@@ -244,6 +244,8 @@ def test_codex_preflight_executable_failure_is_allowlisted(tmp_path, monkeypatch
 def test_real_session_prepare_uses_seeded_codex_skills_and_test_auth_home(tmp_path, monkeypatch):
     import sessions
     import harnesses
+    assert Path(sessions.__file__).resolve() == ROOT / "container/lib/sessions.py"
+    assert Path(harnesses.__file__).resolve() == ROOT / "container/lib/harnesses.py"
 
     if not model_test.shutil.which("codex"):
         pytest.skip("Codex CLI is not installed")
@@ -854,14 +856,17 @@ def test_private_tmux_cleanup_only_accepts_confirmed_absence(short_cleanup_base,
     root = model_test._prepare_private_tmux_dir(run, tmp_path)
     env = {"WOLTSPACE_TMUX_BIN": "tmux", "TMUX_TMPDIR": str(root)}
     monkeypatch.setattr(model_test, "_tmux_value", lambda *_: (_ for _ in ()).throw(AssertionError("no command needed")))
-    assert model_test._kill_private_tmux(env, root)
+    assert not model_test._kill_private_tmux(env, root)  # Unknown is not never-started.
+    assert model_test._kill_private_tmux(env, root, never_started=True)
     path = root / f"tmux-{os.getuid()}" / "default"
     sock = socket.socket(socket.AF_UNIX)
     sock.bind(str(path))
     try:
         monkeypatch.setattr(model_test, "_tmux_value", lambda *_: (1, "", "no server running"))
-        assert model_test._kill_private_tmux(env, root)
+        assert not model_test._kill_private_tmux(env, root)
+        assert path.exists()  # No positive stop evidence, leave it untouched.
         sock.close()
+        path.unlink()
         sock = socket.socket(socket.AF_UNIX)
         sock.bind(str(path))
         monkeypatch.setattr(model_test, "_tmux_value", lambda *_: (1, "", "permission denied"))
@@ -1099,3 +1104,146 @@ def test_control_diagnostic_schema_requires_consistent_call_response_facts():
     assert not model_test._valid_diagnostic_record(record)
     record["control_reply"]["submission"] = "http_response_received"
     assert model_test._valid_diagnostic_record(record)
+
+
+def test_source_conftest_prevents_inherited_install_collection_contamination(tmp_path):
+    import subprocess, sys
+    conflicting = tmp_path / "synthetic-install"
+    lib = conflicting / "container/lib"
+    lib.mkdir(parents=True)
+    (lib / "sessions.py").write_text("raise AssertionError('wrong synthetic install imported')\n")
+    code = r"""
+import inspect, os, runpy, sys
+from pathlib import Path
+root, conflicting = map(Path, sys.argv[1:])
+assert Path(os.environ["WOLTSPACE_DIR"]) == conflicting
+# Pytest loads conftest before collecting modules, independently of test order.
+runpy.run_path(str(root / "test/conftest.py"))
+from server.notification_senders import whatsapp_sender
+import sessions, harnesses
+from server import config
+assert config.WOLTSPACE_DIR == root
+assert Path(sessions.__file__).resolve() == root / "container/lib/sessions.py"
+assert Path(harnesses.__file__).resolve() == root / "container/lib/harnesses.py"
+assert "whatsapp_account" in inspect.signature(sessions.SessionRegistry.create).parameters
+# Explicit local config-override tests remain supported after collection.
+import pytest
+with pytest.MonkeyPatch.context() as patch:
+    patch.setenv("WOLTSPACE_DIR", str(conflicting))
+    assert runpy.run_path(str(root / "server/config.py"))["WOLTSPACE_DIR"] == conflicting
+print("source_imports_verified")
+"""
+    env = {"PATH":os.environ.get("PATH", os.defpath), "HOME":str(tmp_path),
+           "WOLTSPACE_DIR":str(conflicting), "WOLTSPACE_WOLTS_DIR":str(tmp_path / "wolts"),
+           "PYTHONPATH":os.pathsep.join(map(str, model_test._PATHS)), "PYTHONDONTWRITEBYTECODE":"1"}
+    result = subprocess.run([sys.executable, "-c", code, str(ROOT), str(conflicting)],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+    assert "source_imports_verified" in result.stdout
+
+
+@pytest.mark.parametrize("requested", [None, True, False])
+def test_absent_socket_cleanup_and_finalizer_require_never_requested(
+    tmp_path, short_cleanup_base, monkeypatch, requested,
+):
+    base = short_cleanup_base
+    monkeypatch.setattr(model_test, "PRIVATE_TMUX_BASE", base)
+    root = model_test._prepare_private_tmux_dir(base / "model-absent", base)
+    run = tmp_path / root.name
+    run.mkdir(mode=0o700)
+    diag = model_test.RunDiagnostics("codex")
+    calls = []
+    stopped = model_test._cleanup_resources(None, None, None,
+        "synthetic" if requested is not False else "", {"TMUX_TMPDIR":str(root)}, root,
+        diag, requested, stop_session_fn=lambda _: calls.append("registry") or {"status":"stopped"})
+    assert stopped is (requested is False)
+    assert diag.cleanup_components["tmux"] == ("not_needed" if requested is False else "failed")
+    # A registry status alone does not override uncertain server cleanup.
+    assert calls == ([] if requested is False else ["registry"])
+    diag.enter("cleanup"); diag.fail("cleanup_failed")
+    model_test._write_failure_record(run, diag)
+    finalized = model_test._finalize_run_root(run, stopped, root, preserve_failure=True)
+    assert finalized is (requested is False)
+    assert (run / ".cleanup-required").exists() is (requested is not False)
+    assert root.exists() is (requested is not False)
+
+
+def test_private_server_stop_precedes_registry_stamp(tmp_path):
+    calls = []
+    assert model_test._cleanup_resources(None, None, None, "synthetic", {}, tmp_path,
+        session_start_requested=True,
+        kill_tmux_fn=lambda *_: calls.append("verified-private-server-stop") or True,
+        stop_session_fn=lambda _: calls.append("registry-stop") or {"status":"stopped"})
+    assert calls == ["verified-private-server-stop", "registry-stop"]
+
+
+def test_live_sleep_only_tmux_with_unlinked_socket_is_not_stopped(short_cleanup_base, monkeypatch):
+    import select, shutil, signal
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        pytest.skip("pidfd identity cleanup required for this Linux-only probe")
+    tmux_bin = shutil.which("tmux")
+    if not tmux_bin:
+        pytest.skip("tmux not installed")
+    base = short_cleanup_base
+    monkeypatch.setattr(model_test, "PRIVATE_TMUX_BASE", base)
+    root = model_test._prepare_private_tmux_dir(base / "model-unlink", base)
+    env = {"WOLTSPACE_TMUX_BIN":tmux_bin, "TMUX_TMPDIR":str(root),
+           "HOME":str(root), "PATH":os.environ.get("PATH",os.defpath)}
+    descriptors = []
+    try:
+        assert model_test._tmux_value(env, "new-session", "-d", "-s", "isolated-unlink", "exec sleep 30")[0] == 0
+        for variable, executable in (("#{pid}", "tmux"), ("#{pane_pid}", "sleep")):
+            status, value, _ = model_test._tmux_value(env, "display-message", "-p", variable)
+            assert status == 0 and value.isdecimal()
+            pid = int(value)
+            descriptor = os.pidfd_open(pid)
+            descriptors.append(descriptor)
+            assert Path(f"/proc/{pid}/exe").resolve().name == executable
+            assert model_test._tmux_value(env, "display-message", "-p", variable)[1] == value
+            assert not select.select([descriptor], [], [], 0)[0]
+        socket = root / f"tmux-{os.getuid()}" / "default"
+        assert stat.S_ISSOCK(socket.lstat().st_mode)
+        socket.unlink()  # Only this exact test-created socket.
+        assert not model_test._kill_private_tmux(env, root)
+        assert not select.select([descriptors[0]], [], [], 0)[0]  # Server still alive.
+    finally:
+        # Held pidfds cannot retarget a reused PID. Never inspect/kill other processes.
+        for descriptor in reversed(descriptors):
+            try:
+                signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+                if not select.select([descriptor], [], [], 2)[0]:
+                    signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+                assert select.select([descriptor], [], [], 2)[0]
+            except ProcessLookupError:
+                pass
+            finally:
+                os.close(descriptor)
+        if not descriptors:
+            model_test._kill_private_tmux(env, root)
+
+
+def test_late_finalization_failure_cannot_return_success(tmp_path, short_cleanup_base, monkeypatch):
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    auth = tmp_path / "synthetic-auth"
+    auth.mkdir(mode=0o700)
+    monkeypatch.setattr(model_test.owner_test, "PRIVATE", private)
+    monkeypatch.setattr(model_test.owner_test, "_check_private_dir", lambda: None)
+    monkeypatch.setattr(model_test.owner_test, "_read_token", lambda: "synthetic-only")
+    monkeypatch.setattr(model_test, "PRIVATE_TMUX_BASE", short_cleanup_base)
+    monkeypatch.setattr(model_test, "_auth_path", lambda *_: ("CODEX_HOME", auth))
+    monkeypatch.setattr(model_test, "_preflight_harness", lambda *_: None)
+    def no_process_runner(*args, **kwargs):
+        args[-1].set_check("cleanup", "passed")
+        return 0
+    monkeypatch.setattr(model_test, "_run_model_session", no_process_runner)
+    monkeypatch.setattr(model_test, "_finalize_run_root", lambda *_args, **_kwargs: False)
+    diag = model_test.RunDiagnostics("codex")
+    assert model_test._run_model_test("codex", diag) == 2
+    assert diag.category == "cleanup_failed"
+    files = list(private.glob("model-*/failure.json"))
+    assert len(files) == 1
+    record = __import__('json').loads(files[0].read_text())
+    assert record["cleanup_components"]["finalize"] == "failed"
+    assert model_test._valid_diagnostic_record(record)
+    assert "synthetic-only" not in files[0].read_text()

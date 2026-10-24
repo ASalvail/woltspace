@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 @pytest.mark.parametrize("scenario", [
     "sent", "heredoc", "approval_pending", "ambiguous", "extra_blank",
     "trailing_space", "leading_space", "extra_text", "crlf",
-    "tool_sent", "tool_ambiguous", "tool_legacy", "tool_duplicate", "tool_prompt", "tool_timeout",
+    "tool_sent", "tool_ambiguous", "tool_legacy", "tool_duplicate", "tool_prompt", "tool_timeout", "tool_spawn_ambiguous",
 ])
 def test_real_runner_approval_flow_without_credentials_or_model(tmp_path, scenario):
     code = r'''
@@ -39,8 +39,11 @@ m._harness_process_status = lambda *_: True
 m._harness_readiness_status = lambda *_: "unsupported"
 m._capture_boot_symptom = lambda *_, **__: "tool_approval_prompt" if scenario == "prompt" else m._classify_boot_symptom(m.NOTIFY_APPROVAL_INSTRUCTION)
 real_cleanup = m._cleanup_resources
-m._cleanup_resources = lambda *args: real_cleanup(
-    *args, stop_session_fn=lambda _: {"status": "stopped"}, kill_tmux_fn=lambda *_: True)
+cleanup_requests = []
+def cleanup(*args):
+    cleanup_requests.append(args[-1])
+    return real_cleanup(*args, stop_session_fn=lambda _: {"status": "stopped"}, kill_tmux_fn=lambda *_: True)
+m._cleanup_resources = cleanup
 m.TIMEOUT_SECONDS = 1
 cli_threads, cli_results, sends, starts, expected_forwarded = [], [], [], [], []
 real_wrap = m._wrap_notify_send
@@ -65,6 +68,8 @@ def start(prompt, **kwargs):
         assert m.NOTIFY_APPROVAL_INSTRUCTION not in prompt
     assert "WHATSAPP_AGENT_TOKEN" not in os.environ
     assert kwargs["routing"]["whatsapp_account"] == adapter.ACCOUNT
+    if scenario == "spawn_ambiguous":
+        raise TimeoutError("synthetic-private-ambiguous-start")
     nonce = re.search(r"wa-model-check-[0-9a-f]+", prompt).group()
     suffixes = {"extra_blank": "\n\n", "trailing_space": " ", "extra_text": "\nextra", "crlf": "\r\n"}
     body = (" " if scenario == "leading_space" else "") + nonce + suffixes.get(scenario, "")
@@ -163,6 +168,7 @@ with tempfile.TemporaryDirectory(prefix=".wma-offline-", dir=m.ROOT.parents[2]) 
 record = diag.as_record()
 assert m._valid_diagnostic_record(record)
 assert starts == [1]
+assert cleanup_requests == [True]  # Includes throws before any returned session ID.
 assert record["checks"]["cleanup"] == "passed"
 assert adapter.start_claude_session is start and adapter.TOKEN == ""
 if scenario in {"sent", "heredoc"}:
@@ -174,7 +180,7 @@ if scenario in {"sent", "heredoc"}:
 elif tool_mode:
     assert result == 2 and record["checks"]["notify"] != "passed"
     expected = {"ambiguous":"notify_ambiguous", "legacy":"notify_rejected",
-                "duplicate":"notify_rejected", "prompt":"tool_approval_prompt", "timeout":"run_timeout"}
+                "duplicate":"notify_rejected", "prompt":"tool_approval_prompt", "timeout":"run_timeout", "spawn_ambiguous":"session_not_started"}
     assert record["category"] == expected[scenario], record
     assert sends == ([1] if scenario in {"ambiguous", "duplicate"} else [])
     files = list(private.glob("model-*/failure.json"))

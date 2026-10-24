@@ -919,14 +919,14 @@ def _socket_absent(socket: Path) -> bool:
     return False
 
 
-def _kill_private_tmux(env: dict[str, str], tmux_root: Path) -> bool:
+def _kill_private_tmux(env: dict[str, str], tmux_root: Path, *, never_started=False) -> bool:
     socket = _validated_private_socket(env, tmux_root)
     if socket is None:
         return False
     if _socket_absent(socket):
-        # Exact owned socket parent validated above; no tmux command/error
-        # string is needed for the never-created/already-removed case.
-        return True
+        # Absence cannot prove a previously started server exited: its socket
+        # could have been unlinked while it remains alive.
+        return never_started is True
     try:
         status, socket_path, error = _tmux_value(
             env, "display-message", "-p", "#{socket_path}",
@@ -934,10 +934,8 @@ def _kill_private_tmux(env: dict[str, str], tmux_root: Path) -> bool:
     except Exception:
         return False
     if status:
-        # Tmux's own explicit "no server running" response is the only
-        # nonzero result that proves cleanup is already complete.
-        return ("no server running" in error.lower()
-                and _remove_stale_private_socket(tmux_root))
+        # No positive stop evidence for a previously started/unknown server.
+        return False
     if Path(socket_path) != socket:
         return False
     try:
@@ -948,6 +946,9 @@ def _kill_private_tmux(env: dict[str, str], tmux_root: Path) -> bool:
         return False
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
+        # Absence after a successful exact-server kill is positive stop evidence.
+        if _validated_private_socket(env, tmux_root) == socket and _socket_absent(socket):
+            return True
         try:
             check_status, _, check_error = _tmux_value(
                 env, "display-message", "-p", "#{socket_path}",
@@ -1045,7 +1046,8 @@ class OneNonceSendGate:
 
 def _cleanup_resources(
     server, server_thread, listener, session_name: str, env: dict[str, str],
-    tmux_root: Path, diagnostics=None, *, stop_session_fn=None, kill_tmux_fn=None,
+    tmux_root: Path, diagnostics=None, session_start_requested=None, *,
+    stop_session_fn=None, kill_tmux_fn=None,
 ) -> bool:
     """Attempt all independent steps, retaining only fixed component outcomes."""
     outcomes = dict.fromkeys(("api_server", "listener", "session", "tmux"), "not_needed")
@@ -1072,6 +1074,20 @@ def _cleanup_resources(
             outcomes["listener"] = "passed"
         except Exception:
             outcomes["listener"] = "failed"
+    # Stop the exact verified private server BEFORE registry stop_session:
+    # that API can stamp stopped while ignoring its runtime.stop boolean.
+    try:
+        socket = _validated_private_socket(env, tmux_root) if kill_tmux_fn is None else None
+        never_created = (session_start_requested is False and socket is not None
+                         and _socket_absent(socket))
+        stopped = (_kill_private_tmux(env, tmux_root,
+                                     never_started=session_start_requested is False)
+                   if kill_tmux_fn is None else kill_tmux_fn(env, tmux_root))
+        # Preserve which positive evidence justified completion: no creation
+        # was requested, or a verified private-server stop was confirmed.
+        outcomes["tmux"] = ("not_needed" if never_created else "passed") if stopped else "failed"
+    except Exception:
+        outcomes["tmux"] = "failed"
     if session_name:
         try:
             if stop_session_fn is None:
@@ -1081,12 +1097,6 @@ def _cleanup_resources(
                                    and result.get("status") == "stopped" else "failed")
         except Exception:
             outcomes["session"] = "failed"
-    try:
-        if kill_tmux_fn is None:
-            kill_tmux_fn = _kill_private_tmux
-        outcomes["tmux"] = "passed" if kill_tmux_fn(env, tmux_root) else "failed"
-    except Exception:
-        outcomes["tmux"] = "failed"
     if diagnostics is not None:
         for component, state in outcomes.items():
             diagnostics.set_cleanup(component, state)
@@ -1221,7 +1231,6 @@ def _run_model_test(harness: str, diagnostics: RunDiagnostics | None = None,
                 harness, inherited, auth_variable, auth_path, run_root, secret, tmux_root,
                 diagnostics, notify_owner_tool=notify_owner_tool,
             )
-        return 2 if diagnostics.category else result
     except BaseException:
         if not diagnostics.category:
             diagnostics.fail()
@@ -1256,6 +1265,10 @@ def _run_model_test(harness: str, diagnostics: RunDiagnostics | None = None,
                     _write_failure_record(run_root, diagnostics)
                 except OSError:
                     pass
+    # Finalization can add a failure after the inner runner returned success.
+    # Compute the exit status only after that evidence-preserving step.
+    return 2 if diagnostics.category else result
+
 
 
 def _run_model_session(
@@ -1288,6 +1301,7 @@ def _run_model_session(
     server_errors: list[str] = []
     verified_session = ""
     send_gate = None
+    session_start_requested = False
     counter = None
     run_log = run_root / "runner.log"
     fd = os.open(run_log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -1352,6 +1366,8 @@ def _run_model_session(
             original_start = adapter.start_claude_session
 
             def approval_start(prompt, **kwargs):
+                nonlocal session_start_requested
+                session_start_requested = True  # Before the call, including throws.
                 return original_start(prompt + "\n" + (NOTIFY_OWNER_INSTRUCTION if notify_owner_tool
                                                        else NOTIFY_APPROVAL_INSTRUCTION), **kwargs)
 
@@ -1403,6 +1419,7 @@ def _run_model_session(
             notify._send = _wrap_notify_send(notify._send, send_gate)
 
             def dispatch_test_message(item: dict, current_routes: dict, started_at: int) -> None:
+                nonlocal session_start_requested
                 text = (item.get("text") or {}).get("body", "")
                 participant = item.get("from", "")
                 if text.strip() == f"wolt {TEST_WOLT}":
@@ -1433,6 +1450,7 @@ def _run_model_session(
                     # allow another model session from a duplicate phrase.
                     phase["prompted"] = True
                 diagnostics.enter("challenge_dispatch")
+                session_start_requested = True  # Creation/resume may throw ambiguously.
                 try:
                     adapter.handle(item, current_routes, started_at)
                     route = current_routes.get(participant, {})
@@ -1594,6 +1612,7 @@ def _run_model_session(
         diagnostics.enter("cleanup")
         cleanup_ok = _cleanup_resources(
             server, server_thread, listener, session_name, env, tmux_root, diagnostics,
+            session_start_requested,
         )
         diagnostics.checks["cleanup"] = "passed" if cleanup_ok else "failed"
         if notify_owner_tool and counter is not None:

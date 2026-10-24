@@ -322,6 +322,7 @@ def _run_startup_session(
     old_env, old_path = os.environ.copy(), list(sys.path)
     old_env.pop("WHATSAPP_AGENT_TOKEN", None)
     session = ""
+    session_start_requested = False
     server = thread = None
     notify_module = None
     original_send = original_dotenv = None
@@ -403,6 +404,7 @@ def _run_startup_session(
             diagnostics.enter("session_spawn")
             deadline = time.monotonic() + timeout_seconds
             try:
+                session_start_requested = True  # Before dispatch, including ambiguous throws.
                 result = _start_session(prompt) if probe_transport or notify_owner_tool else _start_session()
                 session = result.get("name", "") if isinstance(result, dict) else ""
                 if probe_config is not None:
@@ -481,7 +483,7 @@ def _run_startup_session(
         ) if capture_snapshot else None
         diagnostics.enter("cleanup")
         with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
-            cleanup_ok = model._cleanup_resources(server, thread, listener, session, env, tmux_root, diagnostics)
+            cleanup_ok = model._cleanup_resources(server, thread, listener, session, env, tmux_root, diagnostics, session_start_requested)
         diagnostics.set_check("cleanup", "passed" if cleanup_ok else "failed")
         if not cleanup_ok:
             diagnostics.fail("cleanup_failed")
