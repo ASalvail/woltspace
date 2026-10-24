@@ -1,12 +1,18 @@
 # Isolated WhatsApp model-session test plan
 
-**Status: final approval-aware adjustment prepared for review; no final live
-retry launched.** Owner-observed transport/registry stages and the local
-approval-aware mocked-notify diagnostic passed. Full WhatsApp/model reply
-success remains unproven. The separate
+**Status: owner-observed isolated acceptance passed.** Transport/registry
+stages, the local approval-aware mocked-notify diagnostic, and one real
+WhatsApp inbound → model session → notify → WhatsApp nonce reply passed.
+The successful run's private root and socket directory were removed, with no
+matching bound Unix socket or run-scoped working-directory process found.
+Two process lookups were denied, so that process scan remains qualified.
+This is one bounded text-only test; it does not establish production endurance
+or general account availability. No further live test is needed for this
+handoff. The separate
 runner is `scripts/whatsapp_model_session_test.py`; it requires an explicit
 `--run`, the owner-selected `--harness codex`, a real TTY, and typed
-confirmation. Do not launch it until Survey reviews that implementation.
+confirmation. Any later use requires implementation review and the normal
+runtime approval flow; never repeat a send with an ambiguous outcome.
 Stage one and stage two in
 `whatsapp-owner-test.md` do not create a real agent session. This plan covers a
 later test of the complete inbound → session → model reply → notify → WhatsApp
@@ -58,20 +64,22 @@ outbound path.
 
 ### Startup inspection before another WhatsApp attempt
 
-The separate `scripts/whatsapp_startup_inspection.py` runner is prepared for
-implementation review. After review, its proposed command from this checkout is:
+The separate `scripts/whatsapp_startup_inspection.py` runner was used to
+diagnose the local bootstrap/notify boundary before the successful acceptance.
+These commands are retained for reference; they are not routine setup steps
+and should not be repeated without review:
 
 ```sh
 .venv/bin/python scripts/whatsapp_startup_inspection.py --run --harness codex --timeout 120
 ```
 
-The comparison mode, prepared for review before another launch, is:
+The comparison mode is:
 
 ```sh
 .venv/bin/python scripts/whatsapp_startup_inspection.py --run --harness codex --timeout 120 --directory-trust normal
 ```
 
-For the next implementation review, the proposed bounded UI capture adds
+The separately reviewed bounded UI capture adds
 `--capture-snapshot` to that command. This opt-in captures the verified exact
 registry pane on the private tmux socket immediately before cleanup. ANSI
 control sequences, bearer/JWT/key patterns, credential assignment lines,
@@ -90,9 +98,9 @@ ignored private run directory) and any sanitized failure record are retained.
 The snapshot is private review material, never printed automatically or added
 to a PR. Remove it after the diagnostic review no longer needs it. Raw pane
 text exists only transiently in memory; raw logs are removed as before. This
-mode is prepared for review, not yet launched.
+mode was reviewed separately before its diagnostic run.
 
-The next transport-boundary comparison is prepared for review with:
+The transport-boundary comparison uses:
 
 ```sh
 .venv/bin/python scripts/whatsapp_startup_inspection.py --run --harness codex --timeout 120 --directory-trust normal --capture-snapshot --probe-transport
@@ -117,19 +125,19 @@ only the validated fixed probe fields and host health class alongside the
 existing redacted UI. No environment values, endpoint, session identifier or
 namespace identifier are emitted by the probe. Normal prompt policy and network
 restrictions remain in effect; the helper does not request or grant approval.
-This comparison has not been launched and does not use a WhatsApp credential,
+This comparison does not use a WhatsApp credential,
 provider poll or provider send.
 
 The reviewed probe subsequently established correct routing/session/executable,
 a blocked tool-context health request in a different network namespace, and a
-successful nearby host health check. The next proposed comparison requests
+successful nearby host health check. The subsequent comparison requests
 normal approval before the first helper call:
 
 ```sh
 .venv/bin/python scripts/whatsapp_startup_inspection.py --run --harness codex --timeout 180 --directory-trust normal --capture-snapshot --probe-transport --request-notify-approval
 ```
 
-This new mode is prepared for review, **not yet launched**. It changes the
+This mode passed in an owner-operated local diagnostic. It changes the
 synthetic instruction only: request normal one-time shell-tool escalation for
 the helper, wait for the current reviewer, and stop on denied/unavailable
 approval. No proxy, network, sandbox, reviewer or execution-policy setting is
