@@ -135,7 +135,7 @@ def test_failure_record_has_only_sanitized_schema_and_private_mode(tmp_path):
     data = __import__("json").loads(text)
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert data == {
-        "schema": 2,
+        "schema": 3,
         "harness": "codex",
         "stage": "harness_boot",
         "category": "auth_or_config",
@@ -147,6 +147,8 @@ def test_failure_record_has_only_sanitized_schema_and_private_mode(tmp_path):
             "notify": "pending", "cleanup": "not_reached",
         },
         "notify_attempt": "not_seen",
+        "notify_rejection": "none",
+        "notify_payload_shape": "not_seen",
         "harness_process": "not_checked",
         "harness_readiness": "not_checked",
         "boot_symptom": "not_checked",
@@ -156,6 +158,9 @@ def test_failure_record_has_only_sanitized_schema_and_private_mode(tmp_path):
         "raw exception", "opaque",
     ))
     assert model_test._valid_diagnostic_record(data)
+    legacy = dict(data, schema=2)
+    del legacy["notify_rejection"], legacy["notify_payload_shape"]
+    assert model_test._valid_diagnostic_record(legacy)
     data["notify_attempt"] = "raw prompt text"
     assert not model_test._valid_diagnostic_record(data)
     data["notify_attempt"] = []
@@ -542,6 +547,8 @@ def test_notify_failure_record_hides_synthetic_participant_prompt_and_exception(
     )
     assert model_test._diagnostic_line(diagnostics) == (
         f"Run stopped: stage=notify category={category}."
+        f" notify_rejection={'payload_mismatch' if mode == 'rejected' else 'none'}"
+        f" notify_payload_shape={'other' if mode == 'rejected' else 'exact'}."
     )
 
 
@@ -603,7 +610,8 @@ def test_notify_gate_requires_authoritative_verification_before_io():
     assert gate.status == "rejected"
 
 
-def test_ambiguous_notify_send_is_terminal_and_never_retried():
+@pytest.mark.parametrize("suffix", ["", "\n"])
+def test_ambiguous_notify_send_is_terminal_and_never_retried(suffix):
     attempts = []
     routing = {"adapter": "whatsapp", "chat_id": "user:42",
                "whatsapp_account": "test-account", "wolt": "wa-test"}
@@ -619,15 +627,67 @@ def test_ambiguous_notify_send_is_terminal_and_never_retried():
 
     async def run():
         with pytest.raises(TimeoutError):
-            await wrapped("whatsapp", "s1", "🦦 wa-test: nonce", "user:42",
+            await wrapped("whatsapp", "s1", "🦦 wa-test: nonce" + suffix, "user:42",
                           routing=routing)
         with pytest.raises(RuntimeError, match="already reserved"):
-            await wrapped("whatsapp", "s1", "🦦 wa-test: nonce", "user:42",
+            await wrapped("whatsapp", "s1", "🦦 wa-test: nonce" + suffix, "user:42",
                           routing=routing)
 
     asyncio.run(run())
     assert attempts == ["sent"]
     assert gate.status == "ambiguous"
+
+
+@pytest.mark.parametrize("reason", ["dispatch_timeout", "payload_mismatch", "route_unverified", "route_exception"])
+def test_rejection_reason_and_shape_are_fixed_and_survive_private_record(tmp_path, reason):
+    diagnostics = model_test.RunDiagnostics("codex")
+    diagnostics.enter("notify")
+    event = _completed_event() if reason != "dispatch_timeout" else threading.Event()
+    def verify(*_):
+        if reason == "route_exception":
+            raise RuntimeError("synthetic-raw-exception-with-private-content")
+        return "" if reason == "route_unverified" else "synthetic-session"
+    gate = model_test.OneNonceSendGate(
+        "🦦 wa-test: synthetic-private-nonce", verify, event, wait_seconds=0,
+        diagnostics=diagnostics,
+    )
+    sends = []
+    async def sender():
+        sends.append(1)
+    message = "synthetic-private-wrong-payload" if reason == "payload_mismatch" else "🦦 wa-test: synthetic-private-nonce\n"
+    async def run():
+        with pytest.raises(RuntimeError):
+            await gate.send("synthetic-session", "synthetic-participant", message, {}, sender)
+        with pytest.raises(RuntimeError, match="already reserved"):
+            await gate.send("synthetic-session", "synthetic-participant", message, {}, sender)
+    asyncio.run(run())
+    assert sends == []
+    record = diagnostics.as_record()
+    assert record["notify_rejection"] == ("route_unverified" if reason == "route_exception" else reason)
+    assert record["notify_payload_shape"] == ("other" if reason == "payload_mismatch" else "exact_plus_terminal_lf")
+    diagnostics.fail("notify_rejected")
+    path = model_test._write_failure_record(tmp_path, diagnostics)
+    text = path.read_text()
+    assert all(raw not in text for raw in (message, "synthetic-session", "synthetic-participant", "synthetic-raw-exception"))
+    assert model_test._valid_diagnostic_record(__import__('json').loads(text))
+
+
+@pytest.mark.parametrize("field", ["notify_rejection", "notify_payload_shape"])
+@pytest.mark.parametrize("value", ["raw-private-text", [], {}, 1, None])
+def test_new_diagnostic_fields_reject_non_enum_values(field, value):
+    diagnostics = model_test.RunDiagnostics("codex")
+    record = diagnostics.as_record()
+    assert record["schema"] == 3 and model_test._valid_diagnostic_record(record)
+    record[field] = value
+    assert not model_test._valid_diagnostic_record(record)
+    diagnostics.set_notify_details(rejection=value, payload_shape=value)
+    assert model_test._valid_diagnostic_record(diagnostics.as_record())
+
+
+def test_diagnostics_reject_extra_private_fields_and_legacy_schema_expansion():
+    record = model_test.RunDiagnostics("codex").as_record()
+    assert not model_test._valid_diagnostic_record(dict(record, payload="synthetic-private"))
+    assert not model_test._valid_diagnostic_record(dict(record, schema=2))
 
 
 @pytest.mark.parametrize("explicit", [

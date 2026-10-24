@@ -61,6 +61,8 @@ _NOTIFY_ATTEMPT_STATES = {
     "not_seen", "dispatch_wait", "reserved", "route_verified",
     "send_in_flight", "sent", "rejected", "ambiguous",
 }
+_NOTIFY_REJECTIONS = {"none", "dispatch_timeout", "payload_mismatch", "route_unverified"}
+_NOTIFY_PAYLOAD_SHAPES = {"not_seen", "exact", "exact_plus_terminal_lf", "other"}
 _PROCESS_STATES = {"not_checked", "present", "absent", "unknown"}
 _READINESS_STATES = {
     "not_checked", "ready_marker_seen", "prompt_detected", "not_ready",
@@ -91,6 +93,8 @@ class RunDiagnostics:
         self.checks = {name: "pending" for name in _DIAGNOSTIC_STAGES}
         self.checks["cleanup"] = "not_reached"
         self.notify_attempt = "not_seen"
+        self.notify_rejection = "none"
+        self.notify_payload_shape = "not_seen"
         self.harness_process = "not_checked"
         self.harness_readiness = "not_checked"
         self.boot_symptom = "not_checked"
@@ -114,6 +118,13 @@ class RunDiagnostics:
         with self._lock:
             if state in _NOTIFY_ATTEMPT_STATES:
                 self.notify_attempt = state
+
+    def set_notify_details(self, *, rejection=None, payload_shape=None) -> None:
+        with self._lock:
+            if isinstance(rejection, str) and rejection in _NOTIFY_REJECTIONS:
+                self.notify_rejection = rejection
+            if isinstance(payload_shape, str) and payload_shape in _NOTIFY_PAYLOAD_SHAPES:
+                self.notify_payload_shape = payload_shape
 
     def set_harness_process(self, state: str) -> None:
         with self._lock:
@@ -155,12 +166,14 @@ class RunDiagnostics:
     def as_record(self) -> dict[str, Any]:
         with self._lock:
             return {
-                "schema": 2,
+                "schema": 3,
                 "harness": self.harness,
                 "stage": self.failure_stage or self.stage,
                 "category": self.category or "internal_error",
                 "checks": {name: self.checks[name] for name in _DIAGNOSTIC_STAGES},
                 "notify_attempt": self.notify_attempt,
+                "notify_rejection": self.notify_rejection,
+                "notify_payload_shape": self.notify_payload_shape,
                 "harness_process": self.harness_process,
                 "harness_readiness": self.harness_readiness,
                 "boot_symptom": self.boot_symptom,
@@ -255,13 +268,18 @@ def _valid_diagnostic_record(record: Any) -> bool:
     def enum(value: Any, choices) -> bool:
         return isinstance(value, str) and value in choices
 
+    if (not isinstance(record, dict) or type(record.get("schema")) is not int
+            or record["schema"] not in {2, 3}):
+        return False
+    keys = {"schema", "harness", "stage", "category", "checks", "notify_attempt",
+            "harness_process", "harness_readiness", "boot_symptom"}
+    if record["schema"] == 3:
+        keys |= {"notify_rejection", "notify_payload_shape"}
+        if (not enum(record.get("notify_rejection"), _NOTIFY_REJECTIONS)
+                or not enum(record.get("notify_payload_shape"), _NOTIFY_PAYLOAD_SHAPES)):
+            return False
     return bool(
-        isinstance(record, dict)
-        and set(record) == {
-            "schema", "harness", "stage", "category", "checks",
-            "notify_attempt", "harness_process", "harness_readiness", "boot_symptom",
-        }
-        and record.get("schema") == 2
+        set(record) == keys
         and enum(record.get("harness"), {"claude", "codex", "unknown"})
         and enum(record.get("stage"), _DIAGNOSTIC_STAGES)
         and enum(record.get("category"), _FAILURE_CATEGORIES)
@@ -287,7 +305,14 @@ def _remove_raw_log(run_root: Path) -> None:
 def _diagnostic_line(diagnostics: RunDiagnostics) -> str:
     stage = diagnostics.failure_stage or diagnostics.stage
     category = diagnostics.category if diagnostics.category in _FAILURE_CATEGORIES else "internal_error"
-    return f"Run stopped: stage={stage} category={category}."
+    line = f"Run stopped: stage={stage} category={category}."
+    if diagnostics.notify_attempt != "not_seen":
+        rejection = diagnostics.notify_rejection
+        shape = diagnostics.notify_payload_shape
+        rejection = rejection if isinstance(rejection, str) and rejection in _NOTIFY_REJECTIONS else "none"
+        shape = shape if isinstance(shape, str) and shape in _NOTIFY_PAYLOAD_SHAPES else "other"
+        line += f" notify_rejection={rejection} notify_payload_shape={shape}."
+    return line
 
 
 def _track_adapter_replies(real_api, diagnostics: RunDiagnostics):
@@ -823,6 +848,12 @@ class OneNonceSendGate:
             if self.status != "ready":
                 raise RuntimeError("the single WhatsApp test send is already reserved")
             self._set_status("dispatch_wait")
+            # Only the single LF separator from literal heredoc input is an
+            # accepted transport variation. Never strip arbitrary whitespace.
+            shape = ("exact" if message == self.expected_payload else
+                     "exact_plus_terminal_lf" if message == self.expected_payload + "\n" else "other")
+            if self.diagnostics is not None:
+                self.diagnostics.set_notify_details(payload_shape=shape)
         dispatch_finished = await asyncio.to_thread(
             self.dispatch_done.wait, self.wait_seconds,
         )
@@ -833,10 +864,14 @@ class OneNonceSendGate:
             # validation and definitely before any network I/O.
             self._set_status("reserved")
             if not dispatch_finished:
+                if self.diagnostics is not None:
+                    self.diagnostics.set_notify_details(rejection="dispatch_timeout")
                 self._set_status("rejected")
                 self.failure = "the inbound dispatch did not finish in time"
                 raise RuntimeError(self.failure)
-            if message != self.expected_payload:
+            if shape == "other":
+                if self.diagnostics is not None:
+                    self.diagnostics.set_notify_details(rejection="payload_mismatch")
                 self._set_status("rejected")
                 self.failure = "the notify payload did not match the exact nonce"
                 raise RuntimeError(self.failure)
@@ -845,6 +880,8 @@ class OneNonceSendGate:
             except Exception:
                 verified = ""
             if not verified:
+                if self.diagnostics is not None:
+                    self.diagnostics.set_notify_details(rejection="route_unverified")
                 self._set_status("rejected")
                 self.failure = "the test session route was not verified"
                 raise RuntimeError(self.failure)

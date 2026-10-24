@@ -9,7 +9,10 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.parametrize("scenario", ["sent", "approval_pending", "ambiguous"])
+@pytest.mark.parametrize("scenario", [
+    "sent", "heredoc", "approval_pending", "ambiguous", "extra_blank",
+    "trailing_space", "leading_space", "extra_text", "crlf",
+])
 def test_real_runner_approval_flow_without_credentials_or_model(tmp_path, scenario):
     code = r'''
 import asyncio, json, os, re, subprocess, sys, tempfile, threading, time, types
@@ -36,9 +39,10 @@ real_cleanup = m._cleanup_resources
 m._cleanup_resources = lambda *args: real_cleanup(
     *args, stop_session_fn=lambda _: {"status": "stopped"}, kill_tmux_fn=lambda *_: True)
 m.TIMEOUT_SECONDS = 1
-cli_threads, cli_results, sends, starts = [], [], [], []
+cli_threads, cli_results, sends, starts, expected_forwarded = [], [], [], [], []
 real_wrap = m._wrap_notify_send
 async def provider_send(*args, **kwargs):
+    assert args[2] == expected_forwarded[0]  # Original CLI bytes preserved.
     sends.append(1)
     if scenario == "ambiguous":
         raise TimeoutError("synthetic-private-provider-error")
@@ -56,6 +60,9 @@ def start(prompt, **kwargs):
     assert "WHATSAPP_AGENT_TOKEN" not in os.environ
     assert kwargs["routing"]["whatsapp_account"] == adapter.ACCOUNT
     nonce = re.search(r"wa-model-check-[0-9a-f]+", prompt).group()
+    suffixes = {"extra_blank": "\n\n", "trailing_space": " ", "extra_text": "\nextra", "crlf": "\r\n"}
+    body = (" " if scenario == "leading_space" else "") + nonce + suffixes.get(scenario, "")
+    expected_forwarded.append(m._expected_notify_payload(nonce) + ("" if scenario == "sent" else "\n"))
     from sessions import SessionRegistry
     registry = SessionRegistry()
     record = registry.create(
@@ -74,10 +81,16 @@ def start(prompt, **kwargs):
             env["WOLTSPACE_WOLT_SESSION"] = record["name"]
             from session_runtime import _session_env_value
             env["PATH"] = _session_env_value("PATH", env["PATH"])
-            result = subprocess.run(
-                [str(m.ROOT / "container/bin/notify"), "--whatsapp", "user:4242424242"],
-                input=nonce, env=env, text=True, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, timeout=10)
+            argv = [str(m.ROOT / "container/bin/notify"), "--whatsapp", "user:4242424242"]
+            if scenario == "sent":
+                command, stdin = argv, nonce
+            else:
+                # The actual supported shell path, including the literal
+                # heredoc's required terminal LF, rather than newline-free input.
+                from container.lib.notify_prompt import quoted_heredoc
+                command, stdin = ["bash", "-c", quoted_heredoc(argv, body, prefix="WOLTSPACE_NOTIFY")], None
+            result = subprocess.run(command, input=stdin, env=env, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
             cli_results.append(result.returncode)
         thread = threading.Thread(target=cli)
         thread.start()
@@ -131,18 +144,23 @@ assert m._valid_diagnostic_record(record)
 assert starts == [1]
 assert record["checks"]["cleanup"] == "passed"
 assert adapter.start_claude_session is start and adapter.TOKEN == ""
-if scenario == "sent":
+if scenario in {"sent", "heredoc"}:
     assert result == 0 and sends == [1] and cli_results == [0]
     assert record["notify_attempt"] == "sent" and record["checks"]["notify"] == "passed"
+    assert record["notify_rejection"] == "none"
+    assert record["notify_payload_shape"] == ("exact" if scenario == "sent" else "exact_plus_terminal_lf")
     assert not list(private.glob("model-*"))
 else:
     assert result == 2 and record["checks"]["notify"] != "passed"
-    assert record["category"] == ("approval_not_completed" if scenario == "approval_pending" else "notify_ambiguous")
-    assert sends == ([] if scenario == "approval_pending" else [1])
+    assert record["category"] == ("approval_not_completed" if scenario == "approval_pending" else "notify_ambiguous" if scenario == "ambiguous" else "notify_rejected")
+    assert sends == ([1] if scenario == "ambiguous" else [])
+    assert record["notify_rejection"] == ("none" if scenario in {"approval_pending", "ambiguous"} else "payload_mismatch")
+    assert record["notify_payload_shape"] == ("not_seen" if scenario == "approval_pending" else "exact_plus_terminal_lf" if scenario == "ambiguous" else "other")
     if scenario == "approval_pending":
         assert record["harness_readiness"] == "unknown" and cli_results == []
     files = list(private.glob("model-*/failure.json"))
     assert len(files) == 1 and m._valid_diagnostic_record(json.loads(files[0].read_text()))
+    assert all(term not in files[0].read_text() for term in ("synthetic-only-key", "user:4242424242", "wa-model-check-", "synthetic-private-provider-error"))
     assert {p.name for p in files[0].parent.iterdir()} == {"failure.json"}
 assert "WHATSAPP_AGENT_TOKEN" not in os.environ
 print("offline_model_approval_ok")

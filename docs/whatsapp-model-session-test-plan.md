@@ -207,7 +207,7 @@ session, stop the private local server/listener, and stop only that private
 tmux server. On success it prints the fixed local-notification and cleanup
 status plus allowlisted process/readiness/symptom/notify-attempt fields, and
 removes its `startup-*` root. Failures preserve only the validated
-schema-2 mode-0600 record after verified cleanup; uncertain cleanup retains
+schema-3 mode-0600 record after verified cleanup; uncertain cleanup retains
 the marked private root. The prior `model-*` roots and saved credential are
 untouched. No separate broad cleanup command is required; a retained marker
 requires scoped inspection. Do not wrap the command in an external hard kill
@@ -286,7 +286,7 @@ The failure record includes only the harness name, primary stage/category and
 those statuses. It never contains a prompt, participant/session ID,
 credential, exception text, or pane/log contents. Raw runner and session boot
 logs are removed after cleanup attempts.
-Schema 2 also records a fixed `notify_attempt` state (`not_seen`,
+Schema 3 retains the fixed `notify_attempt` state (`not_seen`,
 `dispatch_wait`, `reserved`, `route_verified`, `send_in_flight`, `sent`,
 `rejected`, or `ambiguous`); it distinguishes no notify invocation from one
 that reached the sender but did not finish before timeout. It separately
@@ -296,6 +296,16 @@ records `harness_process` (`not_checked`, `present`, `absent`, `unknown`),
 allowlist. Process presence is not harness readiness. Codex currently has no
 configured versioned TUI-ready marker, so its readiness is `unsupported`; a
 running Codex process alone does not mark `harness_boot` passed.
+
+New records add only fixed `notify_rejection` (`none`, `dispatch_timeout`,
+`payload_mismatch`, `route_unverified`) and `notify_payload_shape` (`not_seen`,
+`exact`, `exact_plus_terminal_lf`, `other`) enums. The terminal includes these
+classes after a notify attempt, so the owner need not share private logs.
+Route verifier exceptions map to `route_unverified` without retaining exception
+text. The first attempt's evidence remains unchanged after a duplicate attempt
+is refused. No payload, identifier, nonce, exception or arbitrary field is
+retained. The strict validator also accepts historical schema-2 records with
+exactly their old fields; missing evidence is not retrospectively inferred.
 
 The runner classifies captured boot symptoms in memory as `auth_or_config`,
 `bootstrap_missing`, `trust_or_approval`, `waiting_for_input`, or
@@ -316,7 +326,8 @@ rejection, a sender that remains in flight, completed send, and synthetic
 auth/bootstrap/trust/approval/waiting pane text. These checks validate the
 diagnostic states and redaction only; they do not diagnose a prior live run.
 
-The test allows one exact `🦦 wa-test: <nonce>` payload from the selected
+The test allows one exact `🦦 wa-test: <nonce>` payload, or that exact payload
+plus **one terminal LF** from a literal heredoc, from the selected
 participant after checking the session registry, account fingerprint, and
 private tmux socket. If the model replies while the inbound handler is still
 saving its route, the notify request waits asynchronously for at most 45
@@ -325,6 +336,18 @@ closed if it is absent. The notification sender retains its bounded HTTP 429
 handling (up to three attempts, honoring `Retry-After`). The runner does not
 retry an ambiguous timeout or any other send failure; the attempt is reserved
 before network I/O and all later notify attempts are rejected.
+The original message bytes are passed to the sender unchanged; this does not
+strip arbitrary whitespace or alter the production notify CLI. Leading or
+trailing spaces, additional blank lines, CRLF, extra text and a wrong nonce
+remain refused. Offline tests exercise the actual quoted-heredoc shell command,
+real CLI and local mocked route for valid and invalid variants, including an
+ambiguous sender outcome with no retry.
+
+An earlier live test retained only a generic rejection, so its exact cause
+remains unknown. Independently, source-only reproduction established that the
+required heredoc preserves its terminal LF while the previous test gate
+expected none. The correction addresses that concrete mismatch; it does not
+prove that it caused the earlier rejection or establish a successful live reply.
 
 1. Create only the synthetic test wolt and start the isolated server and its
    private tmux server. Confirm the API endpoint is the selected loopback port
