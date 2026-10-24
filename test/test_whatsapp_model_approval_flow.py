@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 @pytest.mark.parametrize("scenario", [
     "sent", "heredoc", "approval_pending", "ambiguous", "extra_blank",
     "trailing_space", "leading_space", "extra_text", "crlf",
+    "tool_sent", "tool_ambiguous", "tool_legacy", "tool_duplicate", "tool_prompt", "tool_timeout",
 ])
 def test_real_runner_approval_flow_without_credentials_or_model(tmp_path, scenario):
     code = r'''
@@ -19,6 +20,8 @@ import asyncio, json, os, re, subprocess, sys, tempfile, threading, time, types
 from pathlib import Path
 from scripts import whatsapp_model_session_test as m
 base, scenario = Path(sys.argv[1]), sys.argv[2]
+tool_mode = scenario.startswith("tool_")
+if tool_mode: scenario = scenario[5:]
 private = base / "private"
 private.mkdir(mode=0o700)
 auth = base / "synthetic-auth"
@@ -34,7 +37,7 @@ m._preflight_harness = preflight
 m._verify_private_tmux = lambda *_: None
 m._harness_process_status = lambda *_: True
 m._harness_readiness_status = lambda *_: "unsupported"
-m._capture_boot_symptom = lambda *_, **__: m._classify_boot_symptom(m.NOTIFY_APPROVAL_INSTRUCTION)
+m._capture_boot_symptom = lambda *_, **__: "tool_approval_prompt" if scenario == "prompt" else m._classify_boot_symptom(m.NOTIFY_APPROVAL_INSTRUCTION)
 real_cleanup = m._cleanup_resources
 m._cleanup_resources = lambda *args: real_cleanup(
     *args, stop_session_fn=lambda _: {"status": "stopped"}, kill_tmux_fn=lambda *_: True)
@@ -56,13 +59,16 @@ adapter.atomic_json = lambda path, data: path.write_text(json.dumps(data))
 adapter.api = lambda *_: (200, {"messages": [{"id": "synthetic-control"}]})
 def start(prompt, **kwargs):
     starts.append(1)
-    assert prompt.endswith(m.NOTIFY_APPROVAL_INSTRUCTION)
+    assert prompt.endswith(m.NOTIFY_OWNER_INSTRUCTION if tool_mode else m.NOTIFY_APPROVAL_INSTRUCTION)
+    if tool_mode:
+        assert os.environ["WOLTSPACE_NOTIFY_TOOL"] == "1"
+        assert m.NOTIFY_APPROVAL_INSTRUCTION not in prompt
     assert "WHATSAPP_AGENT_TOKEN" not in os.environ
     assert kwargs["routing"]["whatsapp_account"] == adapter.ACCOUNT
     nonce = re.search(r"wa-model-check-[0-9a-f]+", prompt).group()
     suffixes = {"extra_blank": "\n\n", "trailing_space": " ", "extra_text": "\nextra", "crlf": "\r\n"}
     body = (" " if scenario == "leading_space" else "") + nonce + suffixes.get(scenario, "")
-    expected_forwarded.append(m._expected_notify_payload(nonce) + ("" if scenario == "sent" else "\n"))
+    expected_forwarded.append(m._expected_notify_payload(nonce) + ("" if scenario == "sent" or tool_mode else "\n"))
     from sessions import SessionRegistry
     registry = SessionRegistry()
     record = registry.create(
@@ -70,9 +76,9 @@ def start(prompt, **kwargs):
         dir=str(Path(os.environ["WOLTS_DIR"]) / "wa-test"),
         adapter="whatsapp", chat_id="user:4242424242", whatsapp_account=adapter.ACCOUNT,
         execution_policy={"mode": "prompt", "isolation": "host"})
-    registry.update(record["name"], wolt="wa-test", runtime={
+    record = registry.update(record["name"], wolt="wa-test", notify_owner_generation="synthetic-generation", runtime={
         "kind": "tmux", "tmux_session_name": "synthetic-model", "pane_id": "%1"})
-    if scenario != "approval_pending":
+    if scenario not in {"approval_pending", "prompt", "timeout"}:
         def cli():
             # Arrives after initial selection budget would have expired, but
             # within the new full budget from verified attach readiness.
@@ -82,7 +88,16 @@ def start(prompt, **kwargs):
             from session_runtime import _session_env_value
             env["PATH"] = _session_env_value("PATH", env["PATH"])
             argv = [str(m.ROOT / "container/bin/notify"), "--whatsapp", "user:4242424242"]
-            if scenario == "sent":
+            if tool_mode and scenario != "legacy":
+                import notify_owner_mcp as worker
+                command = [sys.executable, "-I", worker.__file__, "--session", record["name"],
+                           "--binding", worker.route_binding(record), "--api", env["WOLTSPACE_API"]]
+                call = {"jsonrpc":"2.0", "id":1, "method":"tools/call",
+                        "params":{"name":"notify_owner", "arguments":{"message":nonce}}}
+                stdin = json.dumps(call) + "\n"
+                if scenario in {"ambiguous", "duplicate"}:
+                    stdin += json.dumps(dict(call, id=2)) + "\n"
+            elif scenario in {"sent", "legacy"}:
                 command, stdin = argv, nonce
             else:
                 # The actual supported shell path, including the literal
@@ -92,6 +107,12 @@ def start(prompt, **kwargs):
             result = subprocess.run(command, input=stdin, env=env, text=True,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
             cli_results.append(result.returncode)
+            if tool_mode and scenario != "legacy":
+                values = [json.loads(line) for line in result.stdout.splitlines()]
+                assert len(values) == (2 if scenario in {"ambiguous", "duplicate"} else 1)
+                assert values[0]["result"]["isError"] is (scenario == "ambiguous")
+                if scenario in {"ambiguous", "duplicate"}:
+                    assert values[1]["result"]["isError"] is True
         thread = threading.Thread(target=cli)
         thread.start()
         cli_threads.append(thread)
@@ -133,7 +154,7 @@ diag = m.RunDiagnostics("codex")
 with tempfile.TemporaryDirectory(prefix=".wma-offline-", dir=m.ROOT.parents[2]) as sockets:
     m.PRIVATE_TMUX_BASE = Path(sockets)
     try:
-        result = m._run_model_test("codex", diag)
+        result = m._run_model_test("codex", diag, notify_owner_tool=tool_mode)
     except Exception:
         result = 2
     for thread in cli_threads:
@@ -150,6 +171,16 @@ if scenario in {"sent", "heredoc"}:
     assert record["notify_rejection"] == "none"
     assert record["notify_payload_shape"] == ("exact" if scenario == "sent" else "exact_plus_terminal_lf")
     assert not list(private.glob("model-*"))
+elif tool_mode:
+    assert result == 2 and record["checks"]["notify"] != "passed"
+    expected = {"ambiguous":"notify_ambiguous", "legacy":"notify_rejected",
+                "duplicate":"notify_rejected", "prompt":"tool_approval_prompt", "timeout":"run_timeout"}
+    assert record["category"] == expected[scenario], record
+    assert sends == ([1] if scenario in {"ambiguous", "duplicate"} else [])
+    files = list(private.glob("model-*/failure.json"))
+    assert len(files) == 1 and m._valid_diagnostic_record(json.loads(files[0].read_text()))
+    assert all(term not in files[0].read_text() for term in ("synthetic-only-key", "user:4242424242", "wa-model-check-", "synthetic-private-provider-error"))
+    assert {p.name for p in files[0].parent.iterdir()} == {"failure.json"}
 else:
     assert result == 2 and record["checks"]["notify"] != "passed"
     assert record["category"] == ("approval_not_completed" if scenario == "approval_pending" else "notify_ambiguous" if scenario == "ambiguous" else "notify_rejected")
@@ -173,9 +204,17 @@ print("offline_model_approval_ok")
                             stderr=subprocess.PIPE, timeout=35)
     assert result.returncode == 0, result.stderr
     assert "offline_model_approval_ok" in result.stdout
-    assert "Approval needed:" in result.stdout
-    assert "attach-session -t =synthetic-model" in result.stdout
-    assert "Approve only the intended notify command" in result.stdout
+    if scenario.startswith("tool_"):
+        assert "Approval needed:" not in result.stdout
+        assert "attach-session" not in result.stdout
+        assert "Approve only" not in result.stdout
+        assert "Model test cleanup=passed." in result.stdout
+        if scenario == "tool_sent":
+            assert "Owner-tool requests=1 legacy-notify=0." in result.stdout
+    else:
+        assert "Approval needed:" in result.stdout
+        assert "attach-session -t =synthetic-model" in result.stdout
+        assert "Approve only the intended notify command" in result.stdout
     assert "synthetic-private-provider-error" not in result.stdout + result.stderr
     if scenario == "approval_pending":
         assert "This does not prove approval was denied. Cleaning up." in result.stdout

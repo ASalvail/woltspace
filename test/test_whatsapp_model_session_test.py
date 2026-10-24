@@ -951,3 +951,17 @@ def test_cleanup_finalizer_retains_root_on_failure_and_removes_on_success(tmp_pa
     assert model_test._finalize_run_root(disposable, True, tmux_root)
     assert not disposable.exists()
     assert not tmux_root.exists()
+
+
+def test_main_passes_explicit_owner_tool_option_without_launch(monkeypatch):
+    import sys
+    calls = []
+    monkeypatch.setattr(sys, "argv", ["runner", "--run", "--harness", "codex", "--notify-owner-tool"])
+    monkeypatch.setattr(model_test.owner_test, "_require_tty", lambda: None)
+    monkeypatch.setattr("builtins.input", lambda _: "MODEL")
+    def run(harness, diagnostics, **options):
+        calls.append((harness, options))
+        return 0
+    monkeypatch.setattr(model_test, "_run_model_test", run)
+    assert model_test.main() == 0
+    assert calls == [("codex", {"notify_owner_tool": True})]

@@ -78,7 +78,8 @@ def _redact_pane(text):
 
 class _NotifyCounter:
     """Count only /notify request/response metadata, never bodies."""
-    def __init__(self, app):
+    def __init__(self, app, *, owner_only=False):
+        self.owner_only = owner_only
         self.app, self.count, self.status = app, 0, None
         self.owner_count = self.legacy_count = 0
         self.lock = threading.Lock()
@@ -98,6 +99,14 @@ class _NotifyCounter:
                     status = message.get("status")
                     self.status = status if type(status) is int and 100 <= status <= 599 else None
             await send(message)
+        if self.owner_only and notify and (
+                scope.get("path") != "/notify/owner" or self.owner_count > 1):
+            # Refuse fallback/duplicate requests BEFORE application/provider I/O.
+            await counted_send({"type": "http.response.start", "status": 409,
+                                "headers": [(b"content-type", b"application/json")]})
+            await counted_send({"type": "http.response.body",
+                                "body": b'{"status":"refused"}'})
+            return
         await self.app(scope, receive, counted_send)
 
 

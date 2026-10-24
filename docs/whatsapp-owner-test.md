@@ -70,17 +70,39 @@ This removes the saved key and any remaining private test files. Do not copy
 the key into chat or a command line. If the checkout is deleted, the private
 gitignored directory is deleted with it.
 
-## Later real model-session test
+## Real model-session owner-tool test (review before launch)
 
-A true model-session test should use a separate temporary Woltspace data root
-and a separate server on a dynamically selected non-7777 port. It should create
-one synthetic test wolt/session, point the session process only at that
-isolated server, and verify the real WhatsApp inbound → registry → model reply
-→ notify → WhatsApp outbound flow. It must verify tmux environment scrubbing,
-restrict the agent prompt to a fixed harmless task, and clean up the test
-session and temporary data root afterward. Do not launch that stage until the
-exact server command, port, session lifetime, and runtime cleanup are reviewed.
-## Local owner-tool acceptance (review before launch)
+After implementation review, from the checkout with runtime dependencies:
+
+```bash
+.venv/bin/python scripts/whatsapp_model_session_test.py --run --harness codex --notify-owner-tool
+```
+
+Type `MODEL` at the local confirmation. The existing saved key is read only by
+code, never displayed or placed in model/worker environments or configuration.
+In WhatsApp, follow the printed `wolt wa-test` selection and fresh exact challenge.
+No second terminal, session attachment or approval interaction is required.
+Do not reuse an earlier nonce. The runner requests only `notify_owner(message)`;
+it rejects the legacy CLI endpoint before sender access, rather than silently
+falling back. A concrete tool approval prompt fails this mode; do not answer it
+or change policy. Report the fixed failure category for review.
+
+Success requires one owner endpoint request, zero legacy requests, the exact
+nonce payload, and the real account-bound registry route/private runtime. The
+one-attempt gate is reserved before provider I/O; no ambiguous outcome is
+retried. The full 300-second observation budget starts after the session/runtime
+is verified (this is not a model-readiness claim). Cleanup stops only the private
+test session/server/tmux and reports `Model test cleanup=passed.` on success.
+The installed lodge and port 7777 are unchanged. A selection confirmation and
+session acknowledgement are expected control messages in addition to the nonce.
+
+Without `--notify-owner-tool`, the prior CLI/normal-approval diagnostic remains
+available; it is a separate path and prints attachment instructions. Prior real
+CLI acceptance does not establish real-provider acceptance of the new tool path.
+The tool path has passed one bounded local mocked-outbound Codex test without
+owner interaction. Its real WhatsApp acceptance remains pending review/testing.
+
+## Local owner-tool acceptance (completed bounded diagnostic)
 
 The optional stdio owner tool has a separate bounded diagnostic that uses the
 supported platform Codex session path and only a local mocked sender:
@@ -89,7 +111,9 @@ supported platform Codex session path and only a local mocked sender:
 .venv/bin/python scripts/whatsapp_startup_inspection.py --run --harness codex --timeout 120 --directory-trust normal --notify-owner-tool --capture-snapshot
 ```
 
-Review this candidate before executing that command. It does not read the
+This reviewed diagnostic passed once with one owner request, zero legacy requests,
+a verified nonce/route and cleanup, without owner interaction. Do not repeat it
+as part of the real-provider test. It does not read the
 saved WhatsApp key, poll WhatsApp, send provider messages or ask for a human
 WhatsApp challenge. It reuses the existing owner-authorized harness login
 path through the private per-run Codex setup, without exposing auth contents.
@@ -111,5 +135,5 @@ the installed lodge and port 7777 are preserved. A redacted snapshot and fixed
 failure record may be retained privately after verified cleanup, following
 the existing strict validation/retention rules. Never inspect auth/key files
 or dump raw logs to diagnose this test. A failure needs evidence and review,
-not an automatic second model or provider run. This diagnostic mode has
-offline coverage; its real model execution remains a separate review step.
+not an automatic second model or provider run. This establishes one configured local runtime result, not a universal approval
+guarantee under every managed policy/version or real WhatsApp acceptance of the tool.

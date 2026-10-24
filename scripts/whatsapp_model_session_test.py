@@ -50,6 +50,13 @@ NOTIFY_APPROVAL_INSTRUCTION = (
     "answer dialogs yourself. If approval is denied or unavailable, report that blocker and stop. "
     "Never retry an ambiguous send. Send only the requested exact nonce, with no extra notification."
 )
+NOTIFY_OWNER_INSTRUCTION = (
+    "Use only the woltspace_notify notify_owner tool to send the exact requested nonce "
+    "as message, once. This test requires the preauthorized owner tool, not the notify CLI. "
+    "Do not invoke shell/curl/HTTP/legacy notify, request approval, answer dialogs, "
+    "or fall back to another route. If the tool is unavailable or requests approval, stop. "
+    "Never retry an ambiguous outcome. Send no extra notification."
+)
 _PATHS = (ROOT, ROOT / "container", ROOT / "container" / "lib", ROOT / "src")
 _DIAGNOSTIC_STAGES = (
     "preflight", "server_health", "inbound_selection", "selection_reply",
@@ -1039,7 +1046,7 @@ def _confirmed_notify(gate: OneNonceSendGate, session: str,
 
 
 def _run_model_test(harness: str, diagnostics: RunDiagnostics | None = None,
-                    *, startup_runner=None) -> int:
+                    *, startup_runner=None, notify_owner_tool=False) -> int:
     diagnostics = diagnostics or RunDiagnostics(harness)
     owner_test._check_private_dir()
     inherited = {key: value for key, value in os.environ.items()
@@ -1078,7 +1085,7 @@ def _run_model_test(harness: str, diagnostics: RunDiagnostics | None = None,
             secret["value"] = owner_test._read_token()
             result = _run_model_session(
                 harness, inherited, auth_variable, auth_path, run_root, secret, tmux_root,
-                diagnostics,
+                diagnostics, notify_owner_tool=notify_owner_tool,
             )
         return 2 if diagnostics.category else result
     except BaseException:
@@ -1116,7 +1123,7 @@ def _run_model_test(harness: str, diagnostics: RunDiagnostics | None = None,
 def _run_model_session(
     harness: str, inherited: dict[str, str], auth_variable: str,
     auth_path: Path, run_root: Path, secret: dict[str, str], tmux_root: Path,
-    diagnostics: RunDiagnostics,
+    diagnostics: RunDiagnostics, *, notify_owner_tool=False,
 ) -> int:
     wolts_dir = run_root / "wolts"
     wolt_dir = wolts_dir / TEST_WOLT
@@ -1126,6 +1133,8 @@ def _run_model_session(
         run_root, wolts_dir, harness, auth_variable, auth_path,
         host, port, inherited, tmux_root,
     )
+    if notify_owner_tool:
+        env["WOLTSPACE_NOTIFY_TOOL"] = "1"
     if "WHATSAPP_AGENT_TOKEN" in env:
         raise RuntimeError("refusing to start with WhatsApp credentials in child environment")
 
@@ -1141,6 +1150,7 @@ def _run_model_session(
     server_errors: list[str] = []
     verified_session = ""
     send_gate = None
+    counter = None
     run_log = run_root / "runner.log"
     fd = os.open(run_log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     log_stream = os.fdopen(fd, "w", encoding="utf-8", buffering=1)
@@ -1157,9 +1167,16 @@ def _run_model_session(
             import server.app as server_app
             import server.notify as notify
 
-            notify.dotenv_env = lambda name: secret["value"] if name == "WHATSAPP_AGENT_TOKEN" else ""
+            notify.dotenv_env = lambda name: {
+                "WHATSAPP_AGENT_TOKEN": secret["value"],
+                "WOLTSPACE_NOTIFY_TOOL": "1" if notify_owner_tool else "",
+            }.get(name, "")
+            # Reuse the existing body-blind counter; owner-only mode refuses
+            # CLI fallback before the real application/sender is reached.
+            from scripts.whatsapp_startup_inspection import _NotifyCounter
+            counter = _NotifyCounter(server_app.app, owner_only=notify_owner_tool)
             config = uvicorn.Config(
-                server_app.app, host=host, port=port, log_level="error",
+                counter, host=host, port=port, log_level="error",
                 access_log=False, log_config=None, lifespan="off",
             )
             server = uvicorn.Server(config)
@@ -1197,7 +1214,8 @@ def _run_model_session(
             original_start = adapter.start_claude_session
 
             def approval_start(prompt, **kwargs):
-                return original_start(prompt + "\n" + NOTIFY_APPROVAL_INSTRUCTION, **kwargs)
+                return original_start(prompt + "\n" + (NOTIFY_OWNER_INSTRUCTION if notify_owner_tool
+                                                       else NOTIFY_APPROVAL_INSTRUCTION), **kwargs)
 
             adapter.start_claude_session = approval_start
             activation = int(time.time())
@@ -1305,6 +1323,10 @@ def _run_model_session(
                     dispatch=dispatch_test_message,
                 )
                 routes = adapter.load(adapter.ROUTES)
+                if notify_owner_tool and (counter.legacy_count or counter.owner_count > 1):
+                    diagnostics.enter("notify")
+                    diagnostics.fail("notify_rejected")
+                    raise RuntimeError("owner-tool-only request boundary refused fallback or duplicate")
                 if diagnostics.category:
                     raise RuntimeError("an isolated startup or control reply check failed")
                 if phase["unexpected"]:
@@ -1348,10 +1370,14 @@ def _run_model_session(
                             deadline = time.monotonic() + TIMEOUT_SECONDS
                             approval_started = True
                             next_notice = time.monotonic() + 15
-                            _print_approval_notice(
-                                record["runtime"].get("tmux_session_name", ""),
-                                tmux_root, TIMEOUT_SECONDS,
-                            )
+                            if notify_owner_tool:
+                                _say("Verified private session; waiting for one owner-tool notification. "
+                                     "No attachment or approval interaction is required.")
+                            else:
+                                _print_approval_notice(
+                                    record["runtime"].get("tmux_session_name", ""),
+                                    tmux_root, TIMEOUT_SECONDS,
+                                )
                     if diagnostics.checks["harness_boot"] != "passed":
                         diagnostics.enter("harness_boot")
                         process_status = _harness_process_status(session_name, harness)
@@ -1360,7 +1386,11 @@ def _run_model_session(
                             "absent" if process_status is False else "unknown",
                         )
                         symptom = _capture_boot_symptom(env, session_name, visible_only=True)
-                        if not _observe_notify_approval(diagnostics, symptom):
+                        if notify_owner_tool and symptom in {"trust_or_approval", "waiting_for_input"}:
+                            # Instruction echoes do not establish an actual prompt.
+                            diagnostics.set_boot_symptom(symptom)
+                            diagnostics.set_harness_readiness("unknown")
+                        elif notify_owner_tool or not _observe_notify_approval(diagnostics, symptom):
                             if _handle_boot_symptom(diagnostics, symptom):
                                 raise RuntimeError("the isolated harness has an actionable boot prompt")
                             readiness = _harness_readiness_status(session_name, harness)
@@ -1379,6 +1409,10 @@ def _run_model_session(
                     verified_session = send_gate.verified_session
                 if (verified_session == send_gate.verified_session
                         and _confirmed_notify(send_gate, session_name, diagnostics)):
+                    if notify_owner_tool and (counter.owner_count != 1 or counter.legacy_count != 0):
+                        diagnostics.enter("notify")
+                        diagnostics.fail("notify_rejected")
+                        raise RuntimeError("owner-tool request counts did not match")
                     delivered = True
                     break
                 if server_errors:
@@ -1386,7 +1420,8 @@ def _run_model_session(
                     diagnostics.fail("server_start_failed")
                     raise RuntimeError("the isolated local server stopped unexpectedly")
                 if approval_started and send_gate.status == "ready" and time.monotonic() >= next_notice:
-                    _say("Approval-needed task still pending; no notify attempt observed. "
+                    _say(("Owner-tool task still pending; no notify attempt observed. " if notify_owner_tool
+                          else "Approval-needed task still pending; no notify attempt observed. ") +
                          f"Remaining observation budget: {max(0, int(deadline-time.monotonic()))}s.")
                     next_notice = time.monotonic() + 15
             if not delivered:
@@ -1402,7 +1437,7 @@ def _run_model_session(
                     diagnostics.fail("harness_boot_unconfirmed")
                 else:
                     diagnostics.enter("notify")
-                    if approval_started and send_gate.status == "ready":
+                    if not notify_owner_tool and approval_started and send_gate.status == "ready":
                         _say("Approval-needed task did not complete before the observation deadline; "
                              "no notify attempt observed. This does not prove approval was denied. Cleaning up.")
                         diagnostics.fail("approval_not_completed")
@@ -1423,6 +1458,13 @@ def _run_model_session(
             server, server_thread, listener, session_name, env, tmux_root,
         )
         diagnostics.checks["cleanup"] = "passed" if cleanup_ok else "failed"
+        if notify_owner_tool and counter is not None:
+            # On successful cleanup the local server is stopped/drained.
+            # A cleanup failure remains a failed test, regardless of counts.
+            _say(f"Owner-tool requests={counter.owner_count} legacy-notify={counter.legacy_count}.")
+            if not diagnostics.category and (counter.owner_count != 1 or counter.legacy_count != 0):
+                diagnostics.enter("notify")
+                diagnostics.fail("notify_rejected")
         if not cleanup_ok and not diagnostics.category:
             diagnostics.category = "cleanup_failed"
         if adapter is not None:
@@ -1436,7 +1478,9 @@ def _run_model_session(
         sys.stdout, sys.stderr = original_stdout, original_stderr
         log_stream.close()
         _remove_raw_log(run_root)
-        if not cleanup_ok:
+        if cleanup_ok:
+            _say("Model test cleanup=passed.")
+        else:
             _say("Cleanup needs attention; the private test directory was retained.")
 
 
@@ -1445,6 +1489,8 @@ def main() -> int:
     parser.add_argument("--run", action="store_true", help="run the guarded live model-session test")
     parser.add_argument("--harness", choices=("codex",),
                         help="use this already-authorized harness login path")
+    parser.add_argument("--notify-owner-tool", action="store_true",
+                        help="require owner tool only, with no CLI fallback or approval interaction")
     args = parser.parse_args()
     if not args.run or not args.harness:
         parser.error("both --run and --harness are required")
@@ -1454,7 +1500,8 @@ def main() -> int:
         if input("This starts one real model session in private test state. Type MODEL to continue: ").strip() != "MODEL":
             print("Cancelled; no key was read and no process was started.")
             return 1
-        result = _run_model_test(args.harness, diagnostics)
+        result = (_run_model_test(args.harness, diagnostics, notify_owner_tool=True)
+                  if args.notify_owner_tool else _run_model_test(args.harness, diagnostics))
         if result and diagnostics.category:
             _say(_diagnostic_line(diagnostics))
         return result

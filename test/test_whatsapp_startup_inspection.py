@@ -497,3 +497,26 @@ print("offline_startup_ok")
         assert "Observation budget:" in result.stdout
     if scenario in {"probe_approval_timeout", "probe_approval_echo_timeout"}:
         assert "This does not prove approval was denied. Cleaning up." in result.stdout
+
+
+def test_owner_only_counter_refuses_legacy_and_duplicate_before_app():
+    import asyncio
+    from scripts.whatsapp_startup_inspection import _NotifyCounter
+    reached, responses = [], []
+    async def app(scope, receive, send):
+        reached.append(scope["path"])
+        await send({"type":"http.response.start", "status":200, "headers":[]})
+        await send({"type":"http.response.body", "body":b""})
+    async def receive():
+        raise AssertionError("refused calls must not consume a body")
+    async def send(item):
+        if item["type"] == "http.response.start":
+            responses.append(item["status"])
+    async def run():
+        counter = _NotifyCounter(app, owner_only=True)
+        for path in ("/notify", "/notify/owner", "/notify/owner"):
+            await counter({"type":"http", "path":path}, receive, send)
+        assert counter.owner_count == 2 and counter.legacy_count == 1
+    asyncio.run(run())
+    assert reached == ["/notify/owner"]
+    assert responses == [409, 200, 409]
