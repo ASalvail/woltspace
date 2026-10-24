@@ -412,3 +412,75 @@ def test_repeated_cancellation_closes_late_file_lock(monkeypatch, tmp_path):
         release_worker.set()
         assert await asyncio.to_thread(closed.wait, 2)
     asyncio.run(run())
+
+
+@__import__("pytest").mark.parametrize("fault,status,code,category,submission", [
+    ("non2xx", 400, 100, "none", "http_response_received"),
+    ("invalid_key", 401, 100, "terminal_configuration", "http_response_received"),
+    ("rate_exhaustion", 429, None, "rate_limited", "http_response_received"),
+    ("timeout", None, None, "timeout", "unknown"),
+    ("connection", None, None, "connection", "unknown"),
+    ("other", None, None, "other", "unknown"),
+    ("unlisted_code", 500, None, "other", "http_response_received"),
+])
+@__import__("pytest").mark.parametrize("operation", ["selection", "session_ack"])
+def test_control_reply_tracking_retains_only_fixed_safe_fields(
+    monkeypatch, tmp_path, fault, status, code, category, submission, operation,
+):
+    import contextlib
+    import urllib.error
+    from scripts import whatsapp_model_session_test as runner
+    adapter = _load_adapter(monkeypatch, tmp_path)
+    calls, sleeps = [], []
+    raw_private = "synthetic-key user:private nonce-private https://private.invalid Authorization: Bearer private"
+    def transport(*args, **kwargs):
+        calls.append(1)
+        if fault == "timeout":
+            raise TimeoutError(raw_private)
+        if fault == "connection":
+            raise urllib.error.URLError(ConnectionRefusedError(raw_private))
+        if fault == "other":
+            raise RuntimeError(raw_private)
+        body = {"error": {"code": 100 if fault == "invalid_key" else "private" if fault == "unlisted_code" else 999,
+                          "message": raw_private, "access_token": raw_private}}
+        raise urllib.error.HTTPError("https://private.invalid", status, raw_private,
+                                     {"Retry-After": "1", "Authorization": raw_private},
+                                     io.BytesIO(json.dumps(body).encode()))
+    monkeypatch.setattr(adapter.urllib.request, "urlopen", transport)
+    monkeypatch.setattr(adapter, "request_slot", lambda *args: contextlib.nullcontext())
+    monkeypatch.setattr(adapter.time, "sleep", sleeps.append)
+    api = adapter.api
+    if fault == "non2xx":
+        api = lambda *_: (400, {"error": {"code":100, "message":raw_private}})
+    diagnostics = runner.RunDiagnostics("codex")
+    tracked = runner._track_adapter_replies(api, diagnostics)
+    body = "Selected wa-test. fixed" if operation == "selection" else "Session started: fixed"
+    try:
+        tracked("POST", "/messages", {"to":"user:private", "text":{"body":body}})
+    except Exception:
+        pass
+    expected = {"operation":operation, "call_attempted":True, "submission":submission,
+                "http_status":status, "provider_code":code, "exception":category}
+    record = diagnostics.as_record()
+    assert record["control_reply"] == expected
+    assert runner._valid_diagnostic_record(record)
+    assert record["checks"]["selection_reply" if operation == "selection" else "session_ack"] == "failed"
+    assert len(calls) == (0 if fault == "non2xx" else 3 if fault == "rate_exhaustion" else 1)
+    assert sleeps == ([1, 1] if fault == "rate_exhaustion" else [])
+    path = runner._write_failure_record(tmp_path, diagnostics)
+    stored = path.read_text()
+    assert all(value not in stored for value in (raw_private, "private.invalid", "Bearer", "user:private", body))
+    assert runner._valid_diagnostic_record(json.loads(stored))
+
+
+def test_invalid_key_get_metadata_is_typed_without_body(monkeypatch, tmp_path):
+    import urllib.error
+    adapter = _load_adapter(monkeypatch, tmp_path)
+    def transport(*args, **kwargs):
+        raise urllib.error.HTTPError("https://private.invalid", 400, "private", {},
+            io.BytesIO(b'{"error":{"code":100,"message":"private-key"}}'))
+    monkeypatch.setattr(adapter.urllib.request, "urlopen", transport)
+    with __import__("pytest").raises(adapter.WhatsAppConfigurationError) as caught:
+        adapter._api_request("GET", "/updates?offset=0")
+    assert caught.value.http_status == 400 and caught.value.provider_code == 100
+    assert "private-key" not in str(caught.value)

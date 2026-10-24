@@ -102,6 +102,30 @@ CLI acceptance does not establish real-provider acceptance of the new tool path.
 The tool path has passed one bounded local mocked-outbound Codex test without
 owner interaction. Its real WhatsApp acceptance remains pending review/testing.
 
+## Fixed failure diagnostics
+
+Future private model-run failure records use schema 4 (the reader also accepts
+unchanged schemas 2/3). Control replies record only `selection`/`session_ack`,
+whether the API function was called, a valid HTTP status if available, documented
+numeric provider code `100` if present, and an exception category: timeout,
+connection, terminal configuration, rate limited or other. No body, exception
+text, URL, header, participant, prompt or credential is retained.
+
+`call_attempted=true` means entry to the API wrapper, including its rate/lock
+wait; it does not prove provider submission. `submission=unknown` includes
+ambiguous timeout/connection outcomes. `http_response_received` establishes an
+HTTP response, not successful delivery. These facts cannot retroactively identify
+the cause of an earlier generic selection-reply failure. Do not replay a nonce
+or retry a potentially delivered message without review.
+
+Cleanup records independent API-server, listener, session, tmux and finalization
+outcomes. An absent tmux socket is treated as stopped only after validating the
+exact private owned 0700 base/run/socket-parent directories and `lstat` absence.
+Permission, foreign ownership, symlink or unverified states fail closed and
+retain evidence. Report the fixed failure line; never dump private raw logs or
+auth/key files. Diagnostic changes alone are not a fix for an unknown provider
+failure and do not authorize another live attempt.
+
 ## Local owner-tool acceptance (completed bounded diagnostic)
 
 The optional stdio owner tool has a separate bounded diagnostic that uses the

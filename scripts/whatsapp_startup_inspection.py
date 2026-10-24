@@ -481,7 +481,7 @@ def _run_startup_session(
         ) if capture_snapshot else None
         diagnostics.enter("cleanup")
         with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
-            cleanup_ok = model._cleanup_resources(server, thread, listener, session, env, tmux_root)
+            cleanup_ok = model._cleanup_resources(server, thread, listener, session, env, tmux_root, diagnostics)
         diagnostics.set_check("cleanup", "passed" if cleanup_ok else "failed")
         if not cleanup_ok:
             diagnostics.fail("cleanup_failed")

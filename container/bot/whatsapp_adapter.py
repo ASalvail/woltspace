@@ -37,14 +37,23 @@ LOCK = STATE / f"poll-{ACCOUNT}.lock"
 RODENT_TYPES = {"raccoon", "beaver", "otter", "rodent"}
 
 
-class WhatsAppConfigurationError(RuntimeError):
+class WhatsAppAPIError(RuntimeError):
+    """Safe typed metadata; no provider body/header/URL retained."""
+    def __init__(self, message, *, http_status=None, provider_code=None):
+        self.http_status = http_status if type(http_status) is int and 100 <= http_status <= 599 else None
+        self.provider_code = provider_code if type(provider_code) is int and provider_code == 100 else None
+        super().__init__(message)
+
+
+class WhatsAppConfigurationError(WhatsAppAPIError):
     """An account or poller conflict needs operator action, not retries."""
 
 
-class WhatsAppRateLimit(RuntimeError):
-    def __init__(self, retry_after: int = 5):
+class WhatsAppRateLimit(WhatsAppAPIError):
+    def __init__(self, retry_after: int = 5, *, provider_code=None):
         self.retry_after = max(1, min(60, retry_after))
-        super().__init__("WhatsApp Agent API rate limit reached")
+        super().__init__("WhatsApp Agent API rate limit reached", http_status=429,
+                         provider_code=provider_code)
 
 
 def eligible_wolts() -> dict[str, dict]:
@@ -84,33 +93,40 @@ def _api_request(method: str, path: str, payload: dict | None = None) -> tuple[i
         # Do not surface response bodies: they may echo submitted content.
         if exc.code == 204:
             return 204, {}
+        # Parse only a documented allowlisted numeric error code. The bounded
+        # body is consumed opaquely and never retained/logged with the error.
+        provider_code = None
+        try:
+            error = json.loads(exc.read(4097)).get("error", {})
+            code = error.get("code") if isinstance(error, dict) else None
+            if type(code) is int and code == 100:
+                provider_code = code
+        except (OSError, AttributeError, TypeError, ValueError):
+            pass
         if exc.code in (401, 403):
             raise WhatsAppConfigurationError(
-                f"WhatsApp Agent API authentication failed (HTTP {exc.code}); check the Agent API key"
+                f"WhatsApp Agent API authentication failed (HTTP {exc.code}); check the Agent API key",
+                http_status=exc.code, provider_code=provider_code,
             ) from None
         if exc.code == 400 and method == "GET" and path.startswith("/updates?"):
-            # The Agent Platform documents error code 100 for an invalid key.
-            # Read only to classify it; never surface the response body.
-            try:
-                error = json.loads(exc.read()).get("error", {})
-                invalid_key = isinstance(error, dict) and error.get("code") == 100
-            except (AttributeError, TypeError, ValueError):
-                invalid_key = False
-            if invalid_key:
+            if provider_code == 100:
                 raise WhatsAppConfigurationError(
-                    "WhatsApp Agent API rejected the key (HTTP 400, error 100); check the Agent API key"
+                    "WhatsApp Agent API rejected the key (HTTP 400, error 100); check the Agent API key",
+                    http_status=400, provider_code=100,
                 ) from None
         if exc.code == 409:
             raise WhatsAppConfigurationError(
-                "WhatsApp Agent API rejected this poller (HTTP 409); verify there is only one active poller"
+                "WhatsApp Agent API rejected this poller (HTTP 409); verify there is only one active poller",
+                http_status=409, provider_code=provider_code,
             ) from None
         if exc.code == 429:
             try:
                 retry_after = int(exc.headers.get("Retry-After", "5")) if exc.headers else 5
             except (TypeError, ValueError):
                 retry_after = 5
-            raise WhatsAppRateLimit(retry_after) from None
-        raise RuntimeError(f"WhatsApp Agent API request failed (HTTP {exc.code})") from None
+            raise WhatsAppRateLimit(retry_after, provider_code=provider_code) from None
+        raise WhatsAppAPIError(f"WhatsApp Agent API request failed (HTTP {exc.code})",
+                               http_status=exc.code, provider_code=provider_code) from None
 
 
 def atomic_json(path: Path, value: dict) -> None:

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import errno
 import hashlib
 import io
 import json
@@ -25,6 +26,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+import urllib.error
 import re
 from pathlib import Path
 from typing import Any
@@ -87,6 +89,15 @@ _FAILURE_CATEGORIES = {
     "cleanup_failed", "internal_error",
 }
 
+_CONTROL_EXCEPTIONS = {"none", "timeout", "connection", "terminal_configuration", "rate_limited", "other"}
+_CLEANUP_COMPONENTS = {"api_server", "listener", "session", "tmux", "finalize"}
+_CLEANUP_STATES = {"not_checked", "not_needed", "passed", "failed", "retained"}
+
+
+def _empty_control_reply():
+    return {"operation": "none", "call_attempted": False, "submission": "not_attempted",
+            "http_status": None, "provider_code": None, "exception": "none"}
+
 
 class RunDiagnostics:
     """Fixed-schema status only; never stores exception, prompt, or identity text."""
@@ -105,6 +116,8 @@ class RunDiagnostics:
         self.harness_process = "not_checked"
         self.harness_readiness = "not_checked"
         self.boot_symptom = "not_checked"
+        self.control_reply = _empty_control_reply()
+        self.cleanup_components = dict.fromkeys(_CLEANUP_COMPONENTS, "not_checked")
 
     def enter(self, stage: str) -> None:
         with self._lock:
@@ -170,10 +183,15 @@ class RunDiagnostics:
                     "cleanup": "cleanup_failed",
                 }.get(self.stage, "internal_error")
 
+    def set_cleanup(self, component, state):
+        with self._lock:
+            if component in _CLEANUP_COMPONENTS and state in _CLEANUP_STATES:
+                self.cleanup_components[component] = state
+
     def as_record(self) -> dict[str, Any]:
         with self._lock:
             return {
-                "schema": 3,
+                "schema": 4,
                 "harness": self.harness,
                 "stage": self.failure_stage or self.stage,
                 "category": self.category or "internal_error",
@@ -184,6 +202,8 @@ class RunDiagnostics:
                 "harness_process": self.harness_process,
                 "harness_readiness": self.harness_readiness,
                 "boot_symptom": self.boot_symptom,
+                "control_reply": dict(self.control_reply),
+                "cleanup_components": dict(self.cleanup_components),
             }
 
 
@@ -285,14 +305,35 @@ def _valid_diagnostic_record(record: Any) -> bool:
         return isinstance(value, str) and value in choices
 
     if (not isinstance(record, dict) or type(record.get("schema")) is not int
-            or record["schema"] not in {2, 3}):
+            or record["schema"] not in {2, 3, 4}):
         return False
     keys = {"schema", "harness", "stage", "category", "checks", "notify_attempt",
             "harness_process", "harness_readiness", "boot_symptom"}
-    if record["schema"] == 3:
+    if record["schema"] >= 3:
         keys |= {"notify_rejection", "notify_payload_shape"}
         if (not enum(record.get("notify_rejection"), _NOTIFY_REJECTIONS)
                 or not enum(record.get("notify_payload_shape"), _NOTIFY_PAYLOAD_SHAPES)):
+            return False
+    if record["schema"] == 4:
+        keys |= {"control_reply", "cleanup_components"}
+        control = record.get("control_reply")
+        cleanup = record.get("cleanup_components")
+        if (not isinstance(control, dict) or set(control) != set(_empty_control_reply())
+                or not enum(control.get("operation"), {"none", "selection", "session_ack"})
+                or type(control.get("call_attempted")) is not bool
+                or not enum(control.get("submission"), {"not_attempted", "unknown", "http_response_received"})
+                or not (control.get("http_status") is None or type(control.get("http_status")) is int and 100 <= control["http_status"] <= 599)
+                or not (control.get("provider_code") is None or type(control.get("provider_code")) is int and control["provider_code"] == 100)
+                or not enum(control.get("exception"), _CONTROL_EXCEPTIONS)
+                or not isinstance(cleanup, dict) or set(cleanup) != _CLEANUP_COMPONENTS
+                or not all(enum(value, _CLEANUP_STATES) for value in cleanup.values())):
+            return False
+        if not control["call_attempted"]:
+            if control != _empty_control_reply():
+                return False
+        elif (control["operation"] == "none" or control["submission"] == "not_attempted"
+              or (control["submission"] == "http_response_received") != (control["http_status"] is not None)
+              or control["provider_code"] is not None and control["http_status"] is None):
             return False
     return bool(
         set(record) == keys
@@ -328,11 +369,21 @@ def _diagnostic_line(diagnostics: RunDiagnostics) -> str:
         rejection = rejection if isinstance(rejection, str) and rejection in _NOTIFY_REJECTIONS else "none"
         shape = shape if isinstance(shape, str) and shape in _NOTIFY_PAYLOAD_SHAPES else "other"
         line += f" notify_rejection={rejection} notify_payload_shape={shape}."
+    record = diagnostics.as_record()
+    if _valid_diagnostic_record(record):
+        control = record["control_reply"]
+        if control["call_attempted"]:
+            line += (f" control_operation={control['operation']} call_attempted=true"
+                     f" submission={control['submission']} http_status={control['http_status']}"
+                     f" provider_code={control['provider_code']} exception={control['exception']}.")
+        failed = sorted(name for name, state in record["cleanup_components"].items() if state == "failed")
+        if failed:
+            line += " cleanup_failed_components=" + ",".join(failed) + "."
     return line
 
 
 def _track_adapter_replies(real_api, diagnostics: RunDiagnostics):
-    """Track only success/failure of the two expected adapter control replies."""
+    """Retain fixed metadata only, never provider bodies or exception text."""
     def tracked(method: str, path: str, payload: dict | None = None):
         body = ((payload or {}).get("text") or {}).get("body", "")
         if method == "POST" and path == "/messages" and body.startswith("Selected wa-test."):
@@ -342,14 +393,48 @@ def _track_adapter_replies(real_api, diagnostics: RunDiagnostics):
         else:
             return real_api(method, path, payload)
         diagnostics.enter(stage)
+        # Call admission is NOT evidence that network/provider submission occurred.
+        diagnostics.control_reply = dict(_empty_control_reply(),
+            operation="selection" if stage == "selection_reply" else "session_ack",
+            call_attempted=True, submission="unknown")
+        def response_metadata(status, code=None):
+            if type(status) is int and 100 <= status <= 599:
+                diagnostics.control_reply["http_status"] = status
+                diagnostics.control_reply["submission"] = "http_response_received"
+            if type(code) is int and code == 100:
+                diagnostics.control_reply["provider_code"] = code
         try:
             result = real_api(method, path, payload)
-        except Exception:
+        except Exception as exc:
+            module = sys.modules.get(getattr(real_api, "__module__", ""))
+            api_error = getattr(module, "WhatsAppAPIError", ())
+            if isinstance(exc, api_error):
+                response_metadata(exc.http_status, exc.provider_code)
+            reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+            if isinstance(reason, TimeoutError):
+                category = "timeout"
+            elif isinstance(reason, ConnectionError) or isinstance(reason, OSError) and reason.errno in {
+                    errno.ECONNREFUSED, errno.ECONNRESET, errno.ENETUNREACH, errno.EHOSTUNREACH}:
+                category = "connection"
+            elif isinstance(exc, getattr(module, "WhatsAppConfigurationError", ())):
+                category = "terminal_configuration"
+            elif isinstance(exc, getattr(module, "WhatsAppRateLimit", ())):
+                category = "rate_limited"
+            else:
+                category = "other"
+            diagnostics.control_reply["exception"] = category
             diagnostics.set_check(stage, "failed")
             if stage == "selection_reply":
                 diagnostics.fail("adapter_reply_failed")
             raise
-        if isinstance(result, tuple) and result and isinstance(result[0], int) and 200 <= result[0] < 300:
+        if isinstance(result, tuple) and result:
+            response_metadata(result[0])
+            # Only numeric allowlisted code; never retain any response body.
+            if len(result) > 1 and isinstance(result[1], dict):
+                error = result[1].get("error")
+                if isinstance(error, dict):
+                    response_metadata(result[0], error.get("code"))
+        if isinstance(result, tuple) and result and type(result[0]) is int and 200 <= result[0] < 300:
             diagnostics.passed(stage)
         else:
             diagnostics.set_check(stage, "failed")
@@ -499,6 +584,7 @@ def _prepare_private_tmux_dir(run_root: Path, base: Path | None = None) -> Path:
     if (stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode)
             or info.st_uid != uid or stat.S_IMODE(info.st_mode) != 0o700):
         raise RuntimeError("private tmux run directory ownership check failed")
+    (tmux_tmp / f"tmux-{uid}").mkdir(mode=0o700)
     socket_path = tmux_tmp / f"tmux-{uid}" / "default"
     # Linux sockaddr_un.sun_path reserves 108 bytes including the NUL.
     if len(os.fsencode(socket_path)) >= 108:
@@ -797,7 +883,50 @@ def _remove_stale_private_socket(tmux_root: Path) -> bool:
         return False
 
 
+def _validated_private_socket(env: dict[str, str], tmux_root: Path) -> Path | None:
+    """Validate exact private owned directories; never follow socket symlinks."""
+    try:
+        base = PRIVATE_TMUX_BASE
+        if (tmux_root.parent.resolve() != base.resolve()
+                or not re.fullmatch(r"(?:model|startup)-[A-Za-z0-9_-]{1,40}", tmux_root.name)
+                or env.get("TMUX_TMPDIR") != str(tmux_root)):
+            return None
+        parent = tmux_root / f"tmux-{os.getuid()}"
+        for directory in (base, tmux_root, parent):
+            info = directory.lstat()
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) != 0o700):
+                return None
+        socket = parent / "default"
+        try:
+            info = socket.lstat()
+            if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
+                return None
+        except FileNotFoundError:
+            pass
+        return socket
+    except (OSError, ValueError):
+        return None
+
+
+def _socket_absent(socket: Path) -> bool:
+    try:
+        socket.lstat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        pass
+    return False
+
+
 def _kill_private_tmux(env: dict[str, str], tmux_root: Path) -> bool:
+    socket = _validated_private_socket(env, tmux_root)
+    if socket is None:
+        return False
+    if _socket_absent(socket):
+        # Exact owned socket parent validated above; no tmux command/error
+        # string is needed for the never-created/already-removed case.
+        return True
     try:
         status, socket_path, error = _tmux_value(
             env, "display-message", "-p", "#{socket_path}",
@@ -809,9 +938,7 @@ def _kill_private_tmux(env: dict[str, str], tmux_root: Path) -> bool:
         # nonzero result that proves cleanup is already complete.
         return ("no server running" in error.lower()
                 and _remove_stale_private_socket(tmux_root))
-    try:
-        Path(socket_path).resolve().relative_to(tmux_root.resolve())
-    except ValueError:
+    if Path(socket_path) != socket:
         return False
     try:
         status, _, _ = _tmux_value(env, "kill-server")
@@ -918,45 +1045,52 @@ class OneNonceSendGate:
 
 def _cleanup_resources(
     server, server_thread, listener, session_name: str, env: dict[str, str],
-    tmux_root: Path, *, stop_session_fn=None, kill_tmux_fn=None,
+    tmux_root: Path, diagnostics=None, *, stop_session_fn=None, kill_tmux_fn=None,
 ) -> bool:
-    """Attempt every independent cleanup step and report aggregate certainty."""
-    ok = True
+    """Attempt all independent steps, retaining only fixed component outcomes."""
+    outcomes = dict.fromkeys(("api_server", "listener", "session", "tmux"), "not_needed")
+    server_ok = True
     if server is not None:
+        outcomes["api_server"] = "passed"
         try:
             server.should_exit = True
         except Exception:
-            ok = False
+            server_ok = False
     if server_thread is not None:
+        outcomes["api_server"] = "passed"
         try:
             server_thread.join(timeout=10)
             if server_thread.is_alive():
-                ok = False
+                server_ok = False
         except Exception:
-            ok = False
+            server_ok = False
+    if not server_ok:
+        outcomes["api_server"] = "failed"
     if listener is not None:
         try:
             listener.close()
+            outcomes["listener"] = "passed"
         except Exception:
-            ok = False
+            outcomes["listener"] = "failed"
     if session_name:
         try:
             if stop_session_fn is None:
                 from sessions import stop_session as stop_session_fn
             result = stop_session_fn(session_name)
-            if not isinstance(result, dict) or result.get("status") != "stopped":
-                ok = False
+            outcomes["session"] = ("passed" if isinstance(result, dict)
+                                   and result.get("status") == "stopped" else "failed")
         except Exception:
-            ok = False
-    # Do this even if session or API-server cleanup failed; each is independent.
+            outcomes["session"] = "failed"
     try:
         if kill_tmux_fn is None:
             kill_tmux_fn = _kill_private_tmux
-        if not kill_tmux_fn(env, tmux_root):
-            ok = False
+        outcomes["tmux"] = "passed" if kill_tmux_fn(env, tmux_root) else "failed"
     except Exception:
-        ok = False
-    return ok
+        outcomes["tmux"] = "failed"
+    if diagnostics is not None:
+        for component, state in outcomes.items():
+            diagnostics.set_cleanup(component, state)
+    return "failed" not in outcomes.values()
 
 
 def _finalize_run_root(run_root: Path, cleanup_ok: bool,
@@ -1099,6 +1233,9 @@ def _run_model_test(harness: str, diagnostics: RunDiagnostics | None = None,
         sys.path[:] = old_path
         if run_root.exists():
             _remove_raw_log(run_root)
+            # Persist the intended retention/finalization outcome before
+            # finalizer removes everything except this fixed failure record.
+            diagnostics.set_cleanup("finalize", "retained" if diagnostics.checks["cleanup"] == "failed" else "passed")
             if diagnostics.category:
                 try:
                     _write_failure_record(run_root, diagnostics)
@@ -1112,6 +1249,7 @@ def _run_model_test(harness: str, diagnostics: RunDiagnostics | None = None,
                     getattr(diagnostics, "private_snapshot_written", False)),
             )
             if not finalized:
+                diagnostics.set_cleanup("finalize", "failed" if cleanup_ok else "retained")
                 diagnostics.enter("cleanup")
                 diagnostics.fail("cleanup_failed")
                 try:
@@ -1455,7 +1593,7 @@ def _run_model_session(
     finally:
         diagnostics.enter("cleanup")
         cleanup_ok = _cleanup_resources(
-            server, server_thread, listener, session_name, env, tmux_root,
+            server, server_thread, listener, session_name, env, tmux_root, diagnostics,
         )
         diagnostics.checks["cleanup"] = "passed" if cleanup_ok else "failed"
         if notify_owner_tool and counter is not None:

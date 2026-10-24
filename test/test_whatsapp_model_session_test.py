@@ -135,7 +135,7 @@ def test_failure_record_has_only_sanitized_schema_and_private_mode(tmp_path):
     data = __import__("json").loads(text)
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert data == {
-        "schema": 3,
+        "schema": 4,
         "harness": "codex",
         "stage": "harness_boot",
         "category": "auth_or_config",
@@ -152,13 +152,18 @@ def test_failure_record_has_only_sanitized_schema_and_private_mode(tmp_path):
         "harness_process": "not_checked",
         "harness_readiness": "not_checked",
         "boot_symptom": "not_checked",
+        "control_reply": model_test._empty_control_reply(),
+        "cleanup_components": dict.fromkeys(model_test._CLEANUP_COMPONENTS, "not_checked"),
     }
     assert all(term not in text for term in (
         "synthetic-whatsapp-secret", "participant=", "private prompt",
         "raw exception", "opaque",
     ))
     assert model_test._valid_diagnostic_record(data)
-    legacy = dict(data, schema=2)
+    previous = dict(data, schema=3)
+    del previous["control_reply"], previous["cleanup_components"]
+    assert model_test._valid_diagnostic_record(previous)
+    legacy = dict(previous, schema=2)
     del legacy["notify_rejection"], legacy["notify_payload_shape"]
     assert model_test._valid_diagnostic_record(legacy)
     data["notify_attempt"] = "raw prompt text"
@@ -677,7 +682,7 @@ def test_rejection_reason_and_shape_are_fixed_and_survive_private_record(tmp_pat
 def test_new_diagnostic_fields_reject_non_enum_values(field, value):
     diagnostics = model_test.RunDiagnostics("codex")
     record = diagnostics.as_record()
-    assert record["schema"] == 3 and model_test._valid_diagnostic_record(record)
+    assert record["schema"] == 4 and model_test._valid_diagnostic_record(record)
     record[field] = value
     assert not model_test._valid_diagnostic_record(record)
     diagnostics.set_notify_details(rejection=value, payload_shape=value)
@@ -834,24 +839,43 @@ def test_cleanup_attempts_tmux_even_when_session_and_server_cleanup_fail(tmp_pat
     assert calls == ["join", "close", "tmux"]
 
 
-def test_private_tmux_cleanup_only_accepts_confirmed_absence(tmp_path, monkeypatch):
-    env = {"WOLTSPACE_TMUX_BIN": "tmux"}
-    monkeypatch.setattr(
-        model_test, "_tmux_value",
-        lambda *_: (1, "", "no server running on /private/tmux/default"),
-    )
-    assert model_test._kill_private_tmux(env, tmp_path)
-    monkeypatch.setattr(
-        model_test, "_tmux_value",
-        lambda *_: (1, "", "permission denied"),
-    )
-    assert not model_test._kill_private_tmux(env, tmp_path)
+@pytest.fixture
+def short_cleanup_base():
+    with tempfile.TemporaryDirectory(prefix=".wt-", dir=ROOT.parents[2]) as name:
+        yield Path(name)
+
+
+def test_private_tmux_cleanup_only_accepts_confirmed_absence(short_cleanup_base, monkeypatch):
+    import socket
+    tmp_path = short_cleanup_base
+    os.chmod(tmp_path, 0o700)
+    monkeypatch.setattr(model_test, "PRIVATE_TMUX_BASE", tmp_path)
+    run = tmp_path / "model-test"
+    root = model_test._prepare_private_tmux_dir(run, tmp_path)
+    env = {"WOLTSPACE_TMUX_BIN": "tmux", "TMUX_TMPDIR": str(root)}
+    monkeypatch.setattr(model_test, "_tmux_value", lambda *_: (_ for _ in ()).throw(AssertionError("no command needed")))
+    assert model_test._kill_private_tmux(env, root)
+    path = root / f"tmux-{os.getuid()}" / "default"
+    sock = socket.socket(socket.AF_UNIX)
+    sock.bind(str(path))
+    try:
+        monkeypatch.setattr(model_test, "_tmux_value", lambda *_: (1, "", "no server running"))
+        assert model_test._kill_private_tmux(env, root)
+        sock.close()
+        sock = socket.socket(socket.AF_UNIX)
+        sock.bind(str(path))
+        monkeypatch.setattr(model_test, "_tmux_value", lambda *_: (1, "", "permission denied"))
+        assert not model_test._kill_private_tmux(env, root)
+        assert path.exists()
+    finally:
+        sock.close()
+        path.unlink(missing_ok=True)
 
 
 def test_private_tmux_path_preflight_checks_ownership_and_linux_limit(tmp_path):
     run_root = tmp_path / "model-12345678"
     run_root.mkdir(mode=0o700)
-    with tempfile.TemporaryDirectory(prefix="wt-", dir="/tmp") as base_name:
+    with tempfile.TemporaryDirectory(prefix=".wt-", dir=ROOT.parents[2]) as base_name:
         base = Path(base_name)
         socket_dir = model_test._prepare_private_tmux_dir(run_root, base)
         assert socket_dir.parent == base
@@ -899,7 +923,7 @@ def test_path_length_preflight_happens_before_private_key_read(tmp_path, monkeyp
             __import__("shutil").rmtree(path)
 
 
-def test_real_tmux_private_socket_start_and_stop_smoke(tmp_path):
+def test_real_tmux_private_socket_start_and_stop_smoke(tmp_path, monkeypatch):
     import shutil
     import tempfile
 
@@ -908,7 +932,8 @@ def test_real_tmux_private_socket_start_and_stop_smoke(tmp_path):
         pytest.skip("tmux is not installed")
     run_root = tmp_path / "model-smoke"
     run_root.mkdir(mode=0o700)
-    with tempfile.TemporaryDirectory(prefix="wt-", dir="/tmp") as base_name:
+    with tempfile.TemporaryDirectory(prefix=".wt-", dir=ROOT.parents[2]) as base_name:
+        monkeypatch.setattr(model_test, "PRIVATE_TMUX_BASE", Path(base_name))
         tmux_root = model_test._prepare_private_tmux_dir(run_root, Path(base_name))
         env = {
             "WOLTSPACE_TMUX_BIN": tmux_bin,
@@ -965,3 +990,112 @@ def test_main_passes_explicit_owner_tool_option_without_launch(monkeypatch):
     monkeypatch.setattr(model_test, "_run_model_test", run)
     assert model_test.main() == 0
     assert calls == [("codex", {"notify_owner_tool": True})]
+
+
+@pytest.mark.parametrize("unsafe", ["parent_mode", "parent_symlink", "socket_symlink", "socket_regular", "wrong_root", "wrong_env", "foreign_owner", "permission"])
+def test_never_created_socket_cleanup_fails_closed(short_cleanup_base, monkeypatch, unsafe):
+    base = short_cleanup_base
+    monkeypatch.setattr(model_test, "PRIVATE_TMUX_BASE", base)
+    root = model_test._prepare_private_tmux_dir(base / "model-never", base)
+    parent = root / f"tmux-{os.getuid()}"
+    socket = parent / "default"
+    env = {"TMUX_TMPDIR": str(root)}
+    if unsafe == "parent_mode":
+        parent.chmod(0o755)
+    elif unsafe == "parent_symlink":
+        parent.rmdir(); parent.symlink_to(base, target_is_directory=True)
+    elif unsafe == "socket_symlink":
+        socket.symlink_to(base / "absent")
+    elif unsafe == "socket_regular":
+        socket.write_text("synthetic")
+    elif unsafe == "wrong_root":
+        monkeypatch.setattr(model_test, "PRIVATE_TMUX_BASE", base / "other")
+    elif unsafe == "wrong_env":
+        env["TMUX_TMPDIR"] = "unverified"
+    elif unsafe == "foreign_owner":
+        monkeypatch.setattr(model_test.os, "getuid", lambda: -1)
+    elif unsafe == "permission":
+        original = Path.lstat
+        def denied(path, *args, **kwargs):
+            if path == socket: raise PermissionError("synthetic-private")
+            return original(path, *args, **kwargs)
+        monkeypatch.setattr(Path, "lstat", denied)
+    monkeypatch.setattr(model_test, "_tmux_value", lambda *_: (_ for _ in ()).throw(AssertionError("must not probe foreign/unverified state")))
+    assert not model_test._kill_private_tmux(env, root)
+
+
+def test_cleanup_component_failures_persist_fixed_outcomes(tmp_path):
+    diag = model_test.RunDiagnostics("codex")
+    def fail(*_): raise RuntimeError("synthetic-private-key participant nonce")
+    server = SimpleNamespace(should_exit=False)
+    thread = SimpleNamespace(join=fail, is_alive=lambda: True)
+    listener = SimpleNamespace(close=fail)
+    assert not model_test._cleanup_resources(server, thread, listener, "synthetic", {}, tmp_path, diag,
+        stop_session_fn=fail, kill_tmux_fn=lambda *_: False)
+    assert diag.cleanup_components == {
+        "api_server":"failed", "listener":"failed", "session":"failed", "tmux":"failed", "finalize":"not_checked"}
+    diag.enter("cleanup"); diag.fail("cleanup_failed")
+    stored = model_test._write_failure_record(tmp_path, diag).read_text()
+    assert "synthetic-private" not in stored
+    assert model_test._valid_diagnostic_record(__import__('json').loads(stored))
+
+
+@pytest.mark.parametrize("field,value", [
+    ("operation","private"), ("http_status",True), ("http_status",600),
+    ("provider_code","100"), ("provider_code",999), ("exception","private"),
+    ("submission","delivered"), ("call_attempted",1),
+])
+def test_control_diagnostic_schema_rejects_untrusted_fields(field, value):
+    record = model_test.RunDiagnostics("codex").as_record()
+    record["control_reply"][field] = value
+    assert not model_test._valid_diagnostic_record(record)
+
+
+def test_cleanup_component_schema_rejects_extra_or_raw_outcomes():
+    record = model_test.RunDiagnostics("codex").as_record()
+    record["cleanup_components"]["tmux"] = "private-exception"
+    assert not model_test._valid_diagnostic_record(record)
+    record = model_test.RunDiagnostics("codex").as_record()
+    record["cleanup_components"]["private"] = "passed"
+    assert not model_test._valid_diagnostic_record(record)
+
+
+def test_private_tmux_verification_keeps_exact_root_and_token_checks(tmp_path, monkeypatch):
+    root = tmp_path / "model-verify"
+    calls = []
+    def value(env, *args):
+        calls.append(args)
+        if args[0] == "display-message":
+            return 0, str(root / "tmux-1000/default"), ""
+        return 1, "", ""
+    monkeypatch.setattr(model_test, "_tmux_value", value)
+    model_test._verify_private_tmux({}, root, "synthetic")
+    assert len(calls) == 3
+    monkeypatch.setattr(model_test, "_tmux_value", lambda *_: (0, str(tmp_path / "other/default"), ""))
+    with pytest.raises(RuntimeError, match="outside"):
+        model_test._verify_private_tmux({}, root, "synthetic")
+
+
+def test_control_diagnostics_output_is_fixed_and_submission_not_inferred():
+    diag = model_test.RunDiagnostics("codex")
+    def fail(*_): raise TimeoutError("synthetic-private-key participant nonce")
+    tracked = model_test._track_adapter_replies(fail, diag)
+    with pytest.raises(TimeoutError):
+        tracked("POST", "/messages", {"text":{"body":"Selected wa-test. private"}})
+    diag.set_cleanup("tmux", "failed")
+    output = model_test._diagnostic_line(diag)
+    assert "control_operation=selection call_attempted=true submission=unknown http_status=None provider_code=None exception=timeout" in output
+    assert "cleanup_failed_components=tmux" in output
+    assert all(value not in output for value in ("synthetic-private", "participant", "nonce", "Selected"))
+
+
+def test_control_diagnostic_schema_requires_consistent_call_response_facts():
+    record = model_test.RunDiagnostics("codex").as_record()
+    record["control_reply"]["operation"] = "selection"
+    assert not model_test._valid_diagnostic_record(record)
+    record["control_reply"].update(call_attempted=True, submission="unknown")
+    assert model_test._valid_diagnostic_record(record)
+    record["control_reply"]["http_status"] = 400
+    assert not model_test._valid_diagnostic_record(record)
+    record["control_reply"]["submission"] = "http_response_received"
+    assert model_test._valid_diagnostic_record(record)
