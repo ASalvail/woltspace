@@ -223,6 +223,15 @@ def _classify_boot_symptom(text: str) -> str:
         r"would you like to run the following command\??|approve (this|the following) command\??",
         text, re.I,
     ))
+    # Codex's MCP picker uses Allow/Cancel rather than shell Yes/No choices.
+    # Require its concrete question AND both numbered action choices.
+    mcp_tool = bool(re.search(
+        r'(?im)^\s*Allow the [A-Za-z0-9_.-]+ MCP server to run tool "[^"\n]{1,128}"\?', text,
+    )) and all(re.search(pattern, text) for pattern in (
+        r"(?im)^\s*(?:[>❯›]\s*)?\d+[.)]\s*Allow\b",
+        r"(?im)^\s*(?:[>❯›]\s*)?\d+[.)]\s*Cancel\b",
+    ))
+    tool = tool or mcp_tool
     onboarding = choices and bool(re.search(
         r"welcome to codex[\s\S]{0,300}(choose|select).{0,50}(theme|appearance)|"
         r"(choose|select).{0,50}(theme|appearance)[\s\S]{0,300}welcome to codex",

@@ -44,10 +44,16 @@ The launcher passes a per-invocation `-c mcp_servers.woltspace_notify={...}`
 definition with the absolute bundled worker and Python paths, `-I`, a fixed
 local API endpoint, session name and non-secret launch-binding digest. The
 allowlist is exactly `enabled_tools=["notify_owner"]`, and the only tool
-preauthorization is `tools.notify_owner.approval_mode="auto"`. It sets no
+preauthorization is `tools.notify_owner.approval_mode="approve"`. It sets no
 blanket MCP auto mode and changes no shell/network/reviewer policy. Managed
 requirements still apply. Runtime no-prompt acceptance of this new path must
 be verified separately; configuration parsing alone is not proof.
+`auto` must not be treated as an unconditional grant for a tool that writes.
+The exact-tool `approve` override follows the supported
+[MCP configuration example](https://learn.chatgpt.com/docs/extend/mcp).
+[Managed approval requirements](https://learn.chatgpt.com/docs/app-server)
+remain authoritative; a forced prompt is a configuration conflict to report,
+not a reason to change the reviewer or answer a dialog automatically.
 
 Installation must be outside the session/wolt writable roots. The launcher
 refuses a worker/interpreter inside those roots and checks the effective

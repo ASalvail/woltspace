@@ -81,7 +81,7 @@ def codex_overrides(record: dict, endpoint: str, writable_roots: list[Path]) -> 
         "env": {}, "env_vars": [],
         "enabled": True, "required": True,
         "enabled_tools": [TOOL_NAME], "disabled_tools": [],
-        "tools": {TOOL_NAME: {"approval_mode": "auto"}},
+        "tools": {TOOL_NAME: {"approval_mode": "approve"}},
         "startup_timeout_sec": 10, "tool_timeout_sec": 120,
     }
     # JSON strings/arrays are valid TOML values; tables require key = value.

@@ -298,6 +298,19 @@ def test_worker_path_must_be_outside_writable_roots(lodge):
         worker.codex_overrides(record, "http://localhost:7777", [Path(worker.__file__).parent])
 
 
+def test_only_exact_owner_tool_has_explicit_permission(lodge):
+    import tomllib
+    _, record, _, _ = lodge
+    args = worker.codex_overrides(record, "http://localhost:7777", [])
+    definition = tomllib.loads(args[1])["mcp_servers"][worker.SERVER_NAME]
+    assert definition["enabled_tools"] == ["notify_owner"]
+    assert definition["tools"] == {"notify_owner": {"approval_mode": "approve"}}
+    assert "default_tools_approval_mode" not in definition
+    assert "approvals_reviewer" not in args[1] and "approval_policy" not in args[1]
+    tool = run_worker([rpc("tools/list")], lambda _: pytest.fail("send reached"))[0]["result"]["tools"][0]
+    assert tool["annotations"]["readOnlyHint"] is False
+
+
 def test_preflight_scrubs_secret_and_rejects_old_codex(tmp_path, monkeypatch):
     import tomllib
     overrides = worker.codex_overrides({"name": "synthetic"}, "http://localhost:7777", [tmp_path])
@@ -357,7 +370,7 @@ def test_effective_config_precedence_and_nested_env_fail_closed(tmp_path, monkey
     # while reserving real approval behavior for a reviewed runtime test.
     project.write_text('[mcp_servers.woltspace_notify]\ncommand="/synthetic/wrong"\n[mcp_servers.woltspace_notify.tools.notify_owner]\napproval_mode="synthetic_invalid"\n')
     worker.verify_codex_definition(overrides, codex, work)
-    invalid = [overrides[0], overrides[1].replace('approval_mode = "auto"', 'approval_mode = "synthetic_invalid"')]
+    invalid = [overrides[0], overrides[1].replace('approval_mode = "approve"', 'approval_mode = "synthetic_invalid"')]
     rejected = subprocess.run([codex, *invalid, "mcp", "get", worker.SERVER_NAME, "--json"],
                               cwd=work, capture_output=True, timeout=15)
     assert rejected.returncode != 0

@@ -54,6 +54,28 @@ def test_owner_tool_prompt_no_cli_escalation_or_route_input():
     assert startup.PARTICIPANT not in startup.OWNER_TOOL_PROMPT
 
 
+def test_exact_mcp_approval_snapshot_wording_is_actionable(monkeypatch):
+    from scripts import whatsapp_startup_inspection as startup
+    question = 'Allow the woltspace_notify MCP server to run tool "notify_owner"?'
+    text = ('• Calling woltspace_notify.notify_owner\n    + Show details\n' + question + '\n\n'
+            '  › 1. Allow                   Run the tool and continue\n'
+            '    2. Allow for this session  Run the tool and remember this choice for this\n'
+            '                               session\n'
+            '    3. Always allow            Run the tool and remember this choice for\n'
+            '                               future tool calls\n'
+            '    4. Cancel                  Cancel this tool call\n'
+            '  enter to submit | esc to cancel\n')
+    assert startup.model._classify_boot_symptom(text) == "tool_approval_prompt"
+    assert startup.model._classify_boot_symptom(question) != "tool_approval_prompt"
+    assert startup.model._classify_boot_symptom(text.replace(question, "ordinary task text")) != "tool_approval_prompt"
+    assert startup.model._classify_boot_symptom(text.replace('    4. Cancel', '    4. Other')) != "tool_approval_prompt"
+    monkeypatch.setattr(startup.model, "_harness_process_status", lambda *_: True)
+    monkeypatch.setattr(startup.model, "_capture_boot_symptom", lambda *_, **__: startup.model._classify_boot_symptom(text))
+    diag = startup.model.RunDiagnostics("codex")
+    assert not startup._observe_boot("synthetic", {}, diag, owner_tool=True)
+    assert diag.category == "tool_approval_prompt" and diag.notify_attempt == "not_seen"
+
+
 @pytest.mark.parametrize("symptom,expected", [("trust_or_approval", True),
     ("waiting_for_input", True), ("tool_approval_prompt", False), ("directory_trust_prompt", False)])
 def test_owner_tool_observer_never_answers_or_waits_for_specific_approval(monkeypatch, symptom, expected):
