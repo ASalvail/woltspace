@@ -47,7 +47,7 @@ allowlist is exactly `enabled_tools=["notify_owner"]`, and the only tool
 preauthorization is `tools.notify_owner.approval_mode="approve"`. It sets no
 blanket MCP auto mode and changes no shell/network/reviewer policy. Managed
 requirements still apply. Configuration parsing alone is not proof of
-runtime no-prompt behavior; see the bounded local acceptance result below.
+runtime no-prompt behavior; see the bounded acceptance results below.
 `auto` must not be treated as an unconditional grant for a tool that writes.
 The exact-tool `approve` override follows the supported
 [MCP configuration example](https://learn.chatgpt.com/docs/extend/mcp).
@@ -124,19 +124,23 @@ bounded retry using `Retry-After`; timeouts and other ambiguous send failures
 are not retried automatically to avoid duplicate replies.
 
 Offline tests exercise cursor, sender, routing, lifecycle and recovery behavior.
-An owner-operated isolated acceptance test received a real WhatsApp message,
-created a model session and returned one nonce through the CLI `notify`; the owner
-observed the reply, and scoped cleanup metadata was verified. This is one
-text-only account acceptance, not evidence of general account availability or
-long-running reliability. Credentials stay private; no installed lodge
-configuration or running server was changed by the test. Keep only one active
-consumer per key; poll/send coordination is local to the configured state
-directory, not distributed across hosts or separate lodges.
+The owner completed a bounded isolated real WhatsApp tool-only acceptance test:
+WhatsApp inbound → one real Codex session → `notify_owner` → the exact WhatsApp
+nonce reply. The owner received the reply without attachment or approval
+interaction. The runner verified the account-bound registry route, reported
+one owner endpoint request and zero legacy requests, and reported cleanup passed.
 
-The optional owner tool separately passed one bounded local Codex runtime test:
-one account/session-bound mocked notification, zero legacy requests, no owner
-approval interaction, and scoped cleanup. This does not establish real WhatsApp
-acceptance of that changed path or a universal approval guarantee. The reviewed
-owner-operated test option is documented in `docs/whatsapp-owner-test.md`.
+Separate earlier checks exercised a real CLI `notify` reply and a local
+mocked-outbound owner-tool Codex session without owner interaction. These are
+distinct paths; the tool-only live result establishes the changed path for this
+configured account/runtime. It is not a universal approval guarantee, production
+endurance/load result, or evidence of general account availability. Managed
+requirements remain authoritative. No installed lodge configuration or running
+server was changed; the feature remains opt-in, not generally enabled there.
+Credentials and private test artifacts stay private.
+
+Keep only one active consumer per key; poll/send coordination is local to the
+configured state directory, not distributed across hosts or separate lodges.
+See `docs/whatsapp-owner-test.md` for the reviewed isolated test boundaries.
 
 References: [WhatsApp Agent Platform Developer Manual, v1 (Aug. 25, 2026)](https://www.whatsapp.com/developer/WhatsApp-Agent-Platform-Developer-Manual.pdf)

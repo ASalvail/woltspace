@@ -1,22 +1,28 @@
 # Isolated WhatsApp model-session test plan
 
-**Status: owner-observed isolated acceptance passed.** Transport/registry
-stages, the local approval-aware mocked-notify diagnostic, and one real
-WhatsApp inbound → model session → notify → WhatsApp nonce reply passed.
-The successful run's private root and socket directory were removed, with no
-matching bound Unix socket or run-scoped working-directory process found.
-Two process lookups were denied, so that process scan remains qualified.
-This is one bounded text-only test; it does not establish production endurance
-or general account availability. No further live test is needed for this
-handoff. The separate
-runner is `scripts/whatsapp_model_session_test.py`; it requires an explicit
-`--run`, the owner-selected `--harness codex`, a real TTY, and typed
-confirmation. Any later use requires implementation review and the normal
-runtime approval flow; never repeat a send with an ambiguous outcome.
-Stage one and stage two in
-`whatsapp-owner-test.md` do not create a real agent session. This plan covers a
-later test of the complete inbound → session → model reply → notify → WhatsApp
-outbound path.
+**Status: owner-observed bounded tool-only acceptance passed.** A real
+WhatsApp inbound created one Codex model session; its `notify_owner` call
+returned the exact nonce to WhatsApp. The owner received it without attachment
+or approval interaction. The runner reported the account-bound registry route,
+one owner endpoint request and zero legacy requests, and cleanup passed. No repeat is needed.
+
+Separately, earlier checks passed the real CLI reply path and the local
+mocked-outbound owner-tool runtime. These are distinct evidence: one live
+configured tool result is not a universal managed-policy, load/endurance or
+account-availability guarantee. No installed lodge configuration was changed;
+the tool remains opt-in for WhatsApp Codex 0.163+ sessions.
+
+The runner is `scripts/whatsapp_model_session_test.py`. Its current tool-only
+option is `--run --harness codex --notify-owner-tool`; it requires a real TTY
+and typed confirmation, then only the printed WhatsApp selection/challenge.
+Use `whatsapp-owner-test.md` for the current reviewed procedure. A tool prompt
+is a conflict to report, not a dialog to answer or a reason to change policy.
+
+The detailed CLI/diagnostic sections below describe the separate default CLI
+mode and optional troubleshooting. Its attachment/normal shell-approval steps
+are not required for the tool-only path. Any future run needs review; never
+repeat an ambiguous send. Stages one/two in `whatsapp-owner-test.md` exercise
+transport and registry routing without creating a model session.
 
 ## Isolation boundary
 
@@ -26,7 +32,8 @@ outbound path.
 - Run the source-checkout `server.app:app` in the runner process with its
   lifecycle disabled, bound only to `127.0.0.1` on a dynamically allocated
   port. Reserve and pass an already-bound socket so the selected port cannot
-  race with another process. This keeps the real `/notify` route while skipping
+  race with another process. This keeps the real `/notify/owner` (tool) or
+  `/notify` (CLI) route while skipping
   tunnel, connector, watcher, and lodge lifecycle startup. Set `WOLTSPACE_API`
   and `PORT` to that local endpoint; never bind port 7777 or change the lodge's
   running server.
@@ -369,10 +376,11 @@ prove that it caused the earlier rejection or establish a successful live reply.
 3. Verify the isolated session registry records the WhatsApp participant and
    account fingerprint; verify the new tmux process has no
    `WHATSAPP_AGENT_TOKEN`; verify the adapter's selection confirmation and
-   one nonce reply sent through the real `server.notify` route. Use the newly
-   printed private attach command and complete the normal one-time runtime
-   approval if the current reviewer prompts. No additional WhatsApp message
-   is requested while waiting for that approval.
+   one nonce reply through the real notification boundary. In tool-only mode,
+   require one owner endpoint request and zero legacy requests without attachment/approval interaction.
+   For the separate CLI mode only, use the printed private attach command and
+   normal one-time command approval if prompted. Do not substitute CLI for an
+   unavailable/refused owner tool or retry an ambiguous send.
 4. Stop the exact test session, private tmux server, isolated API server, and
    poller. Remove the temporary data root and logs. Keep the credential file
    only until the owner runs the documented cleanup command. If cleanup cannot

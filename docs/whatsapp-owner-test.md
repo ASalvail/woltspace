@@ -70,9 +70,16 @@ This removes the saved key and any remaining private test files. Do not copy
 the key into chat or a command line. If the checkout is deleted, the private
 gitignored directory is deleted with it.
 
-## Real model-session owner-tool test (review before launch)
+## Real model-session owner-tool test (completed bounded acceptance)
 
-After implementation review, from the checkout with runtime dependencies:
+The owner completed this reviewed tool-only test and received the real nonce
+reply in WhatsApp without attachment or approval interaction. The runner
+reported one owner endpoint request, zero legacy requests, an account-bound
+registry route, and cleanup passed. No repeat is needed. This is bounded
+acceptance for the tested runtime/account, not a universal managed-policy or
+reliability guarantee. It does not enable the feature in the installed lodge.
+
+For a separately reviewed future use, from a checkout with runtime dependencies:
 
 ```bash
 .venv/bin/python scripts/whatsapp_model_session_test.py --run --harness codex --notify-owner-tool
@@ -99,8 +106,9 @@ session acknowledgement are expected control messages in addition to the nonce.
 Without `--notify-owner-tool`, the prior CLI/normal-approval diagnostic remains
 available; it is a separate path and prints attachment instructions. Prior real
 CLI acceptance does not establish real-provider acceptance of the new tool path.
-The tool path has passed one bounded local mocked-outbound Codex test without
-owner interaction. Its real WhatsApp acceptance remains pending review/testing.
+The tool path separately passed a local mocked-outbound Codex check without
+owner interaction and the real-provider acceptance described above. Do not
+conflate the earlier CLI result or local mock with the real tool-only result.
 
 ## Fixed failure diagnostics
 
@@ -167,5 +175,7 @@ the installed lodge and port 7777 are preserved. A redacted snapshot and fixed
 failure record may be retained privately after verified cleanup, following
 the existing strict validation/retention rules. Never inspect auth/key files
 or dump raw logs to diagnose this test. A failure needs evidence and review,
-not an automatic second model or provider run. This establishes one configured local runtime result, not a universal approval
-guarantee under every managed policy/version or real WhatsApp acceptance of the tool.
+not an automatic second model or provider run. This local diagnostic establishes
+one configured runtime result, not a universal approval guarantee or provider
+delivery by itself. The separately completed real tool-only acceptance is
+recorded above.
