@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -20,7 +21,8 @@ from scripts import whatsapp_model_session_test as model
 from scripts import startup_transport_probe as transport
 
 PARTICIPANT = "user:4242424242"
-ACCOUNT = "synthetic-startup-account"
+SYNTHETIC_TOKEN = "synthetic-local-notify-no-provider"
+ACCOUNT = hashlib.sha256(SYNTHETIC_TOKEN.encode()).hexdigest()[:20]
 BODY = "startup-inspection-ok"
 PROMPT = (
     "This is an isolated startup inspection. Use the notify CLI exactly once "
@@ -42,6 +44,12 @@ APPROVAL_PROBE_PROMPT = (
     "Do not request a persistent prefix grant, change network/sandbox/reviewer settings, or answer "
     "any dialog yourself. Existing feature authorization does not replace runtime approval. "
     "If approval is denied or unavailable, report that blocker and stop. Never retry an ambiguous send."
+)
+OWNER_TOOL_PROMPT = (
+    "This is an isolated local notification inspection. Call the notify_owner MCP tool "
+    "exactly once with message startup-inspection-ok. Do not add a name prefix. "
+    "The lodge endpoint is mocked and does not contact WhatsApp. Use that tool only, "
+    "not the notify CLI or shell. Do not repeat an ambiguous outcome or change permissions."
 )
 MAX_SECONDS = 180
 SNAPSHOT_NAME = "startup-snapshot.json"
@@ -72,13 +80,18 @@ class _NotifyCounter:
     """Count only /notify request/response metadata, never bodies."""
     def __init__(self, app):
         self.app, self.count, self.status = app, 0, None
+        self.owner_count = self.legacy_count = 0
         self.lock = threading.Lock()
 
     async def __call__(self, scope, receive, send):
-        notify = scope.get("type") == "http" and scope.get("path") == "/notify"
+        notify = scope.get("type") == "http" and scope.get("path") in {"/notify", "/notify/owner"}
         if notify:
             with self.lock:
                 self.count += 1
+                if scope.get("path") == "/notify/owner":
+                    self.owner_count += 1
+                else:
+                    self.legacy_count += 1
         async def counted_send(message):
             if notify and message.get("type") == "http.response.start":
                 with self.lock:
@@ -227,13 +240,18 @@ def _verify_record(session: str, wolts_dir: Path, env: dict,
     return True
 
 
-def _observe_boot(session: str, env: dict, diagnostics, *, allow_tool_approval=False) -> bool:
+def _observe_boot(session: str, env: dict, diagnostics, *, allow_tool_approval=False,
+                  owner_tool=False) -> bool:
     process = model._harness_process_status(session, "codex")
     diagnostics.set_harness_process(
         "present" if process is True else "absent" if process is False else "unknown",
     )
     diagnostics.enter("harness_boot")
     symptom = model._capture_boot_symptom(env, session, visible_only=True)
+    if owner_tool and symptom in {"trust_or_approval", "waiting_for_input"}:
+        diagnostics.set_boot_symptom(symptom)
+        diagnostics.set_harness_readiness("unknown")
+        return True  # Echoed instructions alone are not a displayed prompt.
     if allow_tool_approval and model._observe_notify_approval(diagnostics, symptom):
         return True  # Human may answer a real tool request; runner never does.
     if model._handle_boot_symptom(diagnostics, symptom):
@@ -272,11 +290,12 @@ def _directory_trust_environment(env: dict, run_root: Path, mode: str) -> None:
 def _run_startup_session(
     harness, inherited, auth_variable, auth_path, run_root, tmux_root, diagnostics,
     *, timeout_seconds=120, directory_trust="preserve", capture_snapshot=False,
-    probe_transport=False, request_notify_approval=False,
+    probe_transport=False, request_notify_approval=False, notify_owner_tool=False,
 ):
     """Real local server/session machinery; every outbound sender is mocked."""
     if (harness != "codex" or not 1 <= timeout_seconds <= MAX_SECONDS
-            or request_notify_approval and not probe_transport):
+            or request_notify_approval and not probe_transport
+            or notify_owner_tool and (probe_transport or request_notify_approval or directory_trust != "normal")):
         raise ValueError("unsupported startup inspection settings")
     wolts_dir = run_root / "wolts"
     listener, port = model._bind_local_socket()
@@ -284,6 +303,8 @@ def _run_startup_session(
         run_root, wolts_dir, harness, auth_variable, auth_path,
         "127.0.0.1", port, inherited, tmux_root,
     )
+    if notify_owner_tool:
+        env["WOLTSPACE_NOTIFY_TOOL"] = "1"
     try:
         _directory_trust_environment(env, run_root, directory_trust)
     except BaseException:
@@ -301,7 +322,7 @@ def _run_startup_session(
     counter = None
     probe_config = probe_result = None
     host_health = "not_checked"
-    prompt = APPROVAL_PROBE_PROMPT if request_notify_approval else PROBE_PROMPT if probe_transport else PROMPT
+    prompt = OWNER_TOOL_PROMPT if notify_owner_tool else APPROVAL_PROBE_PROMPT if request_notify_approval else PROBE_PROMPT if probe_transport else PROMPT
     fd = os.open(run_root / "runner.log", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     log = os.fdopen(fd, "w", encoding="utf-8", buffering=1)
     os.environ.clear()
@@ -348,7 +369,9 @@ def _run_startup_session(
             # Replace the entire outbound boundary, not just WhatsApp transport:
             # a malformed route cannot fall back to a live Telegram/Slack sender.
             notify_module._send = local_send
-            notify_module.dotenv_env = lambda _name: ""
+            notify_module.dotenv_env = lambda name: ({
+                "WOLTSPACE_NOTIFY_TOOL": "1", "WHATSAPP_AGENT_TOKEN": SYNTHETIC_TOKEN,
+            }.get(name, "") if notify_owner_tool else "")
             counter = _NotifyCounter(server_app.app)
             server = uvicorn.Server(uvicorn.Config(
                 counter, host="127.0.0.1", port=port, log_level="error",
@@ -371,7 +394,7 @@ def _run_startup_session(
             diagnostics.enter("session_spawn")
             deadline = time.monotonic() + timeout_seconds
             try:
-                result = _start_session(prompt) if probe_transport else _start_session()
+                result = _start_session(prompt) if probe_transport or notify_owner_tool else _start_session()
                 session = result.get("name", "") if isinstance(result, dict) else ""
                 if probe_config is not None:
                     config = transport.read_config(probe_config)
@@ -383,6 +406,9 @@ def _run_startup_session(
                 diagnostics.passed("session_spawn")
             finally:
                 dispatch_done.set()
+            if notify_owner_tool:
+                deadline = time.monotonic() + timeout_seconds
+                model._say("Owner-tool inspection awaiting one local mocked tool notification; no dialog will be answered.")
             if request_notify_approval:
                 _approval_notice(session, wolts_dir, env, tmux_root, timeout_seconds)
             next_notice = time.monotonic() + 15
@@ -411,9 +437,16 @@ def _run_startup_session(
                     raise RuntimeError("local mocked notification failed")
                 if (model._confirmed_notify(gate, session, diagnostics)
                         and (probe_config is None or probe_result is not None and probe_result["phase"] == "complete")):
+                    if notify_owner_tool:
+                        with counter.lock:
+                            if counter.owner_count != 1 or counter.legacy_count:
+                                diagnostics.fail("notify_rejected")
+                                raise RuntimeError("owner-tool inspection saw an unexpected endpoint")
+                        model._say("Owner-tool requests=1 legacy-notify=0.")
                     model._say("Startup inspection received one verified local mocked notification.")
                     return 0
-                if not _observe_boot(session, env, diagnostics, allow_tool_approval=request_notify_approval):
+                if not _observe_boot(session, env, diagnostics, allow_tool_approval=request_notify_approval,
+                                     owner_tool=notify_owner_tool):
                     raise RuntimeError("startup inspection detected an interactive boot prompt")
                 time.sleep(0.2)
             diagnostics.enter("notify")
@@ -472,9 +505,12 @@ def main():
     parser.add_argument("--capture-snapshot", action="store_true")
     parser.add_argument("--probe-transport", action="store_true")
     parser.add_argument("--request-notify-approval", action="store_true")
+    parser.add_argument("--notify-owner-tool", action="store_true")
     args = parser.parse_args()
     if args.request_notify_approval and not args.probe_transport:
         parser.error("--request-notify-approval requires --probe-transport")
+    if args.notify_owner_tool and (args.probe_transport or args.request_notify_approval or args.directory_trust != "normal"):
+        parser.error("--notify-owner-tool requires normal directory trust and no CLI probe/approval mode")
     if not args.run or not 1 <= args.timeout <= MAX_SECONDS:
         parser.error("--run and a timeout between 1 and 180 seconds are required")
     diagnostics = model.RunDiagnostics("codex")
@@ -487,6 +523,7 @@ def main():
                 capture_snapshot=args.capture_snapshot,
                 probe_transport=args.probe_transport,
                 request_notify_approval=args.request_notify_approval,
+                notify_owner_tool=args.notify_owner_tool,
             ),
         )
         if result:

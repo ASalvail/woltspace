@@ -6,6 +6,15 @@ and send them with the explicit participant route shown in the incoming message.
 
 ## Replies
 
+If `notify_owner` is available, use it for every reply/update with only the
+message text. Its destination is fixed to this session's WhatsApp owner,
+and it is preauthorized for routine pings. The lodge adds your name/creature
+prefix, so do not add it yourself. No shell command or per-message shell
+approval is needed. Never resend after an ambiguous outcome, including via
+the CLI. If the tool refuses a stale route, report the binding issue without
+switching channels. Read the general notify skill's owner-tool guidance.
+The following CLI instructions apply only when the tool is absent.
+
 Before the first reply, load the `woltspace-notify` skill (or `woltspace:notify`
 with plugin delivery, as listed in your available skills) and read its
 "Local API access and normal approval" guidance. Notify reaches the local

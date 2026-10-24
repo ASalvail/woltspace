@@ -46,6 +46,25 @@ def test_approval_prompt_preserves_one_attempt_and_normal_policy():
     assert "Existing feature authorization does not" in skill
 
 
+def test_owner_tool_prompt_no_cli_escalation_or_route_input():
+    from scripts import whatsapp_startup_inspection as startup
+    assert "notify_owner MCP tool" in startup.OWNER_TOOL_PROMPT
+    assert "not the notify CLI or shell" in startup.OWNER_TOOL_PROMPT
+    assert "sandbox_permissions" not in startup.OWNER_TOOL_PROMPT
+    assert startup.PARTICIPANT not in startup.OWNER_TOOL_PROMPT
+
+
+@pytest.mark.parametrize("symptom,expected", [("trust_or_approval", True),
+    ("waiting_for_input", True), ("tool_approval_prompt", False), ("directory_trust_prompt", False)])
+def test_owner_tool_observer_never_answers_or_waits_for_specific_approval(monkeypatch, symptom, expected):
+    from scripts import whatsapp_startup_inspection as startup
+    monkeypatch.setattr(startup.model, "_harness_process_status", lambda *_: True)
+    monkeypatch.setattr(startup.model, "_capture_boot_symptom", lambda *_, **__: symptom)
+    diagnostics = startup.model.RunDiagnostics("codex")
+    assert startup._observe_boot("synthetic", {}, diagnostics, owner_tool=True) is expected
+    assert bool(diagnostics.category) is not expected
+
+
 @pytest.mark.parametrize("symptom,expected", [
     ("tool_approval_prompt", True), ("directory_trust_prompt", False),
     ("onboarding_prompt", False), ("trust_or_approval", True),
@@ -253,7 +272,7 @@ def test_snapshot_targets_only_verified_exact_pane(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("scenario", [
-    "success", "normal_success", "snapshot_success", "snapshot_timeout", "wrong_payload", "timeout", "trust_prompt", "spawn_failure", "cleanup_failure", "probe_success", "probe_api_missing", "probe_approval_success", "probe_approval_timeout", "probe_approval_echo_timeout",
+    "success", "normal_success", "snapshot_success", "snapshot_timeout", "wrong_payload", "timeout", "trust_prompt", "spawn_failure", "cleanup_failure", "probe_success", "probe_api_missing", "probe_approval_success", "probe_approval_timeout", "probe_approval_echo_timeout", "owner_tool_success", "owner_tool_prompt",
 ])
 def test_full_offline_startup_orchestration(tmp_path, scenario):
     # Fresh interpreter ensures real server/session imports bind to only the
@@ -283,6 +302,8 @@ model._verify_private_tmux = lambda *_: None
 model._harness_process_status = lambda *_: True
 model._harness_readiness_status = lambda *_: "unsupported"
 def boot_symptom(*_, **__):
+    if scenario == "owner_tool_prompt":
+        return "tool_approval_prompt"
     if scenario == "probe_approval_echo_timeout":
         return model._classify_boot_symptom(startup.APPROVAL_PROBE_PROMPT +
             "\n• Starting MCP servers (1/2): codex_apps (0s • esc to interrupt)\n› Ask Codex to do anything")
@@ -300,7 +321,11 @@ model._cleanup_resources = cleanup
 cli_threads = []
 cli_results = []
 def fake_start(prompt=None):
-    assert (os.environ.get("WOLTSPACE_PRESERVE_TRUST_PROMPTS") == "1") == (scenario != "normal_success" and not scenario.startswith("probe_"))
+    assert (os.environ.get("WOLTSPACE_PRESERVE_TRUST_PROMPTS") == "1") == (scenario != "normal_success" and not scenario.startswith(("probe_", "owner_tool_")))
+    if scenario.startswith("owner_tool_"):
+        assert prompt == startup.OWNER_TOOL_PROMPT
+        assert os.environ.get("WOLTSPACE_NOTIFY_TOOL") == "1"
+        assert "WHATSAPP_AGENT_TOKEN" not in os.environ
     if scenario.startswith("probe_"):
         assert prompt == (startup.APPROVAL_PROBE_PROMPT if scenario.startswith("probe_approval_") else startup.PROBE_PROMPT)
     if scenario == "spawn_failure":
@@ -318,7 +343,9 @@ def fake_start(prompt=None):
     registry.update(record["name"], wolt="wa-test", runtime={
         "kind": "tmux", "tmux_session_name": "synthetic", "pane_id": "%1",
     })
-    if scenario not in {"timeout", "snapshot_timeout", "trust_prompt", "probe_approval_timeout", "probe_approval_echo_timeout"}:
+    if scenario.startswith("owner_tool_"):
+        record = registry.update(record["name"], wolt="wa-test", notify_owner_generation="synthetic-tool-launch")
+    if scenario not in {"timeout", "snapshot_timeout", "trust_prompt", "probe_approval_timeout", "probe_approval_echo_timeout", "owner_tool_prompt"}:
         def cli():
             env = dict(os.environ)
             env["WOLTSPACE_WOLT_SESSION"] = record["name"]
@@ -329,11 +356,20 @@ def fake_start(prompt=None):
             message = "wrong-synthetic-body" if scenario == "wrong_payload" else startup.BODY
             command = [str(Path(env["WOLTS_DIR"]) / "wa-test/startup-notify-probe")] if scenario.startswith("probe_") else [
                 str(startup.ROOT / "container/bin/notify"), "--whatsapp", startup.PARTICIPANT]
+            if scenario.startswith("owner_tool_"):
+                import notify_owner_mcp as worker
+                command = [sys.executable, "-I", str(Path(worker.__file__).resolve()),
+                    "--session", record["name"], "--binding", worker.route_binding(record),
+                    "--api", env["WOLTSPACE_API"]]
+                message = json.dumps({"jsonrpc":"2.0", "id":1, "method":"tools/call",
+                    "params":{"name":"notify_owner", "arguments":{"message":startup.BODY}}})+"\n"
             result = subprocess.run(
                 command, input=message,
                 env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, timeout=10,
             )
+            if scenario.startswith("owner_tool_"):
+                assert json.loads(result.stdout)["result"]["isError"] is False
             cli_results.append(result.returncode)
         thread = threading.Thread(target=cli)
         thread.start()
@@ -346,10 +382,11 @@ with tempfile.TemporaryDirectory(prefix=".wsi-offline-", dir=startup.ROOT.parent
     try:
         result = model._run_model_test("codex", diag, startup_runner=lambda *args:
             startup._run_startup_session(*args, timeout_seconds=1 if scenario in {"timeout", "snapshot_timeout", "probe_approval_timeout", "probe_approval_echo_timeout"} else 5,
-                directory_trust="normal" if scenario == "normal_success" or scenario.startswith("probe_") else "preserve",
+                directory_trust="normal" if scenario == "normal_success" or scenario.startswith(("probe_", "owner_tool_")) else "preserve",
                 capture_snapshot=scenario.startswith(("snapshot_", "probe_")),
                 probe_transport=scenario.startswith("probe_"),
-                request_notify_approval=scenario.startswith("probe_approval_")))
+                request_notify_approval=scenario.startswith("probe_approval_"),
+                notify_owner_tool=scenario.startswith("owner_tool_")))
     except Exception:
         result = 2
     for thread in cli_threads:
@@ -358,7 +395,7 @@ with tempfile.TemporaryDirectory(prefix=".wsi-offline-", dir=startup.ROOT.parent
 record = diag.as_record()
 assert model._valid_diagnostic_record(record)
 assert "bot.whatsapp_adapter" not in sys.modules
-if scenario in {"success", "normal_success", "snapshot_success", "probe_success", "probe_approval_success"}:
+if scenario in {"success", "normal_success", "snapshot_success", "probe_success", "probe_approval_success", "owner_tool_success"}:
     assert result == 0
     assert record["notify_attempt"] == "sent"
     assert record["checks"]["notify"] == "passed"
@@ -380,11 +417,12 @@ else:
         "probe_api_missing": "local_transport_probe_failed",
         "probe_approval_timeout": "approval_not_completed",
         "probe_approval_echo_timeout": "approval_not_completed",
+        "owner_tool_prompt": "tool_approval_prompt",
     }[scenario]
     assert record["checks"]["notify"] != "passed"
     assert record["notify_attempt"] == ("rejected" if scenario == "wrong_payload" else "not_seen")
     assert record["checks"]["cleanup"] == "passed"
-if scenario not in {"success", "normal_success", "snapshot_success", "probe_success", "probe_approval_success"}:
+if scenario not in {"success", "normal_success", "snapshot_success", "probe_success", "probe_approval_success", "owner_tool_success"}:
     paths = list(private.glob("startup-*/failure.json"))
     assert len(paths) == 1
     data = json.loads(paths[0].read_text())

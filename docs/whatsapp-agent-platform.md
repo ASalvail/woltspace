@@ -30,12 +30,75 @@ that session return to the same recent WhatsApp participant. Send `wolt NAME`
 again to switch destinations. Only plain text is supported; inbound media gets
 an explanatory response and outbound files, voice, and speech are unsupported.
 
-With sandboxed host Codex tools, `notify` may require normal one-time command
-approval to reach the local Woltspace API. Load the general notify skill and
-honor the current reviewer. Approval applies to that command and its children,
-not an exact destination port. Do not enable broad networking, change reviewer
-policy or answer dialogs automatically. The lodge handles WhatsApp delivery;
-the model's shell does not need the Agent API key or direct provider access.
+### Routine pings through the owner tool (opt-in Codex)
+
+Set `WOLTSPACE_NOTIFY_TOOL=1` in the lodge process environment before starting
+it, then start a new WhatsApp Codex session. Codex 0.163+ is required. The
+trusted session launcher exposes one stdio MCP tool, `notify_owner(message)`.
+It accepts message text only; the lodge supplies the name/creature prefix and
+the stored WhatsApp owner destination. No routine shell approval is needed
+for this tool. Optional/unconfigured sessions, other adapters and other
+harnesses retain their existing notification behavior.
+
+The launcher passes a per-invocation `-c mcp_servers.woltspace_notify={...}`
+definition with the absolute bundled worker and Python paths, `-I`, a fixed
+local API endpoint, session name and non-secret launch-binding digest. The
+allowlist is exactly `enabled_tools=["notify_owner"]`, and the only tool
+preauthorization is `tools.notify_owner.approval_mode="auto"`. It sets no
+blanket MCP auto mode and changes no shell/network/reviewer policy. Managed
+requirements still apply. Runtime no-prompt acceptance of this new path must
+be verified separately; configuration parsing alone is not proof.
+
+Installation must be outside the session/wolt writable roots. The launcher
+refuses a worker/interpreter inside those roots and checks the effective
+definition using the same wrapper, working directory and config stack.
+Codex merges nested maps: an existing `env` entry is not cleared by `env={}`.
+Unexpected effective command/args/env/cwd/allowlist disables launch with a
+fixed configuration error. Do not configure this server globally or add
+worker environment overrides. Exposed startup/tool timeouts are also checked.
+`mcp get` does not expose `required` or per-tool approval policy; trusted CLI
+values and parser controls do not establish their effective runtime behavior.
+The named-root guard and tests cover the intended `:workspace` installation,
+including denied parent renames and fixed resolved symlink targets. They do
+not discover every custom effective writable root. A supported setup must
+keep worker/interpreter/config paths and their ancestors outside broader
+writable roots; custom profiles may invalidate these assumptions. This relies
+on the actual sandbox/installation boundary, not file ownership alone.
+
+The worker has no WhatsApp key and makes only one fixed local notification
+request per tool call, without redirects/proxy environment or transport
+retries. The backend checks the running session, launch generation, exact
+stored route and current account fingerprint; stale bindings are refused
+without channel fallback. Admission uses that validated registry snapshot.
+Once admitted to the sender, including its rate wait, a call is in flight:
+stop/completion, route/key change or fresh spawn/resume preparation rejects
+future calls but does not undo an accepted call. It retains its original
+destination/account and is never retargeted. Harness EOF ends the worker
+after any bounded active attempt. Only text is accepted: final formatted text must fit 4096 characters
+and 16 KiB UTF-8; frames are capped at 32 KiB. Concurrent requests are bounded
+and provider pacing/order remains shared with the adapter.
+
+The worker's wall deadline is 90 seconds, below the configured 120-second
+tool deadline. A queued/provider request can continue after timeout or caller
+cancellation; these do not prove cancellation of delivery. Serial stdio
+processes a queued cancellation after the active attempt, then refuses further
+sends. After an ambiguous send it also refuses all further attempts. This is
+worker-lifetime suppression, not durable duplicate protection: restart loses
+that state. Do not resubmit through a new worker or the CLI until the prior
+outcome is resolved. Requests/errors expose fixed statuses, not provider
+responses or route/credential details.
+
+**Trust boundary:** this uses the existing trusted-host lodge API. Session
+IDs and launch digests are routing/staleness data, not authentication or
+secret capabilities. Unsandboxed same-UID host code can impersonate local
+callers; this is not adversarial cross-wolt isolation or an encrypted secret
+vault. Provider credentials remain server-side and are scrubbed from agent,
+tmux and worker configuration. No new kernel broker is introduced.
+
+If the owner tool is absent, the existing `notify` CLI may require normal
+one-time command approval to reach the local API. Load the general notify
+skill and honor the current reviewer. Do not enable broad networking or
+answer dialogs automatically. The model needs no direct provider access.
 
 The first poll uses explicit `offset=0`, with a persisted activation time to
 ignore older retained messages. The `next_offset` cursor is persisted; HTTP 204
