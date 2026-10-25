@@ -69,6 +69,170 @@ transport and registry routing without creating a model session.
 
 ## Single-message flow
 
+### Startup inspection before another WhatsApp attempt
+
+The separate `scripts/whatsapp_startup_inspection.py` runner was used to
+diagnose the local bootstrap/notify boundary before the successful acceptance.
+These commands are retained for reference; they are not routine setup steps
+and should not be repeated without review:
+
+```sh
+.venv/bin/python scripts/whatsapp_startup_inspection.py --run --harness codex --timeout 120
+```
+
+The comparison mode is:
+
+```sh
+.venv/bin/python scripts/whatsapp_startup_inspection.py --run --harness codex --timeout 120 --directory-trust normal
+```
+
+The separately reviewed bounded UI capture adds
+`--capture-snapshot` to that command. This opt-in captures the verified exact
+registry pane on the private tmux socket immediately before cleanup. ANSI
+control sequences, bearer/JWT/key patterns, credential assignment lines,
+private-key blocks and long opaque values are redacted in process; the
+remaining synthetic UI/error text is limited to 8192 UTF-8 bytes. No owner
+auth/key file is opened. The fixed synthetic prompt is included. A small
+ASGI wrapper records only `/notify` request count and final HTTP status, never
+request/response bodies. Private boot-log inspection emits only known-session
+wrapper/prompt-hook booleans; registry status/exit code and whether a rollout
+ID was observed are included without the ID. Prompt transport is marked
+`cli_argument_consumption_unconfirmed`: the command builder supplies the input,
+but there is no acknowledgment that the model consumed it.
+
+After cleanup, only the redacted `startup-snapshot.json` (mode 0600, within the
+ignored private run directory) and any sanitized failure record are retained.
+The snapshot is private review material, never printed automatically or added
+to a PR. Remove it after the diagnostic review no longer needs it. Raw pane
+text exists only transiently in memory; raw logs are removed as before. This
+mode was reviewed separately before its diagnostic run.
+
+The transport-boundary comparison uses:
+
+```sh
+.venv/bin/python scripts/whatsapp_startup_inspection.py --run --harness codex --timeout 120 --directory-trust normal --capture-snapshot --probe-transport
+```
+
+The fixed synthetic prompt asks the model to execute `./startup-notify-probe`
+once. In that same tool invocation the helper compares only selected environment
+values internally: API presence, expected isolated destination versus default
+7777/other, session match, and checkout notify executable match. It reports only
+fixed classes and same/different/unavailable network namespace. It makes a
+body-free `/health` request only to the known isolated endpoint. Notify runs
+only if connectivity and endpoint/session/executable checks pass, using the
+existing CLI and fixed synthetic body; its output is discarded and only its
+exit code is retained. Missing or mismatched routing skips the send, including
+any fallback to the installed server. A private one-attempt marker prevents
+duplicate helper calls from sending again.
+
+The host samples the same endpoint when it first observes the tool's probe
+record (usually the `health_started` transition). This is a nearby comparison,
+not a claim of simultaneous health observations. Snapshot schema 2 retains
+only the validated fixed probe fields and host health class alongside the
+existing redacted UI. No environment values, endpoint, session identifier or
+namespace identifier are emitted by the probe. Normal prompt policy and network
+restrictions remain in effect; the helper does not request or grant approval.
+This comparison does not use a WhatsApp credential,
+provider poll or provider send.
+
+The reviewed probe subsequently established correct routing/session/executable,
+a blocked tool-context health request in a different network namespace, and a
+successful nearby host health check. The subsequent comparison requests
+normal approval before the first helper call:
+
+```sh
+.venv/bin/python scripts/whatsapp_startup_inspection.py --run --harness codex --timeout 180 --directory-trust normal --capture-snapshot --probe-transport --request-notify-approval
+```
+
+This mode passed in an owner-operated local diagnostic. It changes the
+synthetic instruction only: request normal one-time shell-tool escalation for
+the helper, wait for the current reviewer, and stop on denied/unavailable
+approval. No proxy, network, sandbox, reviewer or execution-policy setting is
+changed. The helper still supplies the exact fixed stdin/route and reserves
+its one attempt before I/O; it never retries an ambiguous send. This tests the
+general local notify path: provider delivery happens in the lodge, and the
+shell does not need direct WhatsApp networking.
+
+The runner prints `Approval needed` after verifying its temporary registry and
+socket, followed by an exact `env -u TMUX tmux -S ... attach-session -t ...`
+command for **that private test session only**. Run this printed command in a
+second terminal. No key, auth content or participant identifier is included.
+If Codex shows the intended helper request, the owner can approve it once;
+do not select a permanent rule or answer unrelated dialogs. The runner never
+answers a dialog. Detach with Ctrl-b then d. Ctrl-C in the runner attempts its
+normal scoped cleanup.
+
+The task begins with approval-needed status, not proof that a dialog is
+already visible. A concrete tool-approval symptom can remain waiting, while
+directory-trust/onboarding prompts keep their previous failure behavior.
+In this opt-in mode broad trust/approval or input-wait wording stays observable
+with readiness `unknown`: it can be the echoed synthetic instructions, and
+neither establishes a displayed dialog nor terminates the run. Outside this
+mode, existing symptom handling is unchanged. The runner repeats a fixed pending status every 15 seconds
+until a helper result appears and announces the bounded observation deadline.
+If no helper result is observed by that deadline, it explicitly reports
+`approval_not_completed`, then cleans up. This does not prove approval was
+denied or even displayed. A delayed owner response is not an integration
+failure. No session remains running after successful cleanup; the printed
+attach command then expires.
+
+Normal approval is a runtime check in addition to feature authorization.
+An approved escalation runs that command and its children outside the command
+sandbox; it is **not** an OS-enforced exact-port grant. The current reviewer
+may ask the owner or apply managed review. Honor its result. See the official
+[sandbox and approval guidance](https://learn.chatgpt.com/docs/agent-approvals-security#sandbox-and-approvals).
+
+The default `--directory-trust preserve` keeps directory prompts visible.
+`normal` omits `WOLTSPACE_PRESERVE_TRUST_PROMPTS` and uses normal platform
+preparation for only the fresh synthetic directory. Both modes retain explicit
+tool `prompt` policy and omit the approval bypass flag. Before enabling normal
+preparation, the inspector verifies CODEX_HOME is the owned private per-run
+directory with no existing/symlinked config. The normal trust writer therefore
+creates only that private config; the owner's auth/config directory is not its
+target. It does not answer a displayed dialog.
+
+Startup inspection now classifies the visible pane rather than scrollback.
+Specific `directory_trust_prompt`, `onboarding_prompt`, and `tool_approval_prompt`
+symptoms require a matching concrete question/header plus interactive choices.
+Overlapping signals or a broad trust/approval mention remain ambiguous
+`trust_or_approval`; they do not establish the dialog type or a prior failure
+cause. Only these fixed classifications leave the local parser, never pane text.
+
+This starts one real Codex session through the supported `sessions.start_session`
+path, with explicit `prompt` execution policy, existing authorized login,
+private HOME/CODEX_HOME, platform skills and the short private tmux socket.
+It does not grant Auto or answer dialogs. In preserve mode it sets
+`WOLTSPACE_PRESERVE_TRUST_PROMPTS=1` in the private session environment
+so the normal platform trust writer does not pre-accept a directory dialog.
+The setting is forwarded through tmux to the real bootstrap process.
+The prompt is fixed synthetic text
+asking for one `startup-inspection-ok` notification. The actual notify CLI
+posts to the private local server; the entire sender boundary is replaced
+with an exact-message/session/account gate and local mocked sender. No
+WhatsApp credential is opened, no WhatsApp adapter is imported, and no
+WhatsApp polling or provider sending occurs. No owner WhatsApp message is
+needed. A local mocked notification demonstrates the harness/bootstrap/CLI
+path only; it does not establish full WhatsApp integration success.
+
+`--timeout` bounds the observation window starting before session creation
+(default 120 seconds, maximum 180). Executable preflight and the existing
+bounded platform metadata/startup/cleanup operations can extend wall time.
+The same command executes cleanup in `finally`: stop the exact synthetic
+session, stop the private local server/listener, and stop only that private
+tmux server. On success it prints the fixed local-notification and cleanup
+status plus allowlisted process/readiness/symptom/notify-attempt fields, and
+removes its `startup-*` root. Failures preserve only the validated
+schema-3 mode-0600 record after verified cleanup; uncertain cleanup retains
+the marked private root. The prior `model-*` roots and saved credential are
+untouched. No separate broad cleanup command is required; a retained marker
+requires scoped inspection. Do not wrap the command in an external hard kill
+that would skip its cleanup.
+
+Offline orchestration tests use a real registry, real notify CLI and real
+local API, with session spawn and private-tmux verification mocked. They
+exercise success, wrong payload, missing notify/timeout, detected trust
+prompt, spawn error, and cleanup failure; no model or provider is launched.
+
 ### WhatsApp model-session flow
 
 After review, invoke it from this checkout with the owner-selected Codex

@@ -58,6 +58,7 @@ _SESSION_ENV_KEYS = (
     "WOLT_SESSION",
     "WOLTSPACE_DIR",
     "WOLTSPACE_ISOLATION",
+    "WOLTSPACE_PRESERVE_TRUST_PROMPTS",
     "WOLTSPACE_NOTIFY_TOOL",
     # Which control plane this session belongs to. A session that reaches its
     # lodge — `notify`, `push-view`, `woltspace session send` — dials

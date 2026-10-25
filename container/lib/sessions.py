@@ -1619,7 +1619,8 @@ def prepare_session_command(name: str, mode: str, prompt: str = "") -> str:
         "claude": ensure_claude_dir_trusted,
         "codex": ensure_codex_dir_trusted,
     }.get(harness)
-    if trust_writer:
+    # An isolated startup inspector may need to observe the actual dialog.
+    if trust_writer and os.environ.get("WOLTSPACE_PRESERVE_TRUST_PROMPTS") != "1":
         target = SessionTarget.from_record(data, wolts_dir=WOLTS_DIR, fallback_wolt=wolt)
         trust_writer(target.canonical_workdir, WOLTS_DIR)
 

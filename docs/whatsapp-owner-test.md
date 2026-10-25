@@ -141,3 +141,41 @@ owned 0700 base/run/socket-parent directories and node ownership/type are checke
 Permission, foreign ownership, symlink or unverified states retain evidence. Report the fixed failure line; never dump private raw logs or
 auth/key files. Diagnostic changes alone are not a fix for an unknown provider
 failure and do not authorize another live attempt.
+
+## Local owner-tool acceptance (completed bounded diagnostic)
+
+The optional stdio owner tool has a separate bounded diagnostic that uses the
+supported platform Codex session path and only a local mocked sender:
+
+```bash
+.venv/bin/python scripts/whatsapp_startup_inspection.py --run --harness codex --timeout 120 --directory-trust normal --notify-owner-tool --capture-snapshot
+```
+
+This reviewed diagnostic passed once with one owner request, zero legacy requests,
+a verified nonce/route and cleanup, without owner interaction. Do not repeat it
+as part of the real-provider test. It does not read the
+saved WhatsApp key, poll WhatsApp, send provider messages or ask for a human
+WhatsApp challenge. It reuses the existing owner-authorized harness login
+path through the private per-run Codex setup, without exposing auth contents.
+The worker/config receive no provider key; a public synthetic token exists
+only in the mocked server lookup. The whole outbound sender boundary is
+replaced, so Telegram/Slack/WhatsApp cannot be reached by a fallback.
+
+The runner enables the owner tool only in its private environment. Its fixed
+synthetic prompt asks for exactly one `notify_owner` call. Success requires
+the exact identity-prefixed nonce, verified session/runtime/account route,
+one `/notify/owner` request and zero legacy `/notify` requests. No dialogs are
+answered. A specific approval/trust prompt fails the diagnostic; broad echoed
+instruction text alone is not evidence of a displayed prompt. Configuration
+parser success and process presence are not runtime no-prompt acceptance.
+
+The 120-second observation budget begins after session/runtime verification.
+Existing private server/tmux/session cleanup runs on success, error or Ctrl-C;
+the installed lodge and port 7777 are preserved. A redacted snapshot and fixed
+failure record may be retained privately after verified cleanup, following
+the existing strict validation/retention rules. Never inspect auth/key files
+or dump raw logs to diagnose this test. A failure needs evidence and review,
+not an automatic second model or provider run. This local diagnostic establishes
+one configured runtime result, not a universal approval guarantee or provider
+delivery by itself. The separately completed real tool-only acceptance is
+recorded above.
