@@ -106,6 +106,7 @@ jobs:
           python -m pytest -q
           test/test_whatsapp_agent.py
           test/test_whatsapp_commands.py
+          test/test_notify_owner.py
       - name: notify command
         # The script runs under woltspace-python, which needs a Python that
         # has the test install's dependencies.

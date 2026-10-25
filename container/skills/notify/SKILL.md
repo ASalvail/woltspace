@@ -11,6 +11,23 @@ identifier from a recent inbound message. Files and audio are unsupported.
 
 Sessions can send messages back to the user at any time. Use this when you finish something worth reporting, hit a blocker that needs input, or find something the user should know about mid-task.
 
+## Session owner notification tool
+
+If this session exposes `notify_owner`, prefer that tool for WhatsApp text
+updates. Supply only `message`, without the creature/name prefix; the lodge
+adds the identity and fixes the owner destination. It needs no routine shell
+approval. Do not provide a session ID, participant, URL, channel, file or path.
+The provider key stays in the lodge. This tool sends text only and never
+falls back to Telegram or Slack. Keep the complete formatted message under
+4096 characters / 16 KiB UTF-8.
+
+After an ambiguous outcome, do not resend through the tool or CLI: delivery
+may already have happened. The worker refuses further sends until a fresh
+launch. A stale/unavailable tool means the session binding needs attention;
+report that state rather than trying a different destination. If the tool
+is absent, the existing CLI instructions below still apply. Tool availability
+does not grant general shell/network permission.
+
 ## Usage
 
 ```bash
