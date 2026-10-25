@@ -291,6 +291,8 @@ async def _send(
     thread, and carries its progress state. `session_record` is that record
     whatever the route, and is read only to tell whose chat this is.
     """
+    if adapter not in {"telegram", "slack", "whatsapp"}:
+        raise RuntimeError("unsupported notification adapter")
     sender = SENDERS[adapter]
     secrets = {key: dotenv_env(key) for key in sender.secrets}
     session_link = ""
@@ -317,7 +319,7 @@ async def _send(
         destination = {"channel": chat_id}
         if thread_ts is not None:
             destination["thread_ts"] = thread_ts
-    else:
+    elif adapter == "whatsapp":
         if not secrets.get("WHATSAPP_AGENT_TOKEN"):
             raise RuntimeError("WHATSAPP_AGENT_TOKEN not set")
         if not chat_id:
