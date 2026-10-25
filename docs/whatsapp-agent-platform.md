@@ -185,6 +185,6 @@ Credentials and private test artifacts stay private.
 
 Keep only one active consumer per key; poll/send coordination is local to the
 configured state directory, not distributed across hosts or separate lodges.
-
+See `docs/whatsapp-owner-test.md` for the reviewed isolated test boundaries.
 
 References: [WhatsApp Agent Platform Developer Manual, v1 (Aug. 25, 2026)](https://www.whatsapp.com/developer/WhatsApp-Agent-Platform-Developer-Manual.pdf)
