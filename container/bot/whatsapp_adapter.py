@@ -245,18 +245,171 @@ def _select(sender: str, name: str, routes: dict) -> None:
     routes.update(updated)
 
 
+def _public_url(value) -> str:
+    # Never expose local API addresses, URL credentials or token query strings.
+    if not isinstance(value, str):
+        return ""
+    try:
+        url = urllib.parse.urlsplit(value)
+        host = (url.hostname or "").rstrip(".").lower()
+        if (url.scheme != "https" or not host or url.username or url.password
+                or url.path not in {"", "/"} or url.query or url.fragment or host == "localhost"
+                or host.endswith((".localhost", ".local", ".internal"))):
+            return ""
+        try:
+            if not ipaddress.ip_address(host).is_global:
+                return ""
+        except ValueError:
+            if "." not in host or not re.fullmatch(r"[a-z0-9.-]+", host):
+                return ""
+        return value.rstrip("/")
+    except ValueError:
+        return ""
+
+
+def _visible_session(record: dict, sender: str) -> bool:
+    routing = record.get("routing", [])
+    if not isinstance(routing, list) or any(not isinstance(route, dict) for route in routing):
+        return False
+    routes = [record, *routing]
+    return all(not isinstance(route, dict) or route.get("adapter") != "whatsapp"
+               or (route.get("whatsapp_account") == ACCOUNT and route.get("chat_id") == sender)
+               for route in routes)
+
+
+def _session_target(core, sender: str, name: str) -> dict | None:
+    if name == "main" or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,160}", name):
+        return None
+    try:
+        record = core._call_server("GET", f"/sessions/{name}")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise
+    if (not isinstance(record, dict) or record.get("name") != name
+            or record.get("status") != "running" or not _visible_session(record, sender)):
+        return None
+    return record
+
+
+_COMMAND_HELP = (
+    "/sessions — active sessions and lodge links\n"
+    "/holds — held sessions; /holds release SESSION\n"
+    "/idle — lodge-wide idle window; /idle never|1h|4h|1d\n"
+    "/wolt [NAME] — list or switch active wolt\n"
+    "/new [NAME] — start a fresh session now\n"
+    "/apps — apps and public links; /apps start|stop NAME\n"
+    "/kill SESSION — stop a session\n"
+    "/help — commands and current target\n"
+    "/start — introduction"
+)
+
+
 def _command(text: str, sender: str, routes: dict) -> tuple[str | None, str]:
+    """Owner-only controls. Return an optional fresh-session prompt and reply.
+
+    All mutations use a fresh authoritative record/roster, not a cached list.
+    Transport acknowledgements are outside this function's action error handler.
+    """
+    core = importlib.import_module("bot.core")
     command, *args = text.split()
     command = command.lower()
-    if command == "/wolt" and len(args) <= 1:
+    active = routes.get(sender, {})
+    if command in {"/start", "/help"} and not args:
+        return None, ("Send text to your active wolt. /wolt selects one.\n\n" + _COMMAND_HELP
+                      + f"\n\nActive wolt: {active.get('wolt') or 'none'}"
+                      + f"\nActive session: {active.get('session') or 'none'}")
+    if command in {"/wolt", "/new"}:
+        if len(args) > 1:
+            return None, f"Usage: {command} [NAME]"
         wolts = eligible_wolts()
-        if not args:
-            return None, "Available: " + (", ".join(sorted(wolts)) or "none") + "\nUse /wolt NAME."
-        if args[0] not in wolts:
+        if not args and command == "/wolt":
+            return None, (f"Active wolt: {active.get('wolt') or 'none'}\nAvailable: "
+                          + (", ".join(sorted(wolts)) or "none") + "\nUse /wolt NAME to switch.")
+        name = args[0] if args else active.get("wolt")
+        if name not in wolts:
             return None, "That wolt is unavailable. Use /wolt to choose an installed wolt."
-        _select(sender, args[0], routes)
-        return None, f"Selected {args[0]}. Send a message to start its session."
-    return None, "Choose a target with /wolt NAME, then send text."
+        _select(sender, name, routes)
+        if command == "/wolt":
+            return None, f"Selected {name}. Send a message to start its session."
+        return "The owner requested a fresh WhatsApp session. Wait for their next message.", ""
+    if command == "/idle":
+        choices = {"never": None, "1h": 3600, "4h": 14400, "1d": 86400}
+        if len(args) > 1 or args and args[0] not in choices:
+            return None, "Usage: /idle [never|1h|4h|1d] (whole lodge)"
+        data = (core._call_server("POST", "/settings/session-expiry", {"idle_timeout_seconds": choices[args[0]]})
+                if args else core._call_server("GET", "/settings/session-expiry"))
+        value = data["idle_timeout_seconds"]
+        label = next((key for key, seconds in choices.items() if seconds == value), "unknown")
+        return None, f"Idle window (whole lodge): {label}. Use /idle never|1h|4h|1d."
+    if command in {"/kill", "/holds"} and args:
+        release = command == "/holds" and len(args) == 2 and args[0] == "release"
+        if not release and (command != "/kill" or len(args) != 1):
+            return None, "Usage: /holds release SESSION or /kill SESSION"
+        name = args[-1]
+        record = _session_target(core, sender, name)
+        if not record or release and (not record.get("hold") or not record.get("alive")):
+            return None, "That session is unavailable for this account or is no longer active."
+        result = core._call_server("DELETE" if release else "POST",
+            f"/sessions/{name}/hold" if release else f"/sessions/{name}/stop")
+        if release:
+            if result.get("ok") is not True:
+                raise RuntimeError("hold release unconfirmed")
+            return None, f"Released the hold on {name}."
+        if result.get("status") != "stopped":
+            raise RuntimeError("session stop unconfirmed")
+        route = routes.get(sender, {})
+        if route.get("session") == name:
+            updated = {**routes, sender: {key: value for key, value in route.items() if key != "session"}}
+            atomic_json(ROUTES, updated)
+            routes.clear()
+            routes.update(updated)
+        return None, f"Stop requested for {name}."
+    if command in {"/sessions", "/holds"} and not args:
+        records = core._call_server("GET", "/sessions")
+        records = [record for record in records if isinstance(record, dict)
+                   and record.get("alive") and _visible_session(record, sender)
+                   and (command != "/holds" or record.get("hold"))]
+        base = _public_url(core.get_tunnel_url())
+        lines = []
+        for record in records:
+            name = record.get("name", "")
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,160}", name):
+                continue
+            line = name + (" (held)" if record.get("hold") else "")
+            if command == "/holds":
+                hold = record["hold"]
+                until = hold.get("until")
+                span = "until released" if until is None else time.strftime("until %Y-%m-%d %H:%M", time.localtime(until))
+                line += f"\n{span}: {hold.get('reason', '')}"
+            if base:
+                line += f"\n{base}/tui?session={urllib.parse.quote(name, safe='')}"
+            lines.append(line)
+        return None, "\n\n".join(lines) or ("No held sessions." if command == "/holds" else "No active sessions.")
+    if command == "/kill":
+        return None, "Usage: /kill SESSION"
+    if command == "/apps":
+        if args and (len(args) != 2 or args[0] not in {"start", "stop"}):
+            return None, "Usage: /apps [start|stop NAME]"
+        apps = core._call_server("GET", "/apps")
+        if args:
+            action, name = args
+            if (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,100}", name)
+                    or not any(app.get("name") == name for app in apps if isinstance(app, dict))):
+                return None, "That app is unavailable. Use /apps for the current list."
+            result = core._call_server("POST", f"/apps/{name}/{action}")
+            if result.get("error"):
+                raise RuntimeError("app action unconfirmed")
+            return None, f"App {action} requested for {name}."
+        lines = []
+        for app in sorted((app for app in apps if isinstance(app, dict)),
+                          key=lambda app: (not app.get("running"), str(app.get("name", "")))):
+            if isinstance(app, dict):
+                line = f"{app.get('name', '?')}: {'running' if app.get('running') else 'off'}"
+                url = _public_url(app.get("tunnel_url")) if app.get("running") else ""
+                lines.append(line + ("\n" + url if url else ""))
+        return None, "\n\n".join(lines) or "No apps yet."
+    return None, "Unknown command or arguments. Send /help."
 
 
 def handle(item: dict, routes: dict, activation: int) -> None:
@@ -370,6 +523,10 @@ def handle(item: dict, routes: dict, activation: int) -> None:
     # Starting/resuming the session is the dispatch. A failed acknowledgement
     # must not invite a duplicate message and duplicate instructions.
     if started_session and (link or fresh_command):
+        if fresh_command:
+            core = importlib.import_module("bot.core")
+            base = _public_url(core.get_tunnel_url())
+            link = f"{base}/tui?session={urllib.parse.quote(session['name'], safe='')}" if base else session["name"]
         try:
             api("POST", "/messages", {"messaging_product": "whatsapp", "to": sender,
                  "type": "text", "text": {"body": f"Session started: {link}"}})

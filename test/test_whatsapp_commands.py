@@ -56,6 +56,125 @@ def send(control, text, routes=None, sender="user:1"):
     return routes
 
 
+@pytest.mark.parametrize("command", ["/sessions", "/holds", "/idle", "/wolt", "/new beaver", "/apps", "/kill owned", "/help", "/start"])
+def test_all_telegram_command_names_are_owner_controls(control, command):
+    send(control, command)
+    assert control.replies
+    assert not control.messages
+    assert len(control.spawns) == (1 if command.startswith('/new') else 0)
+
+
+def test_wolt_switch_and_legacy_alias_do_not_kill_old_session(control):
+    routes = {"user:1":{"wolt":"beaver", "session":"owned"}}
+    send(control, "/wolt otter", routes)
+    assert routes == {"user:1":{"wolt":"otter"}}
+    send(control, "wolt beaver", routes)
+    assert routes == {"user:1":{"wolt":"beaver"}}
+    assert not control.spawns and not control.effects
+    assert "Selected beaver" in control.replies[-1]
+
+
+def test_new_immediately_creates_with_current_account_and_persisted_route(control):
+    routes = {"user:1":{"wolt":"beaver", "session":"owned"}}
+    send(control, "/new", routes)
+    assert len(control.spawns) == 1
+    prompt, kwargs = control.spawns[0]
+    assert "Wait for their next message" in prompt and "/new" not in prompt
+    assert kwargs["routing"] == {"adapter":"whatsapp", "chat_id":"user:1", "whatsapp_account":control.adapter.ACCOUNT}
+    assert routes["user:1"]["session"] == "fresh-session"
+    assert control.adapter.load(control.adapter.ROUTES) == routes
+    assert not control.effects
+
+
+def test_new_ack_timeout_does_not_retry_creation_or_claim_start_failed(control, monkeypatch):
+    attempts = []
+    def timeout(*args):
+        attempts.append(1)
+        assert control.adapter.load(control.adapter.ROUTES)["user:1"]["session"] == "fresh-session"
+        raise TimeoutError("synthetic-private")
+    monkeypatch.setattr(control.adapter, "api", timeout)
+    send(control, "/new beaver")
+    assert len(control.spawns) == 1 and attempts == [1]
+    assert not control.replies
+
+
+def test_new_persistence_failure_after_creation_never_claims_start_failure(control, monkeypatch):
+    real_save = control.adapter.atomic_json
+    def save(path, value):
+        if path == control.adapter.ROUTES and value.get("user:1",{}).get("session"):
+            raise OSError("synthetic-private")
+        real_save(path,value)
+    monkeypatch.setattr(control.adapter, "atomic_json", save)
+    send(control,"/new beaver")
+    assert len(control.spawns)==1
+    assert "session started" in control.replies[-1].lower()
+    assert "could not save" in control.replies[-1].lower()
+    assert "retry" not in control.replies[-1].lower()
+
+
+@pytest.mark.parametrize("target", ["foreign", "rotated", "stale", "missing", "../owned", "main"])
+@pytest.mark.parametrize("command", ["/kill", "/holds release"])
+def test_mutations_reject_foreign_stale_missing_or_malformed_session(control, target, command):
+    send(control, f"{command} {target}")
+    assert not [effect for effect in control.effects if effect[0] != 'GET']
+    assert not control.spawns and not control.messages
+
+
+def test_kill_uses_fresh_target_and_clears_only_owned_reference(control):
+    routes = {"user:1":{"wolt":"beaver", "session":"owned"},
+              "user:2":{"wolt":"otter", "session":"owned"}}
+    send(control,"/kill owned",routes)
+    assert control.effects == [('GET','/sessions/owned',None),('POST','/sessions/owned/stop',None)]
+    assert routes == {"user:1":{"wolt":"beaver"},"user:2":{"wolt":"otter","session":"owned"}}
+    assert control.adapter.load(control.adapter.ROUTES)==routes
+
+
+def test_hold_release_uses_same_control_plane_hook(control):
+    send(control,"/holds release owned")
+    assert control.effects == [('GET','/sessions/owned',None),('DELETE','/sessions/owned/hold',None)]
+    assert "Released" in control.replies[-1]
+
+
+def test_session_list_permissions_are_not_cached_for_later_mutation(control):
+    send(control,"/sessions")
+    control.records['owned']['whatsapp_account']='foreign-now'
+    send(control,"/kill owned")
+    assert not [effect for effect in control.effects if effect[0] != 'GET']
+
+
+@pytest.mark.parametrize("choice,value", [("never",None),("1h",3600),("4h",14400),("1d",86400)])
+def test_idle_change_is_explicitly_lodgewide(control, choice, value):
+    send(control,f"/idle {choice}")
+    assert control.effects == [('POST','/settings/session-expiry',{'idle_timeout_seconds':value})]
+    assert "whole lodge" in control.replies[-1]
+
+
+@pytest.mark.parametrize("action", ['start','stop'])
+def test_apps_action_uses_fresh_roster_then_existing_hook(control, action):
+    send(control,f"/apps {action} dashboard")
+    assert control.effects == [('GET','/apps',None),('POST',f'/apps/dashboard/{action}',None)]
+
+
+@pytest.mark.parametrize("text", ['/unknown','/sessions owned','/kill','/kill owned extra','/holds release','/idle 5h','/apps stop ../dashboard','/apps delete dashboard','/wolt beaver extra','/new missing'])
+def test_bad_or_unknown_commands_never_model_forward(control,text):
+    send(control,text)
+    assert not control.spawns and not control.messages
+    assert not [effect for effect in control.effects if effect[0] != 'GET']
+
+
+def test_missing_app_and_changed_roster_refuse_action(control):
+    send(control,'/apps')
+    control.apps.clear()
+    send(control,'/apps stop dashboard')
+    assert not [effect for effect in control.effects if effect[0]!='GET']
+
+
+@pytest.mark.parametrize("command", ['/sessions','/holds','/idle never','/wolt beaver','/new beaver','/apps start dashboard','/kill owned','/help','/start'])
+def test_foreign_participant_cannot_even_read_lodge_controls(control,command):
+    send(control,command,sender='user:foreign')
+    assert not control.effects and not control.replies and not control.spawns and not control.messages
+
+
 def test_unbound_direct_handle_cannot_dispatch_controls_or_model(control):
     control.adapter._owner_path().unlink()
     send(control,'/sessions')
@@ -68,6 +187,20 @@ def test_key_account_mismatch_fails_before_control_dispatch(control,monkeypatch)
     with pytest.raises(control.adapter.WhatsAppConfigurationError):
         send(control,'/kill owned')
     assert not control.effects and not control.replies
+
+
+def test_lists_exclude_foreign_whatsapp_and_only_use_public_lodge_links(control,monkeypatch):
+    control.records['owned']['url']='http://127.0.0.1:7777/private?token=secret'
+    send(control,'/sessions')
+    text=control.replies[-1]
+    assert 'owned' in text and 'lodge' in text
+    assert 'foreign' not in text and 'rotated' not in text and 'stale' not in text
+    assert 'https://lodge.example.com/tui?session=owned' in text
+    assert '127.0.0.1' not in text and 'secret' not in text
+    core=sys.modules['bot.core']
+    monkeypatch.setattr(core,'get_tunnel_url',lambda:'https://user:secret@localhost:7777/?token=secret')
+    send(control,'/sessions')
+    assert 'https://' not in control.replies[-1] and 'secret' not in control.replies[-1]
 
 
 def poll(adapter, tmp_path, items, dispatch):
@@ -153,12 +286,35 @@ def test_rotated_key_uses_distinct_binding_without_inheriting_owner(control,tmp_
     assert not control.effects
 
 
+def test_ack_timeout_after_mutation_never_repeats_mutation(control,monkeypatch):
+    attempts=[]
+    def timeout(*_):attempts.append(1);raise TimeoutError('synthetic-private')
+    monkeypatch.setattr(control.adapter,'api',timeout)
+    with pytest.raises(TimeoutError):send(control,'/idle never')
+    assert attempts==[1]
+    assert [effect for effect in control.effects if effect[0]=='POST']==[('POST','/settings/session-expiry',{'idle_timeout_seconds':None})]
+
+
 def test_foreign_provider_message_does_not_replace_creator_binding(control,tmp_path):
     adapter=control.adapter
     previous=adapter._owner_path().read_bytes()
     seen=[]
     poll(adapter,tmp_path,[item(sender='user:foreign')],lambda *_:seen.append(1))
     assert not seen and adapter._owner_path().read_bytes()==previous
+
+
+def test_foreign_nested_routing_and_malformed_routing_are_not_mutable(control):
+    control.records['lodge']['routing']=[{'adapter':'whatsapp','chat_id':'user:1','whatsapp_account':'foreign'}]
+    send(control,'/kill lodge')
+    control.records['lodge']['routing']='malformed'
+    send(control,'/kill lodge')
+    assert not [effect for effect in control.effects if effect[0]!='GET']
+
+
+def test_hold_release_rejects_dead_held_session(control):
+    control.records['owned']['alive']=False
+    send(control,'/holds release owned')
+    assert not [effect for effect in control.effects if effect[0]!='GET']
 
 
 def test_provider_non_success_cannot_establish_creator_binding(control,tmp_path):
@@ -187,6 +343,25 @@ def test_unsafe_creator_binding_is_never_read_or_overwritten(control,tmp_path,ki
     assert not control.effects and not control.replies
 
 
+def test_listing_output_is_bounded_to_one_provider_message(control):
+    control.records.clear()
+    control.records.update({f'session-{index}':{'name':f'session-{index}','status':'running','alive':True,'adapter':'lodge'} for index in range(300)})
+    send(control,'/sessions')
+    assert len(control.replies)==1 and len(control.replies[0])<=4096
+    assert 'truncated' in control.replies[0]
+
+
+@pytest.mark.parametrize('url',[
+    'http://localhost:7777','https://127.0.0.1','https://127.0.0.1.',
+    'https://localhost.','https://[::1]','https://10.0.0.1',
+    'https://user:secret@lodge.example.com','https://lodge.example.com/?token=secret',
+    'https://lodge.example.com/#secret','https://service.internal.',
+    'https://lodge.example.com/private-path','https://127.0.0.1%2e',
+])
+def test_nonpublic_or_credential_bearing_link_is_omitted(control,url):
+    assert control.adapter._public_url(url)==''
+
+
 def test_fifo_creator_binding_fails_closed_without_blocking(control,tmp_path):
     import os
     adapter=control.adapter
@@ -196,3 +371,16 @@ def test_fifo_creator_binding_fails_closed_without_blocking(control,tmp_path):
     with pytest.raises(adapter.WhatsAppConfigurationError):
         poll(adapter,tmp_path,[item()],lambda *_:pytest.fail('no dispatch'))
     assert not control.effects
+
+
+def test_new_without_tunnel_always_acknowledges_session_name(control,monkeypatch):
+    monkeypatch.setattr(sys.modules['bot.core'],'get_tunnel_url',lambda:None)
+    monkeypatch.setattr(control.adapter,'start_claude_session',lambda *_,**__: {'name':'fresh-session','url':''})
+    send(control,'/new beaver')
+    assert control.replies==['Session started: fresh-session']
+
+
+def test_new_ack_does_not_expose_private_returned_url(control,monkeypatch):
+    monkeypatch.setattr(control.adapter,'start_claude_session',lambda *_,**__: {'name':'fresh-session','url':'http://127.0.0.1:7777/private?token=secret'})
+    send(control,'/new beaver')
+    assert control.replies==['Session started: https://lodge.example.com/tui?session=fresh-session']

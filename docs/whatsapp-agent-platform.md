@@ -30,6 +30,32 @@ that session return to the same recent WhatsApp participant. Send `/wolt NAME`
 again to switch destinations. Only plain text is supported; inbound media gets
 an explanatory response and outbound files, voice, and speech are unsupported.
 
+### Commands
+
+WhatsApp uses the same slash command names as Telegram. Text commands replace
+Telegram's buttons; no model session is needed for management commands.
+
+| Command | Behavior |
+| --- | --- |
+| `/start`, `/help` | Introduction, commands and current target; does not reset it. |
+| `/wolt` / `/wolt NAME` | List eligible wolts or switch target; next text starts its session. |
+| `/new` / `/new NAME` | Immediately create a fresh session for the active/named wolt; previous session stays up. |
+| `/sessions` | Active sessions and links through the configured public lodge URL. |
+| `/holds` | Held active sessions, reasons and expiry. `/holds release SESSION` releases one. |
+| `/idle` | Show lodge-wide idle window. `/idle never`, `/idle 1h`, `/idle 4h`, `/idle 1d` change it. |
+| `/apps` | Apps, status and public links. `/apps start NAME` / `/apps stop NAME` manage an existing app. |
+| `/kill SESSION` | Request a registered active session stop; clear only this owner's matching active reference. |
+
+The old `wolt NAME` spelling remains a compatibility alias; `/wolt NAME` is
+canonical. Unknown slash commands and malformed arguments never reach a model.
+Listings are bounded to one text reply and marked if truncated. Management has
+the same lodge-wide owner scope as Telegram, but WhatsApp session records for a
+foreign account/participant are excluded from listings and session mutations.
+Mutations check a fresh authoritative session/app record, not a cached listing.
+Session links are built from the configured public HTTPS lodge base, not an
+arbitrary record URL or local API address; URL credentials/query tokens are omitted.
+The existing lodge access protection still applies to those links.
+
 **Creator trust:** the authenticated official Agent Platform poll is creator-only.
 Its first valid fresh text atomically pins the opaque creator participant to the
 current account fingerprint before any command/model dispatch. A `user:` prefix
@@ -45,7 +71,8 @@ Cursor/dedup checkpointing precedes binding persistence and dispatch. A binding
 write failure can therefore safely lose that first item; it cannot dispatch it
 without ownership. Do not blindly replay an ambiguous management operation.
 Provider acknowledgement failure never retries an action or claims that a
-successfully created session failed. Creator enrollment has offline mocked coverage.
+successfully created `/new` session failed. These new command behaviors have
+offline mocked coverage; no additional live command acceptance is claimed.
 
 The first poll uses explicit `offset=0`, with a persisted activation time to
 ignore older retained messages. The `next_offset` cursor is persisted; HTTP 204
