@@ -1422,7 +1422,7 @@ def _run_model_session(
                 nonlocal session_start_requested
                 text = (item.get("text") or {}).get("body", "")
                 participant = item.get("from", "")
-                if text.strip() == f"wolt {TEST_WOLT}":
+                if text.strip() in {f"/wolt {TEST_WOLT}", f"wolt {TEST_WOLT}"}:
                     diagnostics.enter("inbound_selection")
                     with phase_lock:
                         if phase["selected"]:
@@ -1465,7 +1465,7 @@ def _run_model_session(
                     dispatch_done.set()
 
             _say("Isolated server is healthy on a private 127.0.0.1 port.")
-            _say("In WhatsApp, send `wolt wa-test` and wait for the selection confirmation.")
+            _say("In WhatsApp, send `/wolt wa-test` and wait for the selection confirmation.")
             _say(f"Then send exactly: `{challenge}`")
             _say("The test sends no automatic retry after an ambiguous outbound timeout.")
             diagnostics.enter("inbound_selection")

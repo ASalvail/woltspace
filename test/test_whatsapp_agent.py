@@ -37,6 +37,15 @@ def _load_adapter(monkeypatch, tmp_path):
     monkeypatch.setenv("WHATSAPP_AGENT_TOKEN", "test-key")
     monkeypatch.setenv("WOLTSPACE_WOLTS_DIR", str(tmp_path / "wolts"))
     import bot.whatsapp_adapter as adapter
+    # Each fixture owns its synthetic account/state; never inherit a prior
+    # imported module's per-account creator binding or filesystem paths.
+    state = tmp_path / "space/whatsapp"
+    state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    monkeypatch.setattr(adapter, "STATE", state)
+    monkeypatch.setattr(adapter, "TOKEN", "test-key")
+    monkeypatch.setattr(adapter, "ACCOUNT", __import__('hashlib').sha256(b"test-key").hexdigest()[:20])
+    monkeypatch.setattr(adapter, "ROUTES", state / f"routes-{adapter.ACCOUNT}.json")
+    adapter.atomic_json(adapter._owner_path(), {"account":adapter.ACCOUNT, "participant":"user:1"})
     return adapter
 
 
@@ -92,7 +101,7 @@ def test_dispatch_failure_is_marked_before_recovery_without_replay(monkeypatch, 
     adapter = _load_adapter(monkeypatch, tmp_path)
     path = tmp_path / "cursor.json"
     body = {"next_offset": 2, "entry": [{"changes": [{"value": {"messages": [
-        {"id": "m1", "from": "user:1", "timestamp": "100", "type": "text"}
+        {"id": "m1", "from": "user:1", "timestamp": "100", "type": "text", "text": {"body": "synthetic"}}
     ]}}]}]}
     state = {"offset": 0, "processed": []}
     def interrupted(*args):
@@ -113,9 +122,9 @@ def test_item_failure_does_not_drop_later_messages_in_checkpointed_batch(monkeyp
     adapter = _load_adapter(monkeypatch, tmp_path)
     path = tmp_path / "cursor.json"
     batch = {"next_offset": 3, "entry": [{"changes": [{"value": {"messages": [
-        {"id": "bad", "from": "user:1", "timestamp": "100", "type": "text"},
+        {"id": "bad", "from": "user:1", "timestamp": "100", "type": "text", "text": {"body": "synthetic"}},
         None,
-        {"id": "good", "from": "user:1", "timestamp": "100", "type": "text"},
+        {"id": "good", "from": "user:1", "timestamp": "100", "type": "text", "text": {"body": "synthetic"}},
     ]}}]}]}
     delivered = []
     def dispatch(item, routes, activation):

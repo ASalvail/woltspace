@@ -27,7 +27,7 @@ environment variables, output, logs, or shell history. The runner reads it
 inside a child process and holds it only in process memory while the test runs.
 It does not start a Wolt session, agent, tmux server, or lodge server.
 
-After the isolated poll starts, send `wolt wa-test` to the WhatsApp Agent and
+After the isolated poll starts, send `/wolt wa-test` to the WhatsApp Agent and
 wait for the selection confirmation. That is one expected outbound message.
 Then send the one-time `wa-check-…` phrase printed by the local runner. The
 single test message is dispatched to the mocked session handler, which returns
@@ -87,7 +87,7 @@ For a separately reviewed future use, from a checkout with runtime dependencies:
 
 Type `MODEL` at the local confirmation. The existing saved key is read only by
 code, never displayed or placed in model/worker environments or configuration.
-In WhatsApp, follow the printed `wolt wa-test` selection and fresh exact challenge.
+In WhatsApp, follow the printed `/wolt wa-test` selection and fresh exact challenge.
 No second terminal, session attachment or approval interaction is required.
 Do not reuse an earlier nonce. The runner requests only `notify_owner(message)`;
 it rejects the legacy CLI endpoint before sender access, rather than silently

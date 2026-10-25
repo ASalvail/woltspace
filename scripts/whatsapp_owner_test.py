@@ -257,7 +257,7 @@ def _isolated_run_body(token: str, run_root: Path) -> int:
         print(f"Isolated notify-path poll started. Send `{challenge}` once in WhatsApp.")
     else:
         dispatch = adapter.handle
-        print("Isolated poll started. In WhatsApp, send `wolt wa-test` and wait for its confirmation.")
+        print("Isolated poll started. In WhatsApp, send `/wolt wa-test` and wait for its confirmation.")
         print(f"Then send `{challenge}` once. The runner will send one canned reply and exit.")
     print("No incoming message text or participant ID is printed. Press Ctrl+C to stop.")
     routes = adapter.load(adapter.ROUTES)

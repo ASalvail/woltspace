@@ -25,10 +25,54 @@ environment. Never put the key in a prompt, log, repository, or public artifact.
 Start the lodge through `woltspace start`. The connector runs only in the
 platform entrypoint and takes an exclusive local poll lock per API key.
 
-Send `wolt NAME` to choose the destination wolt, then send text. Replies from
-that session return to the same recent WhatsApp participant. Send `wolt NAME`
+Send `/wolt NAME` to choose the destination wolt, then send text. Replies from
+that session return to the same recent WhatsApp participant. Send `/wolt NAME`
 again to switch destinations. Only plain text is supported; inbound media gets
 an explanatory response and outbound files, voice, and speech are unsupported.
+
+### Commands
+
+WhatsApp uses the same slash command names as Telegram. Text commands replace
+Telegram's buttons; no model session is needed for management commands.
+
+| Command | Behavior |
+| --- | --- |
+| `/start`, `/help` | Introduction, commands and current target; does not reset it. |
+| `/wolt` / `/wolt NAME` | List eligible wolts or switch target; next text starts its session. |
+| `/new` / `/new NAME` | Immediately create a fresh session for the active/named wolt; previous session stays up. |
+| `/sessions` | Active sessions and links through the configured public lodge URL. |
+| `/holds` | Held active sessions, reasons and expiry. `/holds release SESSION` releases one. |
+| `/idle` | Show lodge-wide idle window. `/idle never`, `/idle 1h`, `/idle 4h`, `/idle 1d` change it. |
+| `/apps` | Apps, status and public links. `/apps start NAME` / `/apps stop NAME` manage an existing app. |
+| `/kill SESSION` | Request a registered active session stop; clear only this owner's matching active reference. |
+
+The old `wolt NAME` spelling remains a compatibility alias; `/wolt NAME` is
+canonical. Unknown slash commands and malformed arguments never reach a model.
+Listings are bounded to one text reply and marked if truncated. Management has
+the same lodge-wide owner scope as Telegram, but WhatsApp session records for a
+foreign account/participant are excluded from listings and session mutations.
+Mutations check a fresh authoritative session/app record, not a cached listing.
+Session links are built from the configured public HTTPS lodge base, not an
+arbitrary record URL or local API address; URL credentials/query tokens are omitted.
+The existing lodge access protection still applies to those links.
+
+**Creator trust:** the authenticated official Agent Platform poll is creator-only.
+Its first valid fresh text atomically pins the opaque creator participant to the
+current account fingerprint before any command/model dispatch. A `user:` prefix
+or caller-supplied command is not identity proof. This guarantee is the trust
+anchor; if the provider introduces other senders, this enrollment policy must be
+reviewed before enabling them. Subsequent foreign senders are ignored. Malformed
+or foreign persisted bindings fail closed without overwrite; a rotated key uses
+separate binding/routes. An existing same-key installation enrolls on its next
+valid fresh provider text, preserving its routing file. No direct `handle` path
+can enroll an owner or bypass this check.
+
+Cursor/dedup checkpointing precedes binding persistence and dispatch. A binding
+write failure can therefore safely lose that first item; it cannot dispatch it
+without ownership. Do not blindly replay an ambiguous management operation.
+Provider acknowledgement failure never retries an action or claims that a
+successfully created `/new` session failed. These new command behaviors have
+offline mocked coverage; no additional live command acceptance is claimed.
 
 ### Routine pings through the owner tool (opt-in Codex)
 

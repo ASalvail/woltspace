@@ -368,7 +368,7 @@ prove that it caused the earlier rejection or establish a successful live reply.
    private tmux server. Confirm the API endpoint is the selected loopback port
    and that it is not 7777.
 2. Start the adapter with a fresh activation timestamp and explicit offset 0.
-   The owner sends `wolt wa-test` and receives the adapter's selection
+   The owner sends `/wolt wa-test` and receives the adapter's selection
    confirmation. Then they send one unique harmless request asking the test
    wolt to reply with the same nonce and no other action. The runner accepts
    only these two exact inbound texts from that same participant; other
