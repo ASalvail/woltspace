@@ -163,9 +163,17 @@ async def test_real_registry_to_real_sender_boundary(lodge):
 ])
 async def test_stale_binding_never_sends_or_falls_back(lodge, change):
     registry, record, env, sent = lodge
-    # Write mutation into the same actual record, including wolt-field corruption.
-    altered = dict(record, **change)
-    (registry.wolts_dir / "wa-test/.state/sessions" / f"{record['name']}.json").write_text(json.dumps(altered))
+    # Mutate the authoritative store; storage may be JSON or SQLite.
+    fields = dict(change)
+    if "wolt" in fields:
+        other = registry.wolts_dir / fields.pop("wolt")
+        other.mkdir()
+        # Change the canonical owner, not a legacy alias normalized on read.
+        fields["target"] = {"wolt_id": other.name, "canonical_workdir": str(other)}
+    assert registry.update(record["name"], wolt=record["wolt"], **fields) is not None
+    stored = registry.get(record["name"], check_alive=False)
+    assert stored is not None
+    assert all(stored[key] == value for key, value in change.items())
     assert await owner_notify.deliver(body(record)) == "stale_binding"
     sent.assert_not_awaited()
 
